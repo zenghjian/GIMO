@@ -67,6 +67,12 @@ class MotionFromGazeConfig(ArgumentParser):
         self.train_configs.add_argument('--lambda_rec', type=float, default=1)
         self.train_configs.add_argument('--lambda_des', type=float, default=1)
 
+        # Wandb configuration
+        self.wandb_configs = self.add_argument_group('wandb')
+        self.wandb_configs.add_argument('--wandb_project', type=str, default="GIMO", help='Wandb project name')
+        self.wandb_configs.add_argument('--wandb_entity', type=str, default=None, help='Wandb entity (username)')
+        self.wandb_configs.add_argument('--wandb_mode', type=str, default="online", choices=["online", "offline", "disabled"], help='Wandb mode')
+
         self.eval_configs = self.add_argument_group('eval')
         self.eval_configs.add_argument('--output_path', default='results', type=str)
         self.eval_configs.add_argument('--smplx_path', default='smplx_models', type=str)

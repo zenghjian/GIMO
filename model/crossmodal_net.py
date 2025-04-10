@@ -20,10 +20,10 @@ class crossmodal_net(nn.Module):
         # self.use_scene = not config.disable_scene
 
         self.fp_layer = MyFPModule()
-        self.pointnet = PointNet(config.scene_feats_dim)
-        self.scene_encoder = PointNet2SemSegSSGShape({'feat_dim': config.scene_feats_dim})
+        self.pointnet = PointNet(config.scene_feats_dim) 
+        self.scene_encoder = PointNet2SemSegSSGShape({'feat_dim': config.scene_feats_dim}) # scene to scene feats
 
-        self.motion_linear = nn.Linear(config.motion_dim, config.motion_hidden_dim)
+        self.motion_linear = nn.Linear(config.motion_dim, config.motion_hidden_dim) # motion to hidden dim
         input_len = config.input_seq_len
         output_len = config.output_seq_len + config.input_seq_len + 1 # rec + path predict + destination
         if self.use_crossmodal:
@@ -33,12 +33,14 @@ class crossmodal_net(nn.Module):
                                                         n_self_att_heads=config.motion_n_heads,
                                                         n_self_att_layers=config.motion_n_layers,
                                                         dropout=config.dropout)
+            # encode scene feats
             self.motion_encoder = PerceiveEncoder(n_input_channels=config.motion_hidden_dim + config.scene_feats_dim,
                                                   n_latent=output_len,
                                                   n_latent_channels=config.motion_latent_dim,
                                                   n_self_att_heads=config.motion_n_heads,
                                                   n_self_att_layers=config.motion_n_layers,
                                                   dropout=config.dropout)
+            # encode motion feats and scene feats
             self.motion_decoder = PerceiveDecoder(n_query_channels=config.motion_latent_dim,
                                                   n_query=output_len,
                                                   n_latent_channels=config.motion_latent_dim,
@@ -101,24 +103,30 @@ class crossmodal_net(nn.Module):
         :param scene: (bs, num_points, 3)
         :return:
         """
-        bs, seq_len, _, _ = gazes.shape
+        bs, seq_len, n_gaze, gaze_dim = gazes.shape
+        
         n_points = scenes.shape[1]
-        scene_feats, scene_global_feats = self.scene_encoder(scenes.repeat(1, 1, 2))  # B x F x M, B x F
+        scene_feats, scene_global_feats = self.scene_encoder(scenes.repeat(1, 1, 2))  # B x F x M, B x F 
+        # scene_feats: (bs, F, n_points)
+        # scene_global_feats: (bs, F)
 
-        motion_feats = self.motion_linear(motions)
+        motion_feats = self.motion_linear(motions) # motion to hidden dim
 
         motion_scene_feats = self.fp_layer(smplx_vetices.reshape((bs * seq_len, -1, 3)),
                                            scenes.unsqueeze(1).repeat(1, seq_len, 1, 1).reshape((bs * seq_len, -1, 3)),
                                            scene_feats.unsqueeze(1).repeat(1, seq_len, 1, 1).reshape(
                                                (bs * seq_len, -1, n_points)))
+        # 把scene feature 传播到人体顶点
+        
         # B*seq_len x F x N_smpl
-        motion_scene_feats = self.pointnet(motion_scene_feats).reshape((bs, seq_len, -1))
+        motion_scene_feats = self.pointnet(motion_scene_feats).reshape((bs, seq_len, -1)) # 这里提取人体顶点的全局特征
 
 
         if self.use_crossmodal:
             # motion_scene_feats = self.motion_scene_encoder(motion_scene_feats)
             motion_feats = torch.cat([motion_feats, motion_scene_feats], dim=2)
             motion_embedding = self.motion_encoder(motion_feats)
+            # f_m_s
             # motion_embedding = self.motion_decoder(motion_scene_feats, motion_feats)
         else:
             motion_feats = torch.cat([motion_feats, motion_scene_feats], dim=2)
@@ -126,7 +134,8 @@ class crossmodal_net(nn.Module):
 
         out_seq_len = motion_embedding.shape[1]
         cross_modal_embedding = scene_global_feats.unsqueeze(1).repeat(1, out_seq_len, 1)
-
+        #  f0
+        
         if self.use_gaze:
             gazes, _ = torch.median(gazes, dim=2)  # B x seq_len x 3
 
@@ -137,9 +146,14 @@ class crossmodal_net(nn.Module):
         gaze_embedding = self.gaze_linear(gaze_embedding)
         # gaze_embedding *= gazes_mask
         gaze_embedding = self.gaze_encoder(gaze_embedding)
+        # f_g
+        
         if self.use_crossmodal:
             gaze_motion_embedding = self.gaze_motion_decoder(gaze_embedding, motion_embedding)
+            # f_g_m
             motion_gaze_embedding = self.motion_gaze_decoder(motion_embedding, gaze_embedding)
+            # f_m_g
+            
             #print(motion_gaze_embedding.shape, cross_modal_embedding.shape)
             cross_modal_embedding = torch.cat([cross_modal_embedding, gaze_motion_embedding, motion_gaze_embedding], dim=2)
         else:

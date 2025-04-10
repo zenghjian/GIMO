@@ -11,6 +11,7 @@ import trimesh
 from tqdm import tqdm
 import os
 import json
+import wandb
 
 np.random.seed(42)
 
@@ -22,6 +23,16 @@ class SMPLX_evalutor():
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.vposer, _ = load_vposer(self.config.vposer_path, vp_model='snapshot')
         self.vposer = self.vposer.to(self.device)
+        
+        # Initialize wandb for evaluation
+        wandb.init(
+            project=config.wandb_project,
+            config=vars(config),
+            name=f"eval_{time.strftime('%Y%m%d_%H%M%S')}",
+            entity=config.wandb_entity,
+            mode=config.wandb_mode,
+            job_type="evaluation"
+        )
 
     def eval(self, model=None):
         if model is None:
@@ -196,6 +207,7 @@ class SMPLX_evalutor():
             mean_path_ori_loss = np.array([loss_dict[k]['path_ori_error'] for k in loss_dict.keys()]).mean()
             mean_des_trans_loss = np.array([loss_dict[k]['des_trans_error'] for k in loss_dict.keys()]).mean()
             mean_des_ori_loss = np.array([loss_dict[k]['des_ori_error'] for k in loss_dict.keys()]).mean()
+            mean_des_latent_loss = np.array([loss_dict[k]['des_latent_error'] for k in loss_dict.keys()]).mean()
             mean_path_p_mpjpe = np.array([loss_dict[k]['path_P-MPJPE'] for k in loss_dict.keys()]).mean()
             mean_path_mpjpe = np.array([loss_dict[k]['path_MPJPE'] for k in loss_dict.keys()]).mean()
             mean_des_p_mpjpe = np.array([loss_dict[k]['des_P-MPJPE'] for k in loss_dict.keys()]).mean()
@@ -275,6 +287,24 @@ class SMPLX_evalutor():
             print('des P-MPJPE:{}'.format(des_p_mpjpe_test_loss))
             print('des MPJPE:{}'.format(des_mpjpe_test_loss))
 
+        # Log evaluation metrics to wandb
+        wandb.log({
+            # Overall metrics (matching training validation format)
+            'val/loss': mean_path_trans_loss + mean_path_ori_loss + mean_des_trans_loss + mean_des_ori_loss,
+            'val/trans_loss': mean_path_trans_loss,
+            'val/ori_loss': mean_path_ori_loss,
+            'val/latent_loss': path_latent_test_loss,
+            'val/rec_loss': mean_rec_loss,
+            'val/des_loss': mean_des_trans_loss + mean_des_ori_loss + mean_des_latent_loss
+        })
+        
+        # Save model artifacts to wandb
+        if self.config.load_model_dir is not None:
+            wandb.save(self.config.load_model_dir)
+        
+        # Finish wandb run
+        wandb.finish()
+        
         return loss_dict, mean_path_trans_loss, mean_path_ori_loss, mean_path_p_mpjpe, mean_des_trans_loss, mean_des_ori_loss, mean_des_p_mpjpe
 
 

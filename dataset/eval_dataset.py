@@ -38,7 +38,7 @@ class EgoEvalDataset(data.Dataset):
         ])
 
     def __getitem__(self, index):
-        ego_idx = self.poses_path_list[index]
+        ego_idx = self.poses_path_list[index] 
         scene = self.scenes_path_list[index]
         seq = self.sequences_path_list[index]
         start_frame, end_frame = self.start_end_list[index]
@@ -83,7 +83,7 @@ class EgoEvalDataset(data.Dataset):
                                             '{}.ply'.format(pose_idx))
                 if os.path.exists(gaze_pc_path):
 
-                    gaze_data = trimesh.load_mesh(gaze_ply_path)
+                    gaze_data = trimesh.load(gaze_ply_path)
                     gaze_data.apply_scale(1 / scale)
                     gaze_data.apply_transform(transform_norm)
 
@@ -92,7 +92,7 @@ class EgoEvalDataset(data.Dataset):
                         gazes_mask[-1] = torch.ones(1).long()
                     gaze_points = gaze_data.vertices[
                                   0:1]  # np.random.choice(range(len(points)), self.config.gaze_points)]
-                    gaze_pc_data = trimesh.load_mesh(gaze_pc_path)
+                    gaze_pc_data = trimesh.load(gaze_pc_path)
                     if len(gaze_pc_data.vertices) == 0 or np.sum(abs(gaze_pc_data.vertices)) < 1e-8:
                         gazes_mask[-1] = torch.ones(0).long()
             # imgs.append(img_data)
@@ -117,7 +117,7 @@ class EgoEvalDataset(data.Dataset):
                 torch.cat([torch.from_numpy(ori_s.copy()).float(), torch.from_numpy(trans_s.copy()).float(),
                            pose_data['latent']]))
             gazes.append(torch.from_numpy(gaze_points).float())
-            smplx = trimesh.load_mesh(os.path.join(self.dataroot, scene, seq, 'smplx_local',
+            smplx = trimesh.load(os.path.join(self.dataroot, scene, seq, 'smplx_local',
                                                    '{}.obj'.format(pose_idx)))
 
             smplx_vertices.append(torch.from_numpy(smplx.vertices).float())
@@ -218,7 +218,7 @@ class EgoEvalDataset(data.Dataset):
             trans_pose2scene = np.array(transform_info['transformation'])
             trans_scene2pose = np.linalg.inv(trans_pose2scene)
 
-            scene_ply = trimesh.load_mesh(os.path.join(self.dataroot, scene, 'scene_obj', 'scene_downsampled.ply'))
+            scene_ply = trimesh.load(os.path.join(self.dataroot, scene, 'scene_obj', 'scene_downsampled.ply'))
             # print(scene_ply.vertices.shape)
 
             scene_points = scene_ply.vertices
