@@ -57,9 +57,9 @@ class MotionFromGazeConfig(ArgumentParser):
         self.train_configs.add_argument('--load_model_dir', type=str, default=None)
         self.train_configs.add_argument('--load_optim_dir', type=str, default=None)
 
-        self.train_configs.add_argument('--epoch', type=int, default=50)
+        self.train_configs.add_argument('--epoch', type=int, default=100)
         self.train_configs.add_argument('--lr', type=float, default=1e-4)
-        self.train_configs.add_argument('--weight_decay', type=float, default=1e-4)
+        self.train_configs.add_argument('--weight_decay', type=float, default=5e-4)
         self.train_configs.add_argument('--gamma', type=float, default=0.99)
         self.train_configs.add_argument('--lambda_ori', type=float, default=1)
         self.train_configs.add_argument('--lambda_trans', type=float, default=1)
@@ -77,6 +77,7 @@ class MotionFromGazeConfig(ArgumentParser):
         self.eval_configs.add_argument('--output_path', default='results', type=str)
         self.eval_configs.add_argument('--smplx_path', default='smplx_models', type=str)
         self.eval_configs.add_argument('--vposer_path', default='vposer_v1_0', type=str)
+        self.eval_configs.add_argument('--comment', default='', type=str, help='Custom comment for evaluation run')
 
     def get_configs(self):
         return self.parse_args()
