@@ -121,17 +121,29 @@ class GIMO_ADT_Model(nn.Module):
         # 7. Predict trajectory for all tokens in the sequence
         all_predictions = self.outputlayer(cross_modal_embedding)
 
-        # Return the full sequence prediction
-        return all_predictions # Shape: [B, sequence_length, object_motion_dim]
+        # Return the full sequence prediction or only future if first_frame_only
+        if self.config.use_first_frame_only:
+            # Return only frames 1 to sequence_length-1
+            return all_predictions[:, 1:, :] # Shape: [B, sequence_length-1, object_motion_dim]
+        else:
+            # Return the full sequence prediction
+            return all_predictions # Shape: [B, sequence_length, object_motion_dim]
 
     def compute_loss(self, predictions, batch):
         """
         Computes the loss for the predicted trajectories using L1 norm, 
         incorporating dynamic history/future split based on attention mask.
         Losses are averaged per sequence based on valid points before batch averaging.
+        
+        When config.use_first_frame_only is True:
+            - `predictions` tensor has shape [B, sequence_length-1, 3]
+            - Loss is calculated only on the future frames (GT indices 1 to N).
+            - Reconstruction loss is set to 0.
 
         Args:
-            predictions: The model's output tensor [B, sequence_length, 3]
+            predictions: The model's output tensor. Shape depends on config.use_first_frame_only.
+                         [B, sequence_length, 3] if False.
+                         [B, sequence_length-1, 3] if True.
             batch: The batch dictionary from the DataLoader, containing ground truth.
                    Expected keys: 'full_positions' [B, sequence_length, 3]
                                   'full_attention_mask' [B, sequence_length]
@@ -142,15 +154,21 @@ class GIMO_ADT_Model(nn.Module):
         """
         gt_full_positions = batch['full_positions'].to(predictions.device)
         gt_full_mask = batch['full_attention_mask'].to(predictions.device) # Shape [B, seq_len]
-        batch_size = predictions.shape[0]
+        batch_size = gt_full_positions.shape[0]
         device = predictions.device
 
         # --- Calculate Dynamic Split Lengths --- 
         actual_lengths = torch.sum(gt_full_mask, dim=1) # [B]
         # Ensure history length is at least 1 and doesn't exceed actual length, and handle dtypes
-        # Ensure min is also a tensor on the correct device
-        min_val_tensor = torch.tensor(1, device=device)
-        dynamic_history_lengths = torch.floor(actual_lengths * self.history_fraction).long().clamp(min=min_val_tensor, max=actual_lengths.long())
+        # In use_first_frame_only mode, history length is effectively 1
+        if self.config.use_first_frame_only:
+            dynamic_history_lengths = torch.ones_like(actual_lengths).long() # History length is always 1
+            # Clamp history length to actual length in case actual_length is 0 (empty trajectory)
+            dynamic_history_lengths = torch.min(dynamic_history_lengths, actual_lengths.long())
+        else:
+            # Ensure min is also a tensor on the correct device
+            min_val_tensor = torch.tensor(1, device=device)
+            dynamic_history_lengths = torch.floor(actual_lengths * self.history_fraction).long().clamp(min=min_val_tensor, max=actual_lengths.long())
         # ---------------------------------------
         
         # Create masks for history and future based on dynamic lengths
@@ -158,30 +176,48 @@ class GIMO_ADT_Model(nn.Module):
         dynamic_history_mask = (indices < dynamic_history_lengths.unsqueeze(1)).float() # [B, seq_len]
         dynamic_future_mask = (indices >= dynamic_history_lengths.unsqueeze(1)) * gt_full_mask # [B, seq_len]
         
-        dynamic_history_mask_expanded = dynamic_history_mask.unsqueeze(-1) # [B, seq_len, 1]
-        dynamic_future_mask_expanded = dynamic_future_mask.unsqueeze(-1)   # [B, seq_len, 1]
-        
+        # Slice masks and GT if use_first_frame_only
+        if self.config.use_first_frame_only:
+            # Loss is calculated on GT indices 1 onwards, prediction indices 0 onwards
+            gt_future_positions = gt_full_positions[:, 1:, :] # [B, seq_len-1, 3]
+            dynamic_future_mask_for_loss = dynamic_future_mask[:, 1:] # [B, seq_len-1]
+            # Predictions tensor already corresponds to GT indices 1 onwards
+            pred_future_positions = predictions # [B, seq_len-1, 3]
+        else:
+            # Use full GT and prediction for standard mode loss calculation
+            gt_future_positions = gt_full_positions
+            pred_future_positions = predictions
+            dynamic_future_mask_for_loss = dynamic_future_mask
+            
         # --- Calculate L1 Reconstruction Loss (XYZ History) --- 
-        loss_rec_per_coord = F.l1_loss(predictions, gt_full_positions, reduction='none') # Compare full sequences
-        loss_rec_per_point = torch.sum(loss_rec_per_coord, dim=-1) # [B, seq_len]
-        masked_loss_rec = loss_rec_per_point * dynamic_history_mask # Apply DYNAMIC history mask [B, seq_len]
-        
-        sum_loss_rec_per_seq = torch.sum(masked_loss_rec, dim=1) # [B]
-        num_valid_hist_per_seq = torch.sum(dynamic_history_mask, dim=1) # [B]
-        valid_rec_mask = num_valid_hist_per_seq > 0
-        mean_loss_rec_per_seq = torch.zeros_like(sum_loss_rec_per_seq)
-        mean_loss_rec_per_seq[valid_rec_mask] = sum_loss_rec_per_seq[valid_rec_mask] / num_valid_hist_per_seq[valid_rec_mask]
-        mean_rec_loss_xyz = torch.sum(mean_loss_rec_per_seq) / torch.sum(valid_rec_mask) if torch.sum(valid_rec_mask) > 0 else torch.tensor(0.0, device=device)
+        # This is only calculated if not use_first_frame_only
+        if not self.config.use_first_frame_only:
+            loss_rec_per_coord = F.l1_loss(predictions, gt_full_positions, reduction='none') # Compare full sequences
+            loss_rec_per_point = torch.sum(loss_rec_per_coord, dim=-1) # [B, seq_len]
+            masked_loss_rec = loss_rec_per_point * dynamic_history_mask # Apply DYNAMIC history mask [B, seq_len]
+            
+            sum_loss_rec_per_seq = torch.sum(masked_loss_rec, dim=1) # [B]
+            num_valid_hist_per_seq = torch.sum(dynamic_history_mask, dim=1) # [B]
+            valid_rec_mask = num_valid_hist_per_seq > 0
+            mean_loss_rec_per_seq = torch.zeros_like(sum_loss_rec_per_seq)
+            mean_loss_rec_per_seq[valid_rec_mask] = sum_loss_rec_per_seq[valid_rec_mask] / num_valid_hist_per_seq[valid_rec_mask]
+            mean_rec_loss_xyz = torch.sum(mean_loss_rec_per_seq) / torch.sum(valid_rec_mask) if torch.sum(valid_rec_mask) > 0 else torch.tensor(0.0, device=device)
+            rec_loss_weight = self.config.lambda_rec_xyz
+        else:
+            mean_rec_loss_xyz = torch.tensor(0.0, device=device)
+            rec_loss_weight = 0.0
         # ------------------------------------------------------
 
         # --- Calculate L1 Path Loss (XYZ Future) --- 
-        # Use the same full L1 difference, but apply the DYNAMIC future mask
-        loss_path_per_coord = loss_rec_per_coord # Reuse from above
-        loss_path_per_point = loss_rec_per_point # Reuse from above
-        masked_loss_path = loss_path_per_point * dynamic_future_mask # Apply DYNAMIC future mask [B, seq_len]
+        # Compare predicted future with GT future using the future mask
+        loss_path_per_coord = F.l1_loss(pred_future_positions, gt_future_positions, reduction='none') # [B, relevant_len, 3]
+        loss_path_per_point = torch.sum(loss_path_per_coord, dim=-1) # [B, relevant_len]
+        
+        # Ensure the mask matches the dimensions being compared
+        masked_loss_path = loss_path_per_point * dynamic_future_mask_for_loss # [B, relevant_len]
         
         sum_loss_path_per_seq = torch.sum(masked_loss_path, dim=1) # [B]
-        num_valid_future_per_seq = torch.sum(dynamic_future_mask, dim=1) # [B]
+        num_valid_future_per_seq = torch.sum(dynamic_future_mask_for_loss, dim=1) # [B]
         valid_path_mask = num_valid_future_per_seq > 0
         mean_loss_path_per_seq = torch.zeros_like(sum_loss_path_per_seq)
         mean_loss_path_per_seq[valid_path_mask] = sum_loss_path_per_seq[valid_path_mask] / num_valid_future_per_seq[valid_path_mask]
@@ -189,21 +225,34 @@ class GIMO_ADT_Model(nn.Module):
         # -------------------------------------------
 
         # --- Calculate L1 Destination Loss (XYZ) --- 
-        # Find the index of the last valid point for each sequence using the original mask
-        last_valid_indices = actual_lengths.long() - 1
-        last_valid_indices = torch.clamp(last_valid_indices, min=0) # Should be >= 0 if actual_lengths >= 1
+        # Find the index of the last valid point in the *original* GT sequence
+        last_valid_indices_gt = actual_lengths.long() - 1
+        last_valid_indices_gt = torch.clamp(last_valid_indices_gt, min=0)
         
         batch_indices = torch.arange(batch_size, device=device)
         
-        # Gather the last valid ground truth and predicted positions
-        last_gt_positions = gt_full_positions[batch_indices, last_valid_indices, :] 
-        last_pred_positions = predictions[batch_indices, last_valid_indices, :] 
+        # Get the last valid ground truth position
+        last_gt_positions = gt_full_positions[batch_indices, last_valid_indices_gt, :]
         
+        # Get the corresponding predicted position
+        if self.config.use_first_frame_only:
+            # Prediction indices are shifted by 1 relative to GT indices
+            # Last valid prediction index corresponds to GT index last_valid_indices_gt - 1
+            last_valid_indices_pred = last_valid_indices_gt - 1
+            # Clamp to ensure index is valid for prediction tensor (length seq_len-1)
+            last_valid_indices_pred = torch.clamp(last_valid_indices_pred, min=0, max=predictions.shape[1] - 1) 
+            last_pred_positions = predictions[batch_indices, last_valid_indices_pred, :]
+        else:
+            # Standard case: index directly corresponds
+            last_pred_positions = predictions[batch_indices, last_valid_indices_gt, :]
+            
         # Calculate L1 loss per destination point
         dest_loss_per_seq = torch.sum(F.l1_loss(last_pred_positions, last_gt_positions, reduction='none'), dim=1) # [B]
         
-        # Only consider sequences that have at least one point (actual_lengths >= 1)
-        valid_dest_mask = actual_lengths >= 1
+        # Only consider sequences that have at least two points (actual_lengths >= 2 for future prediction)
+        # or at least one point in the standard case.
+        min_len_for_dest = 2 if self.config.use_first_frame_only else 1
+        valid_dest_mask = actual_lengths >= min_len_for_dest
         masked_dest_loss = dest_loss_per_seq * valid_dest_mask.float()
         
         # Batch average of destination loss (only over valid sequences)
@@ -211,7 +260,7 @@ class GIMO_ADT_Model(nn.Module):
         # -----------------------------------------
 
         # --- Combine Losses --- 
-        rec_loss_weight = self.config.lambda_rec_xyz if not self.config.use_first_frame_only else 0.0
+        # rec_loss_weight is determined above based on use_first_frame_only
         total_loss = (rec_loss_weight * mean_rec_loss_xyz + 
                       self.config.lambda_path_xyz * mean_path_loss_xyz + 
                       self.config.lambda_dest_xyz * mean_dest_loss_xyz)
