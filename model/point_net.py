@@ -39,9 +39,12 @@ class PointNetDenseCls(nn.Module):
         self.conv2 = torch.nn.Conv1d(256, 128, 1)
         self.conv3 = torch.nn.Conv1d(128, 64, 1)
         self.conv4 = torch.nn.Conv1d(64, self.k, 1)
-        self.bn1 = nn.BatchNorm1d(256)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.bn3 = nn.BatchNorm1d(64)
+        # self.bn1 = nn.BatchNorm1d(256)
+        self.bn1 = nn.InstanceNorm1d(256)   
+        # self.bn2 = nn.BatchNorm1d(128)
+        self.bn2 = nn.InstanceNorm1d(128)
+        # self.bn3 = nn.BatchNorm1d(64)
+        self.bn3 = nn.InstanceNorm1d(64)
 
     def forward(self, x):
         batchsize = x.size()[0]

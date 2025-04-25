@@ -146,7 +146,7 @@ class PerceiveEncoder(nn.Module):
     """ A encoder model with self attention mechanism. """
 
     def __init__(self, n_input_channels, n_latent, n_latent_channels=512, n_cross_att_heads=1,
-        n_self_att_heads=8, n_self_att_layers=6, dropout=0.1, n_position=400):
+        n_self_att_heads=8, n_self_att_layers=6, dropout=0.1, n_position=800):
 
         super().__init__()
 

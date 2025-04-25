@@ -17,6 +17,15 @@ from model.gimo_adt_model import GIMO_ADT_Model
 from torch.utils.data import DataLoader
 from utils.visualization import visualize_trajectory, visualize_prediction, visualize_full_trajectory # Import visualization utils
 
+# --- Import ADT Sequence Utilities ---
+try:
+    from ariaworldgaussians.adt_sequence_utils import find_adt_sequences, create_train_test_split
+    HAS_SEQ_UTILS = True
+except ImportError:
+    print("Warning: Could not import adt_sequence_utils. Sequence splitting requires adt_dataroot to point to pre-split directories or a single sequence.")
+    HAS_SEQ_UTILS = False
+# -------------------------------------
+
 # Set random seed for reproducibility (optional but good practice)
 np.random.seed(42)
 torch.manual_seed(42)
@@ -103,21 +112,29 @@ def validate(model, dataloader, device, config, epoch):
                         print("Warning: Cannot perform dynamic split for visualization - mask missing.")
                         # Fallback or skip visualization for this sample
                         actual_length = gt_full_positions.shape[0]
-                        dynamic_history_length = int(np.floor(actual_length * config.history_fraction))
+                        if config.use_first_frame_only:
+                            history_length_for_vis = 1
+                        else:
+                            history_length_for_vis = int(np.floor(actual_length * config.history_fraction))
+                            history_length_for_vis = max(1, min(history_length_for_vis, actual_length)) # Ensure valid length
                     else:
                         actual_length = torch.sum(gt_full_mask).int().item()
-                        dynamic_history_length = int(np.floor(actual_length * config.history_fraction))
-                        dynamic_history_length = max(1, min(dynamic_history_length, actual_length)) # Ensure valid length
+                        if config.use_first_frame_only:
+                            history_length_for_vis = 1 if actual_length >= 1 else 0 # Past is frame 0
+                        else:
+                            history_length_for_vis = int(np.floor(actual_length * config.history_fraction))
+                            history_length_for_vis = max(1, min(history_length_for_vis, actual_length)) # Ensure valid length
 
-                    vis_past_positions = gt_full_positions[:dynamic_history_length]
-                    vis_future_positions_gt = gt_full_positions[dynamic_history_length:actual_length] # Slice up to actual length
-                    
-                    vis_past_mask = gt_full_mask[:dynamic_history_length] if gt_full_mask is not None else None
-                    vis_future_mask_gt = gt_full_mask[dynamic_history_length:actual_length] if gt_full_mask is not None else None
-                    
+                    # Slice GT based on the calculated history length for visualization
+                    vis_past_positions = gt_full_positions[:history_length_for_vis]
+                    vis_future_positions_gt = gt_full_positions[history_length_for_vis:actual_length] # Slice up to actual length
+
+                    vis_past_mask = gt_full_mask[:history_length_for_vis] if gt_full_mask is not None else None
+                    vis_future_mask_gt = gt_full_mask[history_length_for_vis:actual_length] if gt_full_mask is not None else None
+
                     # Slice prediction dynamically (relative to prediction length which should match GT length)
-                    pred_past_vis = pred_full_trajectory[:dynamic_history_length]
-                    predicted_future_vis = pred_full_trajectory[dynamic_history_length:actual_length]
+                    pred_past_vis = pred_full_trajectory[:history_length_for_vis]
+                    predicted_future_vis = pred_full_trajectory[history_length_for_vis:actual_length]
                     # ----------------------------------------------------
 
                     obj_name = object_names[i]
@@ -276,36 +293,105 @@ def main():
 
     # --- Dataset and DataLoader ---
     logger("Setting up dataset and dataloader...")
-    # --- Use split files if provided, otherwise use all sequences in root dir ---
+
     train_sequences = []
     val_sequences = []
+    loaded_from_files = False
 
-    if config.train_split_file and os.path.exists(config.train_split_file):
-        logger(f"Loading train sequences from {config.train_split_file}")
-        with open(config.train_split_file, 'r') as f:
-            train_sequence_names = [line.strip() for line in f if line.strip()]
-        train_sequences = [os.path.join(config.adt_dataroot, name) for name in train_sequence_names]
-        logger(f"Found {len(train_sequences)} training sequences.")
-    else:
-        logger(f"Warning: Train split file {config.train_split_file} not found or not specified. Using all sequences in {config.adt_dataroot} for training.")
-        # Fallback logic (same as before)
-        if os.path.isdir(config.adt_dataroot):
-            all_items = [os.path.join(config.adt_dataroot, item) for item in os.listdir(config.adt_dataroot)]
-            train_sequences = [item for item in all_items if os.path.isdir(item)]
-            if not train_sequences: logger(f"Error: No sequence directories found in {config.adt_dataroot} for training."); return
-        elif os.path.exists(config.adt_dataroot): train_sequences = [config.adt_dataroot]
-        else: logger(f"Error: adt_dataroot path {config.adt_dataroot} does not exist."); return
+    # --- Check for Provided Split Files ---
+    if config.train_split_file and config.val_split_file:
+        if os.path.exists(config.train_split_file) and os.path.exists(config.val_split_file):
+            logger(f"Loading train sequences from: {config.train_split_file}")
+            logger(f"Loading validation sequences from: {config.val_split_file}")
+            try:
+                with open(config.train_split_file, 'r') as f:
+                    train_sequences = [line.strip() for line in f if line.strip()]
+                with open(config.val_split_file, 'r') as f:
+                    val_sequences = [line.strip() for line in f if line.strip()]
 
-    if config.test_split_file and os.path.exists(config.test_split_file):
-        logger(f"Loading validation sequences from {config.test_split_file}")
-        with open(config.test_split_file, 'r') as f:
-            val_sequence_names = [line.strip() for line in f if line.strip()]
-        val_sequences = [os.path.join(config.adt_dataroot, name) for name in val_sequence_names]
-        logger(f"Found {len(val_sequences)} validation sequences.")
+                if not train_sequences or not val_sequences:
+                    logger("Warning: One or both provided split files are empty. Falling back to dynamic splitting.")
+                else:
+                    logger(f"Loaded {len(train_sequences)} train and {len(val_sequences)} validation sequences from files.")
+                    loaded_from_files = True
+            except Exception as e:
+                logger(f"Error loading split files: {e}. Falling back to dynamic splitting.")
+        else:
+            logger("Warning: Train/Validation split files provided but not found. Falling back to dynamic splitting.")
+
+    # --- Dynamic Sequence Splitting (Fallback) ---
+    if not loaded_from_files:
+        logger("Proceeding with dynamic sequence splitting...")
+        if not os.path.exists(config.adt_dataroot):
+            logger(f"Error: adt_dataroot path {config.adt_dataroot} does not exist.")
+            return
+
+        if os.path.isdir(config.adt_dataroot) and HAS_SEQ_UTILS:
+            logger(f"Scanning for sequences in {config.adt_dataroot}")
+            try:
+                all_sequences = find_adt_sequences(config.adt_dataroot)
+                if not all_sequences:
+                    logger(f"Error: No sequences found in {config.adt_dataroot}.")
+                    return
+
+                logger(f"Found {len(all_sequences)} total sequences. Splitting with train_ratio={config.train_ratio}")
+                train_sequences, val_sequences = create_train_test_split(
+                    all_sequences,
+                    train_ratio=config.train_ratio,
+                    random_seed=config.split_seed,
+                    write_to_file=False # Don't write split files here
+                )
+                logger(f"Using {len(train_sequences)} sequences for training and {len(val_sequences)} for validation (dynamically split).")
+
+                # --- Handle train_ratio = 1.0 case ---
+                if config.train_ratio >= 1.0:
+                     logger("Train ratio is >= 1.0, using all sequences for both training and validation.")
+                     val_sequences = train_sequences
+                # ---------------------------------------
+
+            except Exception as e:
+                logger(f"Error during sequence finding/splitting: {e}. Please check adt_dataroot and utils.")
+                return
+        elif os.path.isdir(config.adt_dataroot) and not HAS_SEQ_UTILS:
+             logger("Warning: adt_sequence_utils not found. Assuming adt_dataroot contains only training sequences.")
+             all_items = [os.path.join(config.adt_dataroot, item) for item in os.listdir(config.adt_dataroot)]
+             train_sequences = [item for item in all_items if os.path.isdir(item)]
+             val_sequences = train_sequences # Use training data for validation as fallback
+             if not train_sequences:
+                 logger(f"Error: No sequence directories found in {config.adt_dataroot} for training."); return
+             logger(f"Using {len(train_sequences)} sequences for training and validation (from directory scan).")
+        elif os.path.exists(config.adt_dataroot): # If it's a single file/sequence path
+             logger(f"Using single sequence {config.adt_dataroot} for training and validation.")
+             train_sequences = [config.adt_dataroot]
+             val_sequences = [config.adt_dataroot]
+        else:
+             # This case should be caught by the initial check, but included for completeness
+             logger(f"Error: Invalid adt_dataroot path {config.adt_dataroot}.")
+             return
+
+    # --- Save the final train and validation sequence lists ---
+    if train_sequences and val_sequences:
+        try:
+            os.makedirs(config.save_path, exist_ok=True) # Ensure directory exists
+            train_split_save_path = os.path.join(config.save_path, 'train_sequences.txt')
+            val_split_save_path = os.path.join(config.save_path, 'val_sequences.txt')
+
+            with open(train_split_save_path, 'w') as f:
+                for seq_path in train_sequences:
+                    f.write(f"{seq_path}\\n")
+            logger(f"Saved final training sequence list ({len(train_sequences)} sequences) to {train_split_save_path}")
+
+            with open(val_split_save_path, 'w') as f:
+                for seq_path in val_sequences:
+                    f.write(f"{seq_path}\\n")
+            logger(f"Saved final validation sequence list ({len(val_sequences)} sequences) to {val_split_save_path}")
+
+        except Exception as e:
+             logger(f"Warning: Could not save final sequence lists: {e}")
     else:
-         logger(f"Warning: Test split file {config.test_split_file} not found or not specified. Using training sequences for validation.")
-         val_sequences = train_sequences # Use training data for validation if no split
-    # --------------------------------------------------------------------------
+        logger("Error: No train or validation sequences were determined. Cannot proceed.")
+        return
+    # -------------------------------------------------------
 
     # Create datasets
     cache_dir = os.path.join(config.save_path, 'trajectory_cache') # Use a dedicated cache dir for this run

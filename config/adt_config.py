@@ -1,4 +1,4 @@
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 
 class ADTObjectMotionConfig(ArgumentParser):
     def __init__(self):
@@ -12,29 +12,32 @@ class ADTObjectMotionConfig(ArgumentParser):
         # === Trajectory & Dataset Configuration ===
         self.traj_dataset_configs = self.add_argument_group('Trajectory & Dataset')
         self.traj_dataset_configs.add_argument('--adt_dataroot', default='./data', type=str, help='Path to ADT sequence or directory containing sequences/split files')
-        self.traj_dataset_configs.add_argument('--train_split_file', default='./splits/train_sequences.txt', type=str, help='Path to train split file')
-        self.traj_dataset_configs.add_argument('--test_split_file', default='./splits/test_sequences.txt', type=str, help='Path to test split file')
+        self.traj_dataset_configs.add_argument('--train_split_file', default=None, type=str, help='Path to train split file (overrides dataroot scan/split)')
+        self.traj_dataset_configs.add_argument('--val_split_file', default=None, type=str, help='Path to validation split file (overrides dataroot scan/split)')
+        self.traj_dataset_configs.add_argument('--train_ratio', default=0.9, type=float, help='Ratio of sequences to use for training (default: 0.9, used if split files not provided)')
+        self.traj_dataset_configs.add_argument('--split_seed', default=42, type=int, help='Random seed for train/val split (used if split files not provided)')
         self.traj_dataset_configs.add_argument('--trajectory_length', default=100, type=int, help='Total length of trajectory segments extracted (before split)')
-        self.traj_dataset_configs.add_argument('--history_fraction', default=0.6, type=float, help='Fraction of trajectory_length to use for history (e.g., 0.6 for 3/5 ratio)')
+        self.traj_dataset_configs.add_argument('--history_fraction', default=0.3, type=float, help='Fraction of trajectory_length to use for history (e.g., 0.6 for 3/5 ratio)')
         self.traj_dataset_configs.add_argument('--object_motion_dim', default=3, type=int, help='Dimension of object trajectory points (e.g., 3 for XYZ)')
         self.traj_dataset_configs.add_argument('--point_cloud_dim', default=3, type=int, help='Dimension of input point cloud points (e.g., 3 for XYZ)')
         self.traj_dataset_configs.add_argument('--skip_frames', default=5, type=int, help='Frames to skip when extracting trajectory points from dataset')
         self.traj_dataset_configs.add_argument('--use_displacements', default=False, action='store_true', help='Use relative displacements instead of absolute positions')
-        self.traj_dataset_configs.add_argument('--load_pointcloud', default=True, type=bool, help='Whether to load point cloud data from sequences')
+        self.traj_dataset_configs.add_argument('--use_first_frame_only', default=False, action='store_true', help='Use only the first frame as input, predict full sequence')
+        self.traj_dataset_configs.add_argument('--load_pointcloud', default=True, action='store_true', help='Enable loading point cloud data from sequences')
         self.traj_dataset_configs.add_argument('--pointcloud_subsample', default=10, type=int, help='Subsample factor for point cloud (higher means fewer points)')
         self.traj_dataset_configs.add_argument('--min_motion_threshold', default=1.0, type=float, help='Minimum motion threshold in meters for trajectory filtering')
         self.traj_dataset_configs.add_argument('--min_motion_percentile', default=0.0, type=float, help='Filter trajectories below this percentile of motion')
-        self.traj_dataset_configs.add_argument('--use_cache', default=True, type=bool, help='Whether to use caching for trajectories')
-        self.traj_dataset_configs.add_argument('--detect_motion_segments', default=True, type=bool, help='Whether to detect and extract active motion segments')
+        self.traj_dataset_configs.add_argument('--use_cache', default=True, action='store_true', help='Enable caching for trajectories')
+        self.traj_dataset_configs.add_argument('--detect_motion_segments', default=False, action='store_true', help='Enable detection and extraction of active motion segments')
         self.traj_dataset_configs.add_argument('--motion_velocity_threshold', default=0.05, type=float, help='Threshold in m/s for detecting active motion')
         self.traj_dataset_configs.add_argument('--min_segment_frames', default=5, type=int, help='Minimum number of frames for a valid motion segment')
         self.traj_dataset_configs.add_argument('--max_stationary_frames', default=3, type=int, help='Maximum consecutive stationary frames allowed in a motion segment')
-        self.traj_dataset_configs.add_argument('--normalize_data', default=True, type=bool, help='Whether to normalize trajectory data using scene bounds')
+        self.traj_dataset_configs.add_argument('--normalize_data', default=False, action='store_true', help='Enable normalization of trajectory data using scene bounds')
 
         # === Scene/Point Cloud Configuration ===
         self.scene_configs = self.add_argument_group('Scene Encoder')
         self.scene_configs.add_argument('--scene_feats_dim', default=256, type=int, help='Output dimension of the PointNet scene encoder')
-        self.scene_configs.add_argument('--sample_points', default=20000, type=int, help='Number of points to sample from the scene point cloud') # Reduced default for potentially large clouds
+        self.scene_configs.add_argument('--sample_points', default=3000, type=int, help='Number of points to sample from the scene point cloud') # Reduced default for potentially large clouds
         # self.scene_configs.add_argument('--pointnet_chkpoints', default='pretrained/point.model', type=str, help='Path to pretrained PointNet weights') # Consider adding back later
 
         # === Motion Pathway Configuration (Based on GIMO) ===
@@ -56,9 +59,9 @@ class ADTObjectMotionConfig(ArgumentParser):
         # === Training Configuration ===
         self.train_configs = self.add_argument_group('Training')
         self.train_configs.add_argument('--save_path', type=str, default='chkpoints_adt/', help='Directory to save checkpoints')
-        self.train_configs.add_argument('--save_fre', type=int, default=10, help='Checkpoint saving frequency (epochs)')
+        self.train_configs.add_argument('--save_fre', type=int, default=50, help='Checkpoint saving frequency (epochs)')
         # self.train_configs.add_argument('--vis_fre', type=int, default=1000) # Maybe redefine for trajectory viz
-        self.train_configs.add_argument('--val_fre', type=int, default=10, help='Validation frequency (epochs)')
+        self.train_configs.add_argument('--val_fre', type=int, default=50, help='Validation frequency (epochs)')
         self.train_configs.add_argument('--num_val_visualizations', type=int, default=10, help='Number of samples to visualize during validation')
         self.train_configs.add_argument('--load_model_dir', type=str, default=None, help='Path to load a pretrained model checkpoint')
         self.train_configs.add_argument('--load_optim_dir', type=str, default=None, help='Path to load optimizer state separately')

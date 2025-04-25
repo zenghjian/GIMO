@@ -81,7 +81,8 @@ class PointNet2SemSegSSG(PointNet2ClassificationSSG):
 
         self.fc_layer = nn.Sequential(
             nn.Conv1d(128, self.hparams['feat_dim'], kernel_size=1, bias=False),
-            nn.BatchNorm1d(self.hparams['feat_dim']),
+            # nn.BatchNorm1d(self.hparams['feat_dim']),
+            nn.InstanceNorm1d(self.hparams['feat_dim']),
             nn.ReLU(True),
         )
 
@@ -148,12 +149,14 @@ class PointNet2SemSegSSGShape(PointNet2ClassificationSSG):
 
         self.fc_layer = nn.Sequential(
             nn.Conv1d(128, self.hparams['feat_dim'], kernel_size=1, bias=False),
-            nn.BatchNorm1d(self.hparams['feat_dim']),
+            # nn.BatchNorm1d(self.hparams['feat_dim']),
+            nn.InstanceNorm1d(self.hparams['feat_dim']),
             nn.ReLU(True),
         )
         self.fc_layer2 = nn.Sequential(
             nn.Linear(256, self.hparams['feat_dim']),
-            nn.BatchNorm1d(self.hparams['feat_dim']),
+            #   nn.BatchNorm1d(self.hparams['feat_dim']),
+            nn.InstanceNorm1d(self.hparams['feat_dim']),
             nn.ReLU(True),
         )
 
@@ -195,9 +198,12 @@ class PointNet(nn.Module):
         self.conv2 = nn.Conv1d(feat_dim, feat_dim, 1)
         self.conv3 = nn.Conv1d(feat_dim, feat_dim, 1)
 
-        self.bn1 = nn.BatchNorm1d(feat_dim)
-        self.bn2 = nn.BatchNorm1d(feat_dim)
-        self.bn3 = nn.BatchNorm1d(feat_dim)
+        # self.bn1 = nn.BatchNorm1d(feat_dim)
+        self.bn1 = nn.InstanceNorm1d(feat_dim)
+        # self.bn2 = nn.BatchNorm1d(feat_dim)
+        self.bn2 = nn.InstanceNorm1d(feat_dim)
+        # self.bn3 = nn.BatchNorm1d(feat_dim)
+        self.bn3 = nn.InstanceNorm1d(feat_dim)
 
     # B x 2F x N
     # output: B x F

@@ -1,80 +1,174 @@
-# GIMO: Gaze-Informed Human Motion Prediction in Context (ECCV 2022)
- ![demo](./assets/dataset_overview.jpg)
+# GIMO for ADT Object Motion Prediction
 
-## Introduction
+This project adapts the GIMO (Generalizable Implicit Motion) architecture to predict the 3D motion of objects within Aria Digital Twin (ADT) sequences. It takes ADT scene data, including object trajectories and point clouds, as input and outputs predictions for future object motion.
 
-This is the official repo of our paper [GIMO: Gaze-Informed Human Motion Prediction in Context](https://arxiv.org/abs/2204.09443).
+## Features
 
-For more information, please visit our [project page](https://geometry.stanford.edu/projects/gimo/).
+*   **3D Object Motion Prediction:** Predicts future 3D coordinates (XYZ) of objects based on their historical motion and scene context.
+*   **GIMO-Inspired Architecture:** Utilizes a transformer-based model incorporating:
+    *   A scene encoder (PointNet-based) to process static scene point clouds.
+    *   A motion encoder/decoder transformer to model object dynamics.
+    *   Cross-modal attention mechanisms to fuse scene and motion information.
+*   **ADT Data Compatibility:** Designed to work directly with ADT sequence data format.
+*   **Flexible Data Loading:**
+    *   Supports automatic scanning of directories containing multiple ADT sequences.
+    *   Allows specifying pre-defined training and validation splits using text files (`--train_split_file`, `--val_split_file`).
+    *   Falls back to dynamic train/validation splitting based on a ratio (`--train_ratio`) if split files are not provided (requires `adt_sequence_utils`).
+*   **Point Cloud Processing:** Extracts and utilizes scene point clouds for contextual understanding.
+*   **Trajectory Caching:** Caches processed trajectory data for faster loading during subsequent runs (`--use_cache`).
+*   **Motion Filtering:**
+    *   Filters static or minimally moving trajectories based on a threshold (`--min_motion_threshold`).
+    *   Optionally filters based on motion percentile (`--min_motion_percentile`).
+*   **Motion Segment Detection (Optional):** Can detect and extract active motion segments within longer trajectories (`--detect_motion_segments`).
+*   **Validation & Visualization:** Includes validation loops and generates visualizations of ground truth and predicted trajectories.
+*   **Weights & Biases Integration:** Logs metrics, configurations, and visualizations to WandB for experiment tracking (`--wandb_project`, `--wandb_entity`, `--wandb_mode`).
+*   **Configuration:** Highly configurable through command-line arguments (see `config/adt_config.py`).
 
-## Demo
+## Installation
 
-A demo of our dataset:
+1.  **Clone the repository:**
+    ```bash
+    git clone <your-repo-url>
+    cd <your-repo-directory>
+    ```
 
-<img src="./assets/demo.gif" alt="demo" width="480" align="left;">
+2.  **Create a virtual environment (recommended):**
+    ```bash
+    python -m venv venv
+    source venv/bin/activate  # Linux/macOS
+    # venv\\Scripts\\activate  # Windows
+    ```
+    Or using Conda:
+    ```bash
+    conda create -n gimo_adt python=3.9
+    conda activate gimo_adt
+    ```
 
-Demo data can be downloaded from [**here**](https://drive.google.com/file/d/1cTF1zFcYbxAh8GZ5MsDK16C-iGubUgfn/view?usp=sharing)
+3.  **Install dependencies:**
+    ```bash
+    pip install torch torchvision torchaudio numpy tqdm wandb
+    ```
+    *(Consider creating a `requirements.txt` file)*
 
-## Quickstart
+## Training
 
-To setup the environment, firstly install the packages in requirements.txt:
+Use the `train_adt.py` script to train the motion prediction model.
 
+**Basic Command Structure:**
+
+```bash
+python train_adt.py --adt_dataroot <path_to_data> --save_path <path_to_save_checkpoints> [OPTIONS]
 ```
-pip install -r requirements.txt
+
+**Key Arguments:**
+
+*   `--adt_dataroot`: Path to the root directory containing ADT sequences OR path to a single sequence file/directory (used for scanning if split files aren't provided).
+*   `--save_path`: Directory where checkpoints, logs, and visualizations will be saved.
+*   `--train_split_file`: (Optional) Path to the text file listing training sequence paths.
+*   `--val_split_file`: (Optional) Path to the text file listing validation sequence paths.
+*   `--batch_size`: Training batch size.
+*   `--epoch`: Number of training epochs.
+*   `--lr`: Learning rate.
+*   `--trajectory_length`: Length of trajectory segments to extract.
+*   `--history_fraction`: Fraction of trajectory length used as input history (e.g., 0.3 means 30% history, 70% future prediction).
+*   `--load_pointcloud`: Enable/disable loading scene point clouds (default: True).
+*   `--sample_points`: Number of points to sample from the scene point cloud.
+*   `--wandb_project`: Name of the WandB project.
+*   `--wandb_entity`: Your WandB username or team name.
+*   `--wandb_mode`: `online`, `offline`, or `disabled`.
+
+**Example (Dynamic Splitting - requires `adt_sequence_utils`):**
+
+```bash
+python train_adt.py \
+    --adt_dataroot ./data/adt_sequences \
+    --save_path ./chkpoints_adt \
+    --epoch 100 \
+    --batch_size 4 \
+    --lr 1e-4 \
+    --train_ratio 0.9 \
+    --trajectory_length 100 \
+    --history_fraction 0.3 \
+    --sample_points 3000 \
+    --wandb_project "ADT_Motion_Prediction" \
+    --wandb_mode online
 ```
 
-Install PointNet++ as described [here](https://github.com/daerduoCarey/o2oafford/tree/main/exps) :
+**Example (Using Split Files):**
 
-```
-git clone --recursive https://github.com/erikwijmans/Pointnet2_PyTorch
-cd Pointnet2_PyTorch
-# [IMPORTANT] comment these two lines of code:
-#   https://github.com/erikwijmans/Pointnet2_PyTorch/blob/master/pointnet2_ops_lib/pointnet2_ops/_ext-src/src/sampling_gpu.cu#L100-L101
-# [IMPORTANT] Also, you need to change l196-198 of file `[PATH-TO-VENV]/lib64/python3.8/site-packages/pointnet2_ops/pointnet2_modules.py` to `interpolated_feats = known_feats.repeat(1, 1, unknown.shape[1])`)
-pip install -r requirements.txt
-pip install -e .
-```
-
-Download and install [Vposer](https://github.com/nghorbani/human_body_prior), [SMPL-X](https://github.com/vchoutas/smplx)
-
-Download the [pertained weight](https://drive.google.com/file/d/1P48SaFSrBguUDdY0FwXeFqZtuU7KfEyX/view?usp=sharing) and put it in the checkpoints folder
-
-For a quickstart, run:
-
-```
-bash scripts/eval.sh
+```bash
+python train_adt.py \
+    --adt_dataroot ./data/adt_sequences \
+    --train_split_file ./data/splits/train.txt \
+    --val_split_file ./data/splits/val.txt \
+    --save_path ./chkpoints_adt_split \
+    --epoch 100 \
+    --batch_size 4 \
+    --lr 1e-4 \
+    --trajectory_length 100 \
+    --history_fraction 0.3 \
+    --sample_points 3000 \
+    --wandb_project "ADT_Motion_Prediction" \
+    --wandb_mode online
 ```
 
-You can download the full dataset and have a test.
+## Evaluation
 
-## Dataset
-### Agreement
-1. The GIMO dataset (the "Dataset") is available for **non-commercial** research purposes only. Any other use, in particular any use for commercial purposes, is prohibited. This includes, without limitation, incorporation in a commercial product, use in a commercial service, as training data for a commercial product, for commercial ergonomic analysis (e.g. product design, architectural design, etc.), or production of other artifacts for commercial purposes including, for example, web services, movies, television programs, mobile applications, or video games. The dataset may not be used for pornographic purposes or to generate pornographic material whether commercial or not. The Dataset may not be reproduced, modified and/or made available in any form to any third party without our prior written permission.
+Evaluation is performed using the `evaluate_gimo_adt.py` script (details depend on its implementation). It typically involves:
 
-2. You agree **not to** reproduce, modified, duplicate, copy, sell, trade, resell or exploit any portion of the images and any portion of derived data in any form to any third party without our prior written permission
+1.  Loading a trained model checkpoint (`--load_model_dir`).
+2.  Specifying the dataset (`--adt_dataroot` and potentially `--val_split_file` or a dedicated test split file).
+3.  Running inference and calculating evaluation metrics (e.g., ADE, FDE).
+4.  Saving results to an output directory (`--output_path`).
 
-3. You agree **not to** further copy, publish or distribute any portion of the Dataset. Except, for internal use at a single site within the same organization it is allowed to make copies of the dataset.
+**Example (Conceptual):**
 
-4. Stanford University and Tsinghua University reserve the right to terminate your access to the Dataset at any time.
-
-### Download Instructions 
-The dataset is encrypted to prevent unauthorized access.
-
-Please fill the [request form](./assets/GIMO_Dataset_Agreement.pdf) and send it to Yang Zheng (yzheng18@stanford.edu) to request the download link. 
-
-By requesting for the link, you acknowledge that you have read the agreement, understand it, and agree to be bound by them. If you do not agree with these terms and conditions, you must not download and/or use the Dataset.
-
-### Dataset Structure & Visualization
-You can refer to [README](./demo_data/README.md) for details.
-
-### Citation
-If you find this repo useful for your research, please consider citing:
+```bash
+python evaluate_gimo_adt.py \
+    --load_model_dir ./chkpoints_adt/best_model.pth \
+    --adt_dataroot ./data/adt_sequences \
+    --output_path ./results_adt \
+    --batch_size 8
 ```
-@article{zheng2022gimo,
-  title={GIMO: Gaze-Informed Human Motion Prediction in Context},
-  author={Zheng, Yang and Yang, Yanchao and Mo, Kaichun and Li, Jiaman and Yu, Tao and Liu, Yebin and Liu, Karen and Guibas, Leonidas J},
-  journal={arXiv preprint arXiv:2204.09443},
-  year={2022}
-}
 
-```
+## Configuration Options
+
+For a detailed list of all configuration options and their descriptions, please refer to the `ADTObjectMotionConfig` class in `config/adt_config.py`. Key argument groups include:
+
+*   **Input:** Batch size, data loader workers.
+*   **Trajectory & Dataset:** Data paths, split configurations, trajectory parameters (length, history, skipping), point cloud settings, caching, motion filtering/segmentation.
+*   **Scene Encoder:** PointNet configuration (feature dimensions, sampling).
+*   **Motion Transformer:** Transformer architecture details (dimensions, heads, layers).
+*   **Cross-Modal Transformer:** Configuration for the cross-attention module.
+*   **Training:** Checkpoint saving, validation frequency, visualization count, resuming options, optimizer/scheduler settings, loss weights.
+*   **WandB:** Project/entity/mode settings.
+*   **Evaluation:** Output path for evaluation results.
+
+## Output Files
+
+During training, the following files and directories are created under the specified `--save_path`:
+
+*   `chkpt_epoch_*.pth`: Checkpoints saved periodically based on `--save_fre`.
+*   `best_model.pth`: Model checkpoint with the lowest validation loss achieved so far.
+*   `final_model.pth`: Model checkpoint saved after the last training epoch.
+*   `train_log.txt`: Text file containing training and validation logs.
+*   `train_sequences.txt`: List of sequence paths used for training (saved regardless of whether split files were provided).
+*   `val_sequences.txt`: List of sequence paths used for validation (saved regardless of whether split files were provided).
+*   `val_visualizations/`: Directory containing trajectory visualizations generated during validation loops (organized by epoch).
+    *   `epoch_*/{obj_name}_trajectory_split.png`: Ground truth history/future split.
+    *   `epoch_*/{obj_name}_prediction_vs_gt_epoch{epoch}.png`: Prediction vs. Ground Truth.
+    *   `epoch_*/{obj_name}_full_trajectory.png`: Full Ground Truth trajectory.
+*   `trajectory_cache/`: Stores cached trajectory data (`.pkl` files) if `--use_cache` is enabled.
+
+The evaluation script (`evaluate_gimo_adt.py`) will save its outputs (metrics, potentially predicted trajectories) to the directory specified by its `--output_path` argument.
+
+## Dependencies
+
+*   Python (>= 3.8 recommended)
+*   PyTorch (>= 1.10)
+*   NumPy
+*   tqdm
+*   WandB
+*   (Optional) `adt_sequence_utils` from `ariaworldgaussians`
+
+*(Create a `requirements.txt` file for easier installation)* 
