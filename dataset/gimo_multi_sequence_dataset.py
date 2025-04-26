@@ -54,13 +54,14 @@ class GIMOMultiSequenceDataset(Dataset):
         device_num: int = 0,
         transform=None,
         load_pointcloud: bool = True,
-        pointcloud_subsample: int = 10,
+        pointcloud_subsample: int = 1,  # Changed to 1 to use full resolution
         min_motion_threshold: float = 1.0,
         min_motion_percentile: float = 0.0,
         use_displacements: bool = False,
         use_cache: bool = True,
         cache_dir: Optional[str] = None,
         normalize_data: bool = True,
+        trajectory_pointcloud_radius: float = 0.5,  # Added parameter for trajectory filtering
     ):
         """
         Initialize the multi-sequence dataset for GIMO.
@@ -82,6 +83,7 @@ class GIMOMultiSequenceDataset(Dataset):
             use_cache: Whether to use caching (if config not provided)
             cache_dir: Directory for caching trajectory data (if config not provided)
             normalize_data: Whether to normalize data using scene bounds (if config not provided)
+            trajectory_pointcloud_radius: Radius around trajectory to collect points (meters)
         """
         self.sequence_paths = sequence_paths
         
@@ -97,6 +99,7 @@ class GIMOMultiSequenceDataset(Dataset):
             self.use_displacements = getattr(config, 'use_displacements', use_displacements)
             self.use_cache = getattr(config, 'use_cache', use_cache)
             self.normalize_data = getattr(config, 'normalize_data', normalize_data)
+            self.trajectory_pointcloud_radius = getattr(config, 'trajectory_pointcloud_radius', trajectory_pointcloud_radius)
             # For cache_dir, don't use config directly - it will be set below from save_path if provided
         else:
             self.trajectory_length = trajectory_length
@@ -109,6 +112,7 @@ class GIMOMultiSequenceDataset(Dataset):
             self.use_displacements = use_displacements
             self.use_cache = use_cache
             self.normalize_data = normalize_data
+            self.trajectory_pointcloud_radius = trajectory_pointcloud_radius
         
         # These parameters don't typically come from config
         self.max_objects = max_objects
@@ -182,7 +186,8 @@ class GIMOMultiSequenceDataset(Dataset):
                     motion_velocity_threshold=getattr(self, 'motion_velocity_threshold', 0.05),
                     min_segment_frames=getattr(self, 'min_segment_frames', 5),
                     max_stationary_frames=getattr(self, 'max_stationary_frames', 3),
-                    normalize_data=self.normalize_data
+                    normalize_data=self.normalize_data,
+                    trajectory_pointcloud_radius=self.trajectory_pointcloud_radius
                 )
                 
                 # If the dataset has trajectories, add it to our collection
@@ -235,30 +240,46 @@ class GIMOMultiSequenceDataset(Dataset):
         sample['dataset_idx'] = dataset_idx # Add dataset_idx to the sample
         
         # --- Perform Past/Future Split Here --- 
-        if 'positions' in sample and 'attention_mask' in sample:
+        # Check if we have poses (6D) or positions (3D) - handle both for backward compatibility
+        if 'poses' in sample:
             # Rename to full_ versions and remove original keys
+            sample['full_poses'] = sample.pop('poses')
+            sample['full_attention_mask'] = sample.pop('attention_mask')
+            
+            # Make sure positions/orientations are also available
+            if 'positions' not in sample:
+                sample['full_positions'] = sample['full_poses'][:, :3]  # Extract positions
+            else:
+                sample['full_positions'] = sample.pop('positions')  # Rename positions
+                
+            if 'orientations' not in sample:
+                sample['full_orientations'] = sample['full_poses'][:, 3:]  # Extract orientations
+            else:
+                sample['full_orientations'] = sample.pop('orientations')  # Rename orientations
+                
+        elif 'positions' in sample and 'attention_mask' in sample:
+            # Legacy case - only positions available
             sample['full_positions'] = sample.pop('positions')
             sample['full_attention_mask'] = sample.pop('attention_mask')
             
-            # No longer create past_/future_ keys here
-            # hist_len = self.history_length 
-            # sample['past_positions'] = sample['full_positions'][:hist_len]
-            # sample['future_positions'] = sample['full_positions'][hist_len:]
-            # sample['past_mask'] = sample['full_attention_mask'][:hist_len]
-            # sample['future_mask'] = sample['full_attention_mask'][hist_len:]
+            # Create empty orientation tensor with zeros (fall back, should not happen with updated dataset)
+            sample['full_orientations'] = torch.zeros_like(sample['full_positions'])
+            
+            # Create combined poses tensor
+            sample['full_poses'] = torch.cat([sample['full_positions'], sample['full_orientations']], dim=1)
+            print(f"Warning: Created placeholder orientations for sample without orientation data")
         else:
-            print(f"Warning: Could not find 'positions' or 'attention_mask' in sample from {sequence_path}")
+            print(f"Warning: Could not find 'poses' or 'positions' in sample from {sequence_path}")
             # Assign placeholder tensors if data is missing to ensure consistent keys
             dummy_pos = torch.zeros((self.trajectory_length, 3), dtype=torch.float)
+            dummy_ori = torch.zeros((self.trajectory_length, 3), dtype=torch.float)
+            dummy_poses = torch.zeros((self.trajectory_length, 6), dtype=torch.float)
             dummy_mask = torch.zeros(self.trajectory_length, dtype=torch.float)
-            sample['full_positions'] = dummy_pos
-            sample['full_attention_mask'] = dummy_mask
-            # Ensure other keys that might be expected are also handled if needed
-            if 'past_positions' in sample: del sample['past_positions']
-            if 'future_positions' in sample: del sample['future_positions']
-            if 'past_mask' in sample: del sample['past_mask']
-            if 'future_mask' in sample: del sample['future_mask']
             
+            sample['full_positions'] = dummy_pos
+            sample['full_orientations'] = dummy_ori
+            sample['full_poses'] = dummy_poses
+            sample['full_attention_mask'] = dummy_mask
         # -------------------------------------
         
         # Add segment_idx if available in original metadata
@@ -283,8 +304,16 @@ class GIMOMultiSequenceDataset(Dataset):
         elif not isinstance(first_pos, torch.Tensor) and first_pos is not None:
              print(f"Warning: Unexpected type for first_position: {type(first_pos)}. Setting to None.")
              sample['first_position'] = None # Or handle error appropriately
-             
-        # Add more checks as needed
+
+        # Make sure trajectory-specific pointcloud is included if available
+        if 'trajectory_specific_pointcloud' not in sample:
+            try:
+                # Get trajectory-specific point cloud directly from the original dataset
+                traj_pc = self.individual_datasets[dataset_idx].get_trajectory_specific_pointcloud(local_idx)
+                if traj_pc is not None:
+                    sample['trajectory_specific_pointcloud'] = traj_pc
+            except Exception as e:
+                print(f"Warning: Could not get trajectory-specific point cloud for sample {idx}: {e}")
 
         return sample
     
@@ -301,4 +330,28 @@ class GIMOMultiSequenceDataset(Dataset):
         if not self.individual_datasets or dataset_idx >= len(self.individual_datasets):
             return None
         
-        return self.individual_datasets[dataset_idx].get_scene_pointcloud() 
+        return self.individual_datasets[dataset_idx].get_scene_pointcloud()
+        
+    def get_trajectory_specific_pointcloud(self, idx):
+        """
+        Get the trajectory-specific pointcloud for a given global trajectory index.
+        
+        Args:
+            idx: Global index of the trajectory
+            
+        Returns:
+            np.ndarray: The trajectory-specific point cloud or None if not available
+        """
+        if idx < 0 or idx >= len(self.index_map):
+            print(f"Error: Index {idx} out of range [0, {len(self.index_map)-1}]")
+            return None
+            
+        # Look up which dataset and local index to use
+        dataset_idx, local_idx = self.index_map[idx]
+        
+        # Get the trajectory-specific point cloud from the underlying dataset
+        try:
+            return self.individual_datasets[dataset_idx].get_trajectory_specific_pointcloud(local_idx)
+        except Exception as e:
+            print(f"Error getting trajectory-specific point cloud: {e}")
+            return None 

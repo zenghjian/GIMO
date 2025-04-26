@@ -14,6 +14,7 @@ from torch.utils.data import Dataset, DataLoader
 # Add Matplotlib imports for point cloud visualization
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+import traceback
 
 # Imports from our project
 from config.adt_config import ADTObjectMotionConfig
@@ -42,54 +43,6 @@ def log_metrics(epoch, title, metrics, logger_func):
     log_str += " | Components: " + " | ".join([f"{k}: {v:.4f}" for k, v in metrics.items() if k != 'total_loss'])
     logger_func(log_str)
 
-# --- Point Cloud Visualization Function ---
-def visualize_point_cloud(points, save_path, title="Scene Point Cloud"):
-    """Saves a 3D scatter plot of the point cloud."""
-    if points is None or len(points) == 0:
-        print("Point cloud is empty, cannot visualize.")
-        return
-
-    try:
-        fig = plt.figure(figsize=(10, 8))
-        ax = fig.add_subplot(111, projection='3d')
-
-        # Ensure points is a NumPy array
-        if isinstance(points, torch.Tensor):
-            points_np = points.cpu().numpy()
-        else:
-            points_np = np.asarray(points)
-
-        if points_np.ndim != 2 or points_np.shape[1] != 3:
-            print(f"Invalid point cloud shape: {points_np.shape}. Expected (N, 3).")
-            plt.close(fig)
-            return
-
-        # Scatter plot
-        ax.scatter(points_np[:, 0], points_np[:, 1], points_np[:, 2], s=1) # s=1 for smaller points
-
-        # Set labels and title
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_zlabel("Z")
-        ax.set_title(title)
-
-        # Adjust view or limits if needed
-        # ax.view_init(elev=20., azim=-35)
-        # ax.set_xlim([min_x, max_x])
-        # ax.set_ylim([min_y, max_y])
-        # ax.set_zlim([min_z, max_z])
-
-        # Save the figure
-        plt.savefig(save_path, bbox_inches='tight')
-        plt.close(fig) # Close the figure to free memory
-        print(f"Saved point cloud visualization to: {save_path}")
-
-    except Exception as e:
-        print(f"Error during point cloud visualization: {e}")
-        if 'fig' in locals():
-            plt.close(fig)
-# ----------------------------------------
-
 def validate(model, dataloader, device, config, epoch):
     model.eval() # Set model to evaluation mode
     val_total_loss = 0.0
@@ -107,10 +60,20 @@ def validate(model, dataloader, device, config, epoch):
         # Since batch size is 1, no need for progress bar usually
         for batch_idx, batch in enumerate(dataloader):
             try:
-                full_trajectory_batch = batch['full_positions'].float().to(device)
+                full_trajectory_batch = batch['full_poses'].float().to(device)
                 point_cloud_batch = batch['point_cloud'].float().to(device) # Get point cloud from collated batch
                 # Move mask to device for loss calc
                 batch['full_attention_mask'] = batch['full_attention_mask'].to(device)
+                
+                # Prepare input trajectory for the model based on config
+                if config.use_first_frame_only:
+                    # Use only the first frame as input
+                    input_trajectory_batch = full_trajectory_batch[:, 0:1, :]
+                else:
+                    # Use a fixed portion of the history as input
+                    fixed_history_length = int(np.floor(full_trajectory_batch.shape[1] * config.history_fraction))
+                    input_trajectory_batch = full_trajectory_batch[:, :fixed_history_length, :]
+                
                 # Ensure object names are usable (e.g., list of strings)
                 object_names = batch.get('object_name', [f"unknown_{i}" for i in range(full_trajectory_batch.shape[0])])
                 # Ensure object IDs are usable
@@ -123,7 +86,8 @@ def validate(model, dataloader, device, config, epoch):
                 print(f"Error processing validation batch {batch_idx}: {e}. Skipping batch.")
                 continue
 
-            predicted_full_trajectory = model(full_trajectory_batch, point_cloud_batch)
+            # Forward pass with input trajectory only
+            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch)
             total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
 
             val_total_loss += total_loss.item()
@@ -140,18 +104,21 @@ def validate(model, dataloader, device, config, epoch):
                 samples_to_vis = 1
                 
                 # Extract data for visualization (index 0)
-                gt_full_positions_batch = batch['full_positions'] # Renamed for clarity
+                gt_full_poses_batch = batch['full_poses'] # Get full poses (positions + orientations)
                 gt_full_mask_batch = batch.get('full_attention_mask')
-                pred_full_trajectory_batch = predicted_full_trajectory # Renamed for clarity
+                pred_full_trajectory_batch = predicted_full_trajectory # Predicted full trajectory
                 
                 for i in range(samples_to_vis): # Will only run once
                     if visualized_count >= vis_limit:
                         break
                         
                     # Get data for the current sample (the only sample)
-                    gt_full_positions = gt_full_positions_batch[i]
+                    gt_full_positions = gt_full_poses_batch[i, :, :3]
+                    gt_full_orientations = gt_full_poses_batch[i, :, 3:]
                     gt_full_mask = gt_full_mask_batch[i] if gt_full_mask_batch is not None else None
-                    pred_full_trajectory = pred_full_trajectory_batch[i]
+                    pred_full_positions = pred_full_trajectory_batch[i, :, :3]
+                    pred_full_orientations = pred_full_trajectory_batch[i, :, 3:]
+                    sample_pointcloud = point_cloud_batch[i].cpu()  # Get point cloud for this sample
                     
                     # --- Dynamic Split Calculation for Visualization ---
                     if gt_full_mask is None:
@@ -173,22 +140,25 @@ def validate(model, dataloader, device, config, epoch):
                     # Slice GT based on the calculated history length for visualization
                     vis_past_positions = gt_full_positions[:history_length_for_vis]
                     vis_future_positions_gt = gt_full_positions[history_length_for_vis:actual_length] # Slice up to actual length
+                    
+                    vis_past_orientations = gt_full_orientations[:history_length_for_vis]
+                    vis_future_orientations_gt = gt_full_orientations[history_length_for_vis:actual_length]
 
                     vis_past_mask = gt_full_mask[:history_length_for_vis] if gt_full_mask is not None else None
                     vis_future_mask_gt = gt_full_mask[history_length_for_vis:actual_length] if gt_full_mask is not None else None
 
                     # Slice prediction dynamically based on use_first_frame_only
                     if config.use_first_frame_only:
-                        # Model output is only the future (frames 1 onwards)
-                        # We need to slice it to match the valid future length from GT mask
-                        # actual_length includes frame 0, so future has actual_length-1 points.
-                        # Prediction tensor indices 0 to actual_length-2 correspond to GT indices 1 to actual_length-1.
-                        valid_future_len = actual_length - history_length_for_vis # history_length_for_vis is 1 here
-                        predicted_future_vis = pred_full_trajectory[:valid_future_len] 
+                        valid_future_len = actual_length - history_length_for_vis
+                        predicted_future_positions = pred_full_positions[:valid_future_len] 
+                        predicted_future_orientations = pred_full_orientations[:valid_future_len]
                     else:
                         # Standard case: model output is full trajectory
-                        pred_past_vis = pred_full_trajectory[:history_length_for_vis]
-                        predicted_future_vis = pred_full_trajectory[history_length_for_vis:actual_length]
+                        pred_past_positions = pred_full_positions[:history_length_for_vis]
+                        predicted_future_positions = pred_full_positions[history_length_for_vis:actual_length]
+                        
+                        pred_past_orientations = pred_full_orientations[:history_length_for_vis]
+                        predicted_future_orientations = pred_full_orientations[history_length_for_vis:actual_length]
                     # ----------------------------------------------------
 
                     obj_name = object_names[i]
@@ -201,15 +171,25 @@ def validate(model, dataloader, device, config, epoch):
                         filename_base = f"{obj_name}"
                         vis_title_base = f"{obj_name}"
                     
-                    full_traj_path = os.path.join(vis_output_dir, f"{filename_base}_full_trajectory.png")
+                    # Check if orientation visualization is enabled
+                    show_ori_arrows = getattr(config, 'show_ori_arrows', False)
+                    viz_ori_scale = getattr(config, 'viz_ori_scale', 0.2)
+                    
+                    # Full Trajectory Visualization - now with point cloud and orientation
+                    full_traj_path = os.path.join(vis_output_dir, f"{filename_base}_full_trajectory_with_scene_epoch{epoch}.png")
                     visualize_full_trajectory(
                         positions=gt_full_positions,
                         attention_mask=gt_full_mask,
+                        point_cloud=sample_pointcloud,  # Pass the point cloud
                         title=f"Full GT - {vis_title_base}",
                         save_path=full_traj_path,
-                        segment_idx=segment_idx
+                        segment_idx=segment_idx,
+                        show_orientation=show_ori_arrows,
+                        orientations=gt_full_orientations,
+                        arrow_scale=viz_ori_scale
                     )
                     
+                    # Split Trajectory Visualization (uses dynamically sliced data)
                     split_traj_path = os.path.join(vis_output_dir, f"{filename_base}_trajectory_split.png")
                     visualize_trajectory(
                         past_positions=vis_past_positions,
@@ -218,19 +198,29 @@ def validate(model, dataloader, device, config, epoch):
                         future_mask=vis_future_mask_gt,
                         title=f"Split GT - {vis_title_base}",
                         save_path=split_traj_path,
-                        segment_idx=segment_idx
+                        segment_idx=segment_idx,
+                        show_orientation=show_ori_arrows,
+                        past_orientations=vis_past_orientations,
+                        future_orientations=vis_future_orientations_gt,
+                        arrow_scale=viz_ori_scale
                     )
                     
+                    # Prediction vs GT Visualization (uses dynamically sliced data)
                     pred_vs_gt_path = os.path.join(vis_output_dir, f"{filename_base}_prediction_vs_gt_epoch{epoch}.png")
                     visualize_prediction(
                         past_positions=vis_past_positions,
                         future_positions_gt=vis_future_positions_gt,
-                        future_positions_pred=predicted_future_vis,
+                        future_positions_pred=predicted_future_positions, # Use dynamically sliced prediction
                         past_mask=vis_past_mask,
-                        future_mask_gt=vis_future_mask_gt,
+                        future_mask_gt=vis_future_mask_gt, # Corrected argument name
                         title=f"Pred vs GT - {vis_title_base} (Epoch {epoch})",
                         save_path=pred_vs_gt_path,
-                        segment_idx=segment_idx
+                        segment_idx=segment_idx,
+                        show_orientation=show_ori_arrows,
+                        past_orientations=vis_past_orientations,
+                        future_orientations_gt=vis_future_orientations_gt,
+                        future_orientations_pred=predicted_future_orientations,
+                        arrow_scale=viz_ori_scale
                     )
                     
                     visualized_count += 1
@@ -243,12 +233,10 @@ def validate(model, dataloader, device, config, epoch):
     
     return avg_loss_components
 
-# --- Custom Collate Function (Unchanged) ---
+# --- Custom Collate Function (Updated for trajectory-specific point clouds) ---
 def gimo_collate_fn(batch, dataset, num_sample_points):
     """
-    Custom collate function to handle varying point clouds.
-    It uses the `dataset` instance passed to it (the original GIMOMultiSequenceDataset)
-    to fetch the point cloud based on `dataset_idx` in the batch item.
+    Custom collate function to handle trajectory-specific point clouds.
     
     Args:
         batch (list): A list of sample dictionaries (will contain only one dict in overfitting mode).
@@ -258,36 +246,60 @@ def gimo_collate_fn(batch, dataset, num_sample_points):
     Returns:
         dict: A batch dictionary suitable for the model, including batched point clouds.
     """
-    # Separate point clouds based on dataset_idx
-    pc_dict = {}
-    # Batch contains only one item, but we still access dataset_idx
-    batch_dataset_indices = [item['dataset_idx'] for item in batch]
+    # Create a list to store point clouds for each item in the batch
+    point_cloud_batch_list = []
     
-    for i, dataset_idx in enumerate(batch_dataset_indices):
-        if dataset_idx not in pc_dict:
+    for i, item in enumerate(batch):
+        # First check if the item has its own trajectory-specific point cloud
+        if 'trajectory_specific_pointcloud' in item and item['trajectory_specific_pointcloud'] is not None:
+            point_cloud = item['trajectory_specific_pointcloud']
+            
+            # Convert to tensor if it's a numpy array
+            if isinstance(point_cloud, np.ndarray):
+                point_cloud = torch.from_numpy(point_cloud).float()
+                
+            print(f"Using trajectory-specific point cloud with {point_cloud.shape[0]} points")
+        else:
+            # Fallback to getting from dataset if not included in the item
+            dataset_idx = item.get('dataset_idx', 0)
             point_cloud = dataset.get_scene_pointcloud(dataset_idx)
+            
             if point_cloud is None:
                 print(f"Warning: Failed to get point cloud for dataset_idx {dataset_idx} in batch. Using zeros.")
+                # Create a dummy point cloud if loading fails
                 point_cloud = torch.zeros((num_sample_points, 3), dtype=torch.float32)
             elif isinstance(point_cloud, np.ndarray):
                 point_cloud = torch.from_numpy(point_cloud).float()
             
-            if point_cloud.shape[0] >= num_sample_points:
-                indices = np.random.choice(point_cloud.shape[0], num_sample_points, replace=False)
-                sampled_pc = point_cloud[indices]
-            else:
-                print(f"Warning: Point cloud for dataset_idx {dataset_idx} has only {point_cloud.shape[0]} points. Sampling with replacement to get {num_sample_points}.")
-                indices = np.random.choice(point_cloud.shape[0], num_sample_points, replace=True)
-                sampled_pc = point_cloud[indices]
-                
-            pc_dict[dataset_idx] = sampled_pc
-            
-    point_cloud_batch_list = [pc_dict[idx] for idx in batch_dataset_indices]
+            print(f"Using full scene point cloud with {point_cloud.shape[0]} points")
+        
+        # Sample the point cloud to ensure consistent size
+        if point_cloud.shape[0] >= num_sample_points:
+            # Randomly sample points without replacement
+            indices = np.random.choice(point_cloud.shape[0], num_sample_points, replace=False)
+            sampled_pc = point_cloud[indices]
+        else:
+            # If not enough points, sample with replacement
+            print(f"Warning: Point cloud has only {point_cloud.shape[0]} points. Sampling with replacement to get {num_sample_points}.")
+            indices = np.random.choice(point_cloud.shape[0], num_sample_points, replace=True)
+            sampled_pc = point_cloud[indices]
+        
+        # Add to batch list
+        point_cloud_batch_list.append(sampled_pc)
+    
+    # Stack the point clouds
     batched_point_clouds = torch.stack(point_cloud_batch_list, dim=0)
-
-    batch_copy = [{k: v for k, v in item.items() if k != 'dataset_idx'} for item in batch]
+    
+    # Remove trajectory-specific point clouds and dataset_idx from items to avoid issues with default_collate
+    batch_copy = []
+    for item in batch:
+        item_copy = {k: v for k, v in item.items() if k not in ['trajectory_specific_pointcloud', 'dataset_idx']}
+        batch_copy.append(item_copy)
+    
+    # Collate the rest using default_collate
     collated_batch = default_collate(batch_copy)
     
+    # Add the batched point clouds
     collated_batch['point_cloud'] = batched_point_clouds
     
     return collated_batch
@@ -479,22 +491,11 @@ def main():
     # Log details about the selected sample
     first_sample_name = first_sample.get('object_name', 'Unknown Object')
     first_sample_seq_raw = first_sample.get('sequence', 'Unknown_Sequence') # Get raw sequence path/name
+    # pointcloud number of points
+    first_sample_pointcloud_num_points = first_sample.get('pointcloud_num_points', -1)
     first_sample_seq_name = os.path.basename(first_sample_seq_raw) # Extract base name
     first_sample_ds_idx = first_sample.get('dataset_idx', -1)
     logger(f"Using sample: Object '{first_sample_name}' from Sequence '{first_sample_seq_name}' (Dataset Index: {first_sample_ds_idx})")
-
-    # --- Visualize and Save Scene Point Cloud for the First Sample's Scene --- 
-    if first_sample_ds_idx != -1:
-        logger(f"Attempting to visualize point cloud for sequence: {first_sample_seq_name}")
-        scene_point_cloud = original_train_dataset.get_scene_pointcloud(first_sample_ds_idx)
-        if scene_point_cloud is not None:
-            pc_save_filename = f"scene_point_cloud_{first_sample_seq_name}.png"
-            pc_save_path = os.path.join(config.save_path, pc_save_filename)
-            visualize_point_cloud(scene_point_cloud, pc_save_path, title=f"Scene Point Cloud - {first_sample_seq_name}")
-        else:
-            logger(f"Could not retrieve point cloud for dataset index {first_sample_ds_idx} (Sequence: {first_sample_seq_name}).")
-    else:
-        logger("Could not determine dataset index for the first sample. Skipping point cloud visualization.")
     # --------------------------------------------------------------------------
 
     # --- Create Single-Sample Datasets --- 
@@ -569,14 +570,24 @@ def main():
         # Loop runs only once
         for batch_idx, batch in enumerate(train_loader):
             try:
-                full_trajectory_batch = batch['full_positions'].float().to(device)
+                full_trajectory_batch = batch['full_poses'].float().to(device)
                 point_cloud_batch = batch['point_cloud'].float().to(device)
                 batch['full_attention_mask'] = batch['full_attention_mask'].to(device)
+                
+                # Prepare input trajectory for the model based on config
+                if config.use_first_frame_only:
+                    # Use only the first frame as input
+                    input_trajectory_batch = full_trajectory_batch[:, 0:1, :]
+                else:
+                    # Use a fixed portion of the history as input
+                    fixed_history_length = int(np.floor(full_trajectory_batch.shape[1] * config.history_fraction))
+                    input_trajectory_batch = full_trajectory_batch[:, :fixed_history_length, :]
 
             except KeyError as e: logger(f"Error: Missing key {e} in batch {batch_idx}. Skipping."); continue
             except Exception as e: logger(f"Error processing batch {batch_idx}: {e}. Skipping."); continue
 
-            predicted_full_trajectory = model(full_trajectory_batch, point_cloud_batch)
+            # Forward pass with input trajectory only
+            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch)
             total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
 
             optimizer.zero_grad()

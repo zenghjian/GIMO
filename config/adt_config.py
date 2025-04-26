@@ -18,16 +18,19 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.traj_dataset_configs.add_argument('--split_seed', default=42, type=int, help='Random seed for train/val split (used if split files not provided)')
         self.traj_dataset_configs.add_argument('--trajectory_length', default=100, type=int, help='Total length of trajectory segments extracted (before split)')
         self.traj_dataset_configs.add_argument('--history_fraction', default=0.3, type=float, help='Fraction of trajectory_length to use for history (e.g., 0.6 for 3/5 ratio)')
-        self.traj_dataset_configs.add_argument('--object_motion_dim', default=3, type=int, help='Dimension of object trajectory points (e.g., 3 for XYZ)')
+        self.traj_dataset_configs.add_argument('--object_position_dim', default=3, type=int, help='Dimension of object position (x, y, z)')
+        self.traj_dataset_configs.add_argument('--object_orientation_dim', default=3, type=int, help='Dimension of object orientation (roll, pitch, yaw)')
+        self.traj_dataset_configs.add_argument('--object_motion_dim', default=6, type=int, help='Total dimension of object motion (positions + orientations)')
         self.traj_dataset_configs.add_argument('--point_cloud_dim', default=3, type=int, help='Dimension of input point cloud points (e.g., 3 for XYZ)')
         self.traj_dataset_configs.add_argument('--skip_frames', default=5, type=int, help='Frames to skip when extracting trajectory points from dataset')
         self.traj_dataset_configs.add_argument('--use_displacements', default=False, action='store_true', help='Use relative displacements instead of absolute positions')
         self.traj_dataset_configs.add_argument('--use_first_frame_only', default=False, action='store_true', help='Use only the first frame as input, predict full sequence')
         self.traj_dataset_configs.add_argument('--load_pointcloud', default=True, action='store_true', help='Enable loading point cloud data from sequences')
         self.traj_dataset_configs.add_argument('--pointcloud_subsample', default=10, type=int, help='Subsample factor for point cloud (higher means fewer points)')
+        self.traj_dataset_configs.add_argument('--trajectory_pointcloud_radius', default=1.0, type=float, help='Radius (in meters) around trajectory to collect points for trajectory-specific point clouds')
         self.traj_dataset_configs.add_argument('--min_motion_threshold', default=1.0, type=float, help='Minimum motion threshold in meters for trajectory filtering')
         self.traj_dataset_configs.add_argument('--min_motion_percentile', default=0.0, type=float, help='Filter trajectories below this percentile of motion')
-        self.traj_dataset_configs.add_argument('--use_cache', default=True, action='store_true', help='Enable caching for trajectories')
+        self.traj_dataset_configs.add_argument('--no_use_cache', dest='use_cache', action='store_false', help='Disable caching for trajectories')
         self.traj_dataset_configs.add_argument('--detect_motion_segments', default=False, action='store_true', help='Enable detection and extraction of active motion segments')
         self.traj_dataset_configs.add_argument('--motion_velocity_threshold', default=0.05, type=float, help='Threshold in m/s for detecting active motion')
         self.traj_dataset_configs.add_argument('--min_segment_frames', default=5, type=int, help='Minimum number of frames for a valid motion segment')
@@ -37,7 +40,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         # === Scene/Point Cloud Configuration ===
         self.scene_configs = self.add_argument_group('Scene Encoder')
         self.scene_configs.add_argument('--scene_feats_dim', default=256, type=int, help='Output dimension of the PointNet scene encoder')
-        self.scene_configs.add_argument('--sample_points', default=3000, type=int, help='Number of points to sample from the scene point cloud') # Reduced default for potentially large clouds
+        self.scene_configs.add_argument('--sample_points', default=30000, type=int, help='Number of points to sample from the scene point cloud') 
         # self.scene_configs.add_argument('--pointnet_chkpoints', default='pretrained/point.model', type=str, help='Path to pretrained PointNet weights') # Consider adding back later
 
         # === Motion Pathway Configuration (Based on GIMO) ===
@@ -70,11 +73,11 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.train_configs.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
         self.train_configs.add_argument('--weight_decay', type=float, default=5e-4, help='Weight decay for optimizer')
         self.train_configs.add_argument('--gamma', type=float, default=0.99, help='Learning rate decay factor')
-        # Redefine loss lambdas if needed for motion prediction
-        # self.train_configs.add_argument('--lambda_...', type=float, default=1)
-        self.train_configs.add_argument('--lambda_path_xyz', type=float, default=1.0, help='Weight for the L1 path loss on XYZ coordinates')
-        self.train_configs.add_argument('--lambda_dest_xyz', type=float, default=1.0, help='Weight for the L1 destination loss on XYZ coordinates')
-        self.train_configs.add_argument('--lambda_rec_xyz', type=float, default=1.0, help='Weight for the L1 reconstruction loss on history XYZ coordinates')
+        
+        # Loss weights for position and orientation components
+        self.train_configs.add_argument('--lambda_trans', type=float, default=1.0, help='Weight for translation/position loss')
+        self.train_configs.add_argument('--lambda_ori', type=float, default=1.0, help='Weight for orientation loss')
+        self.train_configs.add_argument('--lambda_rec', type=float, default=1.0, help='Weight for reconstruction loss')
 
         # === Wandb Configuration ===
         self.wandb_configs = self.add_argument_group('WandB')
@@ -86,10 +89,24 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.eval_configs = self.add_argument_group('Evaluation')
         self.eval_configs.add_argument('--output_path', default='results_adt/', type=str, help='Directory to save evaluation outputs')
         self.eval_configs.add_argument('--comment', default='', type=str, help='Custom comment for evaluation run')
+        
+        # === Visualization Configuration ===
+        self.viz_configs = self.add_argument_group('Visualization')
+        self.viz_configs.add_argument('--viz_ori_scale', type=float, default=0.2, help='Scale factor for orientation arrows in visualization')
+        self.viz_configs.add_argument('--show_ori_arrows', action='store_true', default=True, help='Show orientation arrows in visualization')
 
     def get_configs(self):
         # Basic validation
         args = self.parse_args()
+        
+        # Ensure object_motion_dim matches position_dim + orientation_dim
+        if args.object_motion_dim != args.object_position_dim + args.object_orientation_dim:
+            print(f"Warning: object_motion_dim ({args.object_motion_dim}) does not match "
+                  f"object_position_dim ({args.object_position_dim}) + "
+                  f"object_orientation_dim ({args.object_orientation_dim}). "
+                  f"Setting object_motion_dim = position_dim + orientation_dim.")
+            args.object_motion_dim = args.object_position_dim + args.object_orientation_dim
+            
         return args
 
 

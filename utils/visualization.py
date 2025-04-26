@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.cm as cm # Import colormap library
 
-def visualize_trajectory(past_positions, future_positions, past_mask=None, future_mask=None, title="Trajectory", save_path=None, segment_idx=None):
+def visualize_trajectory(past_positions, future_positions, past_mask=None, future_mask=None, title="Trajectory", save_path=None, segment_idx=None, show_orientation=False, past_orientations=None, future_orientations=None, arrow_scale=0.2):
     """
     Visualize past (history) and future (ground truth) trajectory segments.
     
@@ -17,6 +17,10 @@ def visualize_trajectory(past_positions, future_positions, past_mask=None, futur
         title: Plot title
         save_path: Path to save the figure
         segment_idx: Optional segment index for multi-segment objects
+        show_orientation: Whether to show orientation arrows
+        past_orientations: Tensor of past orientations [N, 3] (roll, pitch, yaw)
+        future_orientations: Tensor of future orientations [M, 3] (roll, pitch, yaw)
+        arrow_scale: Scale factor for orientation arrows
     """
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
@@ -77,6 +81,19 @@ def visualize_trajectory(past_positions, future_positions, past_mask=None, futur
         # Highlight start of history
         ax.scatter(past_positions_valid[0, 0], past_positions_valid[0, 1], past_positions_valid[0, 2], c='lime', marker='o', s=100, label='Start History', edgecolors='black')
 
+        # Add orientation arrows for past
+        if show_orientation and past_orientations is not None:
+            if isinstance(past_orientations, torch.Tensor):
+                past_orientations = past_orientations.detach().cpu().numpy()
+            for i in range(len(past_positions_valid)):
+                roll, pitch, yaw = past_orientations[i]
+                dx = arrow_scale * np.cos(yaw) * np.cos(pitch)
+                dy = arrow_scale * np.sin(yaw) * np.cos(pitch)
+                dz = arrow_scale * np.sin(pitch)
+                
+                ax.quiver(past_positions_valid[i, 0], past_positions_valid[i, 1], past_positions_valid[i, 2],
+                         dx, dy, dz, color='r', arrow_length_ratio=0.3)
+
     # Plot Future Trajectory (Ground Truth)
     if num_valid_future > 0:
         future_colors = cm.Reds(np.linspace(0.3, 1, num_valid_future)) # Use Reds colormap
@@ -84,6 +101,19 @@ def visualize_trajectory(past_positions, future_positions, past_mask=None, futur
         ax.scatter(future_positions_valid[:, 0], future_positions_valid[:, 1], future_positions_valid[:, 2], c=future_colors, marker='^', s=25, label=f'Future ({num_valid_future} pts)') # Use triangle markers
         # Highlight end of future
         ax.scatter(future_positions_valid[-1, 0], future_positions_valid[-1, 1], future_positions_valid[-1, 2], c='magenta', marker='o', s=100, label='End Future', edgecolors='black')
+
+        # Add orientation arrows for future
+        if show_orientation and future_orientations is not None:
+            if isinstance(future_orientations, torch.Tensor):
+                future_orientations = future_orientations.detach().cpu().numpy()
+            for i in range(len(future_positions_valid)):
+                roll, pitch, yaw = future_orientations[i]
+                dx = arrow_scale * np.cos(yaw) * np.cos(pitch)
+                dy = arrow_scale * np.sin(yaw) * np.cos(pitch)
+                dz = arrow_scale * np.sin(pitch)
+                
+                ax.quiver(future_positions_valid[i, 0], future_positions_valid[i, 1], future_positions_valid[i, 2],
+                         dx, dy, dz, color='b', arrow_length_ratio=0.3)
 
     # Set labels and title
     ax.set_xlabel('X')
@@ -114,7 +144,7 @@ def visualize_trajectory(past_positions, future_positions, past_mask=None, futur
 
 def visualize_prediction(past_positions, future_positions_gt, future_positions_pred, 
                          past_mask=None, future_mask_gt=None, 
-                         title="Prediction vs Ground Truth", save_path=None, segment_idx=None):
+                         title="Prediction vs Ground Truth", save_path=None, segment_idx=None, show_orientation=False, past_orientations=None, future_orientations_gt=None, future_orientations_pred=None, arrow_scale=0.2):
     """
     Visualize past trajectory, ground truth future, and predicted future.
     Uses masks for past and ground truth future trajectories.
@@ -128,6 +158,11 @@ def visualize_prediction(past_positions, future_positions_gt, future_positions_p
         title: Plot title
         save_path: Path to save the figure
         segment_idx: Optional segment index for multi-segment objects
+        show_orientation: Whether to show orientation arrows
+        past_orientations: Tensor of past orientations [N, 3] (roll, pitch, yaw)
+        future_orientations_gt: Tensor of ground truth future orientations [M, 3]
+        future_orientations_pred: Tensor of predicted future orientations [M, 3]
+        arrow_scale: Scale factor for orientation arrows
     """
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
@@ -181,6 +216,19 @@ def visualize_prediction(past_positions, future_positions_gt, future_positions_p
         ax.scatter(past_positions_valid[:, 0], past_positions_valid[:, 1], past_positions_valid[:, 2], c=past_colors, marker='o', s=25, label=f'History ({num_valid_past} valid pts)')
         ax.scatter(past_positions_valid[0, 0], past_positions_valid[0, 1], past_positions_valid[0, 2], c='lime', marker='o', s=100, label='Start History', edgecolors='black')
 
+        # Add orientation arrows for past
+        if show_orientation and past_orientations is not None:
+            if isinstance(past_orientations, torch.Tensor):
+                past_orientations = past_orientations.detach().cpu().numpy()
+            for i in range(len(past_positions_valid)):
+                roll, pitch, yaw = past_orientations[i]
+                dx = arrow_scale * np.cos(yaw) * np.cos(pitch)
+                dy = arrow_scale * np.sin(yaw) * np.cos(pitch)
+                dz = arrow_scale * np.sin(pitch)
+                
+                ax.quiver(past_positions_valid[i, 0], past_positions_valid[i, 1], past_positions_valid[i, 2],
+                         dx, dy, dz, color='r', arrow_length_ratio=0.3)
+
     # Plot Future Trajectory (Ground Truth) - Green (using valid points)
     if num_valid_future_gt > 0:
         gt_colors = cm.Greens(np.linspace(0.3, 1, num_valid_future_gt))
@@ -188,12 +236,38 @@ def visualize_prediction(past_positions, future_positions_gt, future_positions_p
         ax.scatter(future_positions_gt_valid[:, 0], future_positions_gt_valid[:, 1], future_positions_gt_valid[:, 2], c=gt_colors, marker='^', s=25, label=f'Ground Truth Future ({num_valid_future_gt} valid pts)')
         ax.scatter(future_positions_gt_valid[-1, 0], future_positions_gt_valid[-1, 1], future_positions_gt_valid[-1, 2], c='magenta', marker='o', s=100, label='End GT Future', edgecolors='black')
 
+        # Add orientation arrows for ground truth future
+        if show_orientation and future_orientations_gt is not None:
+            if isinstance(future_orientations_gt, torch.Tensor):
+                future_orientations_gt = future_orientations_gt.detach().cpu().numpy()
+            for i in range(len(future_positions_gt_valid)):
+                roll, pitch, yaw = future_orientations_gt[i]
+                dx = arrow_scale * np.cos(yaw) * np.cos(pitch)
+                dy = arrow_scale * np.sin(yaw) * np.cos(pitch)
+                dz = arrow_scale * np.sin(pitch)
+                
+                ax.quiver(future_positions_gt_valid[i, 0], future_positions_gt_valid[i, 1], future_positions_gt_valid[i, 2],
+                         dx, dy, dz, color='b', arrow_length_ratio=0.3)
+
     # Plot Future Trajectory (Prediction) - Red (plotting all points)
     if num_future_pred > 0:
         pred_colors = cm.Reds(np.linspace(0.3, 1, num_future_pred))
         ax.plot(future_positions_pred[:, 0], future_positions_pred[:, 1], future_positions_pred[:, 2], 'black', linestyle=':', linewidth=1, alpha=0.6, label='_nolegend_')
         ax.scatter(future_positions_pred[:, 0], future_positions_pred[:, 1], future_positions_pred[:, 2], c=pred_colors, marker='x', s=35, label=f'Predicted Future ({num_future_pred} pts)')
         ax.scatter(future_positions_pred[-1, 0], future_positions_pred[-1, 1], future_positions_pred[-1, 2], c='cyan', marker='o', s=100, label='End Predicted Future', edgecolors='black')
+
+        # Add orientation arrows for predicted future
+        if show_orientation and future_orientations_pred is not None:
+            if isinstance(future_orientations_pred, torch.Tensor):
+                future_orientations_pred = future_orientations_pred.detach().cpu().numpy()
+            for i in range(len(future_positions_pred)):
+                roll, pitch, yaw = future_orientations_pred[i]
+                dx = arrow_scale * np.cos(yaw) * np.cos(pitch)
+                dy = arrow_scale * np.sin(yaw) * np.cos(pitch)
+                dz = arrow_scale * np.sin(pitch)
+                
+                ax.quiver(future_positions_pred[i, 0], future_positions_pred[i, 1], future_positions_pred[i, 2],
+                         dx, dy, dz, color='g', arrow_length_ratio=0.3)
 
     # Set labels and title
     ax.set_xlabel('X')
@@ -219,16 +293,21 @@ def visualize_prediction(past_positions, future_positions_gt, future_positions_p
 
     plt.close(fig)
 
-def visualize_full_trajectory(positions, attention_mask=None, title="Full Trajectory", save_path=None, segment_idx=None):
+def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, title="Full Trajectory", save_path=None, segment_idx=None, show_orientation=False, orientations=None, arrow_scale=0.2, num_pc_points=10000):
     """
-    Visualize a complete trajectory without past/future split.
+    Visualize a complete trajectory without past/future split, optionally with surrounding point cloud.
     
     Args:
         positions: Tensor or ndarray of positions [trajectory_length, 3]
         attention_mask: Optional mask [trajectory_length]
+        point_cloud: Optional tensor or ndarray of point cloud points [N, 3]
         title: Plot title
         save_path: Path to save the figure
         segment_idx: Optional segment index for multi-segment objects
+        show_orientation: Whether to show orientation arrows
+        orientations: Tensor of orientations [N, 3] (roll, pitch, yaw)
+        arrow_scale: Scale factor for orientation arrows
+        num_pc_points: Max number of point cloud points to plot
     """
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
@@ -256,6 +335,22 @@ def visualize_full_trajectory(positions, attention_mask=None, title="Full Trajec
         # print("Warning: No valid points found in trajectory.") # Can be noisy
         plt.close(fig)
         return
+        
+    # Render point cloud if provided
+    if point_cloud is not None:
+        # Convert point cloud to numpy
+        if isinstance(point_cloud, torch.Tensor):
+            point_cloud = point_cloud.detach().cpu().numpy()
+            
+        # Subsample point cloud if too many points to avoid rendering slowdown
+        # max_pc_points = 10000  # Adjust if needed
+        # if point_cloud.shape[0] > max_pc_points:
+        #     indices = np.random.choice(point_cloud.shape[0], max_pc_points, replace=False)
+        #     point_cloud = point_cloud[indices]
+            
+        # Plot the point cloud with blue color and transparency
+        ax.scatter(point_cloud[:, 0], point_cloud[:, 1], point_cloud[:, 2], 
+                  c='blue', s=1, alpha=0.3, label=f'Scene Points ({point_cloud.shape[0]})')
     
     # Create a colormap based on time progression
     point_colors = cm.viridis(np.linspace(0, 1, num_valid_points))
@@ -264,7 +359,7 @@ def visualize_full_trajectory(positions, attention_mask=None, title="Full Trajec
     ax.plot(positions_valid[:, 0], positions_valid[:, 1], positions_valid[:, 2], 
             'gray', linestyle='-', linewidth=1, alpha=0.6, label='_nolegend_')
     
-    # Plot the points
+    # Plot the trajectory points
     sc = ax.scatter(positions_valid[:, 0], positions_valid[:, 1], positions_valid[:, 2],
               c=point_colors, marker='o', s=30, label=f'Trajectory ({num_valid_points} pts)')
     
@@ -273,6 +368,19 @@ def visualize_full_trajectory(positions, attention_mask=None, title="Full Trajec
               c='lime', marker='o', s=100, label='Start', edgecolors='black')
     ax.scatter(positions_valid[-1, 0], positions_valid[-1, 1], positions_valid[-1, 2],
               c='magenta', marker='o', s=100, label='End', edgecolors='black')
+    
+    # Add orientation arrows if available
+    if show_orientation and orientations is not None:
+        for i in range(len(positions_valid)):
+            roll, pitch, yaw = orientations[i]
+            dx = arrow_scale * np.cos(yaw) * np.cos(pitch)
+            dy = arrow_scale * np.sin(yaw) * np.cos(pitch)
+            dz = arrow_scale * np.sin(pitch)
+            
+            # Use color gradient for arrows too
+            arrow_color = point_colors[i]
+            ax.quiver(positions_valid[i, 0], positions_valid[i, 1], positions_valid[i, 2],
+                     dx, dy, dz, color=arrow_color, arrow_length_ratio=0.3)
     
     # Add labels and title
     ax.set_xlabel('X')

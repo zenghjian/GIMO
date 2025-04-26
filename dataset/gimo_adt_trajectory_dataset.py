@@ -11,6 +11,8 @@ import sys
 import pickle
 import hashlib
 import time
+from scipy.spatial import cKDTree  # Add import for efficient nearest neighbor search
+from scipy.spatial.transform import Rotation as R
 
 class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
     """Dataset for loading trajectories from Aria Digital Twin sequences."""
@@ -24,8 +26,8 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         max_objects: Optional[int] = None,
         device_num: int = 0,
         transform=None,
-        load_pointcloud: bool = False,
-        pointcloud_subsample: int = 100,
+        load_pointcloud: bool = True,
+        pointcloud_subsample: int = 1,  # Default changed to 1 to use full resolution
         use_cache: bool = True,
         cache_dir: Optional[str] = None,
         min_motion_threshold: float = 0.0,  # Minimum motion threshold (in meters)
@@ -35,7 +37,8 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         motion_velocity_threshold: float = 0.05,  # Threshold in m/s for detecting active motion
         min_segment_frames: int = 5,  # Minimum number of frames for a valid motion segment
         max_stationary_frames: int = 3,   # Maximum consecutive stationary frames allowed in a motion segment
-        normalize_data: bool = True       # Whether to normalize data using scene bounds
+        normalize_data: bool = True,      # Whether to normalize data using scene bounds
+        trajectory_pointcloud_radius: float = 0.5,  # Radius around trajectory to collect points (meters)
     ):
         """
         Initialize the ADT trajectory dataset.
@@ -60,6 +63,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             min_segment_frames: Minimum number of frames for a valid motion segment (if config not provided)
             max_stationary_frames: Maximum consecutive stationary frames allowed in a motion segment (if config not provided)
             normalize_data: Whether to normalize data using scene bounds (if config not provided)
+            trajectory_pointcloud_radius: Radius around trajectory to collect points (meters)
         """
         from projectaria_tools.projects.adt import (
             AriaDigitalTwinDataProvider,
@@ -84,6 +88,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             self.min_segment_frames = getattr(config, 'min_segment_frames', min_segment_frames)
             self.max_stationary_frames = getattr(config, 'max_stationary_frames', max_stationary_frames)
             self.normalize_data = getattr(config, 'normalize_data', normalize_data) # Get normalize_data from config
+            self.trajectory_pointcloud_radius = getattr(config, 'trajectory_pointcloud_radius', trajectory_pointcloud_radius)
             # For cache_dir, don't use config directly - it might be set based on save_path
         else:
             self.trajectory_length = trajectory_length
@@ -99,6 +104,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             self.min_segment_frames = min_segment_frames
             self.max_stationary_frames = max_stationary_frames
             self.normalize_data = normalize_data # Use passed parameter if no config
+            self.trajectory_pointcloud_radius = trajectory_pointcloud_radius
         
         # Force load_pointcloud to True when normalize_data is True for maximum precision
         self.load_pointcloud = self.load_pointcloud or self.normalize_data
@@ -169,7 +175,11 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             self._extract_trajectories()
             print(f"Trajectory extraction took {time.time() - start_time:.2f} seconds")
             
-            # Bbox logic removed for GIMO version
+            # Generate trajectory-specific pointclouds (new step)
+            if self.pointcloud is not None:
+                print("Generating trajectory-specific point clouds...")
+                self._generate_trajectory_specific_pointclouds()
+                print(f"Completed generating trajectory-specific point clouds for {len(self.trajectories)} trajectories")
             
             # Save to cache if caching is enabled
             if self.use_cache:
@@ -179,6 +189,123 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             print(f"Error loading ADT sequence: {e}")
             traceback.print_exc()
             raise
+    
+    def _filter_points_by_trajectory(self, trajectory_positions, radius=None):
+        """
+        Filter the full scene point cloud to include only points within a specified radius of any trajectory point.
+        
+        Args:
+            trajectory_positions: Numpy array of shape [N, 3] containing trajectory positions
+            radius: Radius in meters around each trajectory point to include scene points (defaults to self.trajectory_pointcloud_radius)
+            
+        Returns:
+            Numpy array of shape [M, 3] containing filtered point cloud
+        """
+        if self.pointcloud is None or len(self.pointcloud) == 0:
+            print("Warning: No point cloud available for filtering")
+            return np.zeros((0, 3), dtype=np.float32)
+            
+        if trajectory_positions is None or len(trajectory_positions) == 0:
+            print("Warning: Empty trajectory provided for point cloud filtering")
+            return np.zeros((0, 3), dtype=np.float32)
+            
+        # Use instance default radius if not specified
+        if radius is None:
+            radius = self.trajectory_pointcloud_radius
+        
+        # Use KDTree for efficient nearest neighbor queries
+        try:
+            # Convert trajectory positions to numpy if they're tensors
+            if isinstance(trajectory_positions, torch.Tensor):
+                trajectory_positions = trajectory_positions.detach().cpu().numpy()
+                
+            # If normalized, denormalize trajectory positions for consistent distance calculation
+            if self.normalize_data:
+                trajectory_positions = self.denormalize_position(trajectory_positions)
+                
+            # Build KD-tree on trajectory points
+            trajectory_tree = cKDTree(trajectory_positions)
+            
+            # Use KD-tree to find all points within radius of any trajectory point
+            distances, _ = trajectory_tree.query(self.pointcloud, k=1)
+            mask = distances <= radius
+            
+            # Return filtered points
+            filtered_points = self.pointcloud[mask]
+            
+            # For debugging
+            print(f"Filtered point cloud: {len(filtered_points)} points (from {len(self.pointcloud)} total)")
+            
+            return filtered_points
+            
+        except Exception as e:
+            print(f"Error filtering point cloud by trajectory: {e}")
+            traceback.print_exc()
+            return np.zeros((0, 3), dtype=np.float32)
+    
+    def _generate_trajectory_specific_pointclouds(self):
+        """
+        Generate and store trajectory-specific pointclouds for each trajectory in the dataset.
+        These filtered point clouds only include points within trajectory_pointcloud_radius
+        of any point in the trajectory.
+        """
+        if self.pointcloud is None or len(self.pointcloud) == 0:
+            print("Warning: No point cloud available to generate trajectory-specific point clouds")
+            return
+            
+        print(f"Generating trajectory-specific point clouds for {len(self.trajectories)} trajectories...")
+        
+        # Create a KD-tree for the full point cloud once (for efficiency)
+        full_pc_tree = cKDTree(self.pointcloud)
+        
+        for i, traj_item in enumerate(self.trajectories):
+            try:
+                # Get trajectory poses and extract positions (first 3 dimensions)
+                poses_tensor = traj_item['trajectory_data']['poses']
+                positions_tensor = poses_tensor[:, :3]  # Extract first 3 dimensions (x, y, z)
+                
+                # Get attention mask to filter out padding
+                mask = traj_item['trajectory_data']['attention_mask']
+                
+                # Extract only valid positions (where mask is 1)
+                if isinstance(mask, torch.Tensor):
+                    valid_indices = torch.where(mask > 0.5)[0]
+                    valid_positions = positions_tensor[valid_indices]
+                else:
+                    # Fallback if mask isn't a tensor
+                    valid_indices = np.where(np.array(mask) > 0.5)[0]
+                    valid_positions = positions_tensor[valid_indices]
+                
+                # If normalized, denormalize positions for accurate distance calculation
+                if self.normalize_data and isinstance(valid_positions, torch.Tensor):
+                    # Convert to numpy, denormalize, then back to tensor if needed
+                    positions_np = valid_positions.detach().cpu().numpy()
+                    positions_np = self.denormalize_position(positions_np)
+                    valid_positions = positions_np
+                elif self.normalize_data:
+                    valid_positions = self.denormalize_position(valid_positions)
+                
+                # Filter the pointcloud
+                filtered_pc = self._filter_points_by_trajectory(valid_positions)
+                
+                # Store the filtered point cloud with the trajectory metadata
+                if 'metadata' not in traj_item:
+                    traj_item['metadata'] = {}
+                
+                # Store the filtered point cloud
+                traj_item['trajectory_specific_pointcloud'] = filtered_pc
+                
+                # For progress reporting
+                if (i+1) % 10 == 0 or i == 0 or i == len(self.trajectories)-1:
+                    print(f"  Processed {i+1}/{len(self.trajectories)} trajectories")
+                
+            except Exception as e:
+                print(f"Error generating trajectory-specific point cloud for trajectory {i}: {e}")
+                traceback.print_exc()
+                # Set an empty point cloud as fallback
+                traj_item['trajectory_specific_pointcloud'] = np.zeros((0, 3), dtype=np.float32)
+        
+        print(f"Completed generating trajectory-specific point clouds")
     
     def _get_cache_filename(self):
         """Generate a unique filename for the cache based on the dataset parameters."""
@@ -196,7 +323,8 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             'min_motion_threshold': self.min_motion_threshold,
             'min_motion_percentile': self.min_motion_percentile,
             'pointcloud_subsample': self.pointcloud_subsample,
-            'normalize_data': self.normalize_data # Add normalize_data to cache key
+            'normalize_data': self.normalize_data, # Add normalize_data to cache key
+            'trajectory_pointcloud_radius': self.trajectory_pointcloud_radius # Add new parameter to cache key
         }
         
         # Generate hash from parameters
@@ -239,7 +367,8 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                     'min_motion_threshold': self.min_motion_threshold,
                     'min_motion_percentile': self.min_motion_percentile,
                     'pointcloud_subsample': self.pointcloud_subsample,
-                    'normalize_data': self.normalize_data # Save normalize_data state
+                    'normalize_data': self.normalize_data, # Save normalize_data state
+                    'trajectory_pointcloud_radius': self.trajectory_pointcloud_radius # Save new parameter
                 }
             }
             
@@ -282,8 +411,9 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                 params.get('max_stationary_frames', 3) != self.max_stationary_frames or
                 params.get('min_motion_threshold', 0.0) != self.min_motion_threshold or
                 params.get('min_motion_percentile', 0.0) != self.min_motion_percentile or
-                params.get('pointcloud_subsample', 100) != self.pointcloud_subsample or
-                params.get('normalize_data', True) != self.normalize_data): # Verify normalize_data
+                params.get('pointcloud_subsample', 1) != self.pointcloud_subsample or
+                params.get('normalize_data', True) != self.normalize_data or # Verify normalize_data
+                params.get('trajectory_pointcloud_radius', 0.5) != self.trajectory_pointcloud_radius): # Verify new parameter
                 print("Cache parameters don't match, regenerating trajectories")
                 return False
                 
@@ -471,7 +601,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         Calculate the total motion/displacement of a trajectory.
         
         Args:
-            positions: List of position vectors
+            positions: List of position vectors [x,y,z] (extracted from poses if necessary)
             timestamps: Optional list of timestamps corresponding to positions
             
         Returns:
@@ -487,7 +617,12 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         if isinstance(positions, torch.Tensor):
             positions_np = positions.detach().cpu().numpy()
         elif isinstance(positions, list):
-            positions_np = np.array(positions)
+            # If positions is a list of position vectors, convert to numpy array
+            # Ensure each position is only [x,y,z] if extracted from [x,y,z,roll,pitch,yaw]
+            if len(positions[0]) > 3:
+                positions_np = np.array([pos[:3] for pos in positions])
+            else:
+                positions_np = np.array(positions)
         else:
             positions_np = positions
             
@@ -625,14 +760,14 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                 segments = self._track_object_motion(obj_id, timestamps)
                 
                 # Process each segment as a separate trajectory
-                for segment_idx, (positions, tracked_timestamps) in enumerate(segments):
-                    if len(positions) < 2:
+                for segment_idx, (poses, tracked_timestamps) in enumerate(segments):
+                    if len(poses) < 2:
                         # Skip segments that are too short
                         continue
                         
                     # Process this segment
                     self._process_trajectory_segment(
-                        positions, 
+                        poses, 
                         tracked_timestamps, 
                         instance_info, 
                         obj_id, 
@@ -706,49 +841,62 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         
         print(f"Final dataset contains {len(self.trajectories)} trajectories")
     
-    def _process_trajectory_segment(self, positions, tracked_timestamps, instance_info, obj_id, trajectories_with_motion, segment_idx=None):
+    def _process_trajectory_segment(self, poses, tracked_timestamps, instance_info, obj_id, trajectories_with_motion, segment_idx=None):
         """
         Process a single trajectory segment and add it to the trajectories list.
         
         Args:
-            positions: List of position vectors
-            tracked_timestamps: List of timestamps for each position
+            poses: List of pose vectors [x, y, z, roll, pitch, yaw]
+            tracked_timestamps: List of timestamps for each pose
             instance_info: Object instance information
             obj_id: Object ID
             trajectories_with_motion: List to store processed trajectories
             segment_idx: Optional index of the segment (for multi-segment objects)
         """
+        # Extract positions (first 3 elements of each pose) for motion metrics
+        positions = [pose[:3] for pose in poses]
+        
         # Calculate trajectory motion metrics (using original positions before normalization)
         total_path_length, direct_displacement, max_displacement, avg_velocity = self._calculate_trajectory_motion(positions, tracked_timestamps)
         
-        # Convert to numpy array and ensure consistent 2D shape [N, 3]
-        positions_array = np.array(positions)
-        if positions_array.ndim > 2:
-            positions_array = positions_array.reshape(-1, 3)
+        # Convert to numpy array and ensure consistent 2D shape [N, 6]
+        poses_array = np.array(poses)
+        if poses_array.ndim > 2:
+            poses_array = poses_array.reshape(-1, 6)  # Reshape to [N, 6] for [x,y,z,roll,pitch,yaw]
         
-        # Normalize positions if normalize_data is True
+        # Split positions and orientations for separate normalization
+        positions_array = poses_array[:, :3]  # [N, 3] positions
+        orientations_array = poses_array[:, 3:6]  # [N, 3] orientations
+        
+        # Normalize positions if normalize_data is True, leave orientations as radians
         if self.normalize_data:
             positions_array = self.normalize_position(positions_array)
 
-        # Convert normalized (or original) positions to tensor
-        positions_tensor = torch.tensor(positions_array, dtype=torch.float32)
-        real_length = min(len(positions_tensor), self.trajectory_length)
+        # Recombine normalized positions with orientations
+        normalized_poses_array = np.concatenate([positions_array, orientations_array], axis=1)  # [N, 6]
+
+        # Convert normalized (or original) poses to tensor
+        poses_tensor = torch.tensor(normalized_poses_array, dtype=torch.float32)
+        real_length = min(len(poses_tensor), self.trajectory_length)
         
         # Modified displacement calculation (applied on normalized positions if enabled)
         if self.use_displacements and real_length > 1:
-            # Create a new tensor to store the first position and subsequent displacements
-            modified_tensor = torch.zeros_like(positions_tensor)
+            # Create a new tensor to store the modified poses with displacements for positions
+            modified_tensor = torch.zeros_like(poses_tensor)
             
-            # Keep the first position as absolute coordinates (normalized or original)
-            modified_tensor[0] = positions_tensor[0]
+            # Keep the first pose as absolute coordinates and angles
+            modified_tensor[0] = poses_tensor[0]
             
-            # Calculate displacements for all positions after the first
-            modified_tensor[1:real_length] = positions_tensor[1:real_length] - positions_tensor[:real_length-1]
+            # Calculate displacements for positions (first 3 elements) after the first
+            modified_tensor[1:real_length, :3] = poses_tensor[1:real_length, :3] - poses_tensor[:real_length-1, :3]
             
-            # Replace positions with this new representation (first position + displacements)
-            positions_tensor = modified_tensor
+            # Keep absolute angles (last 3 elements) for all poses
+            modified_tensor[1:real_length, 3:] = poses_tensor[1:real_length, 3:]
             
-            # No need to store first_position separately in metadata since it's part of the tensor now
+            # Replace poses with this new representation
+            poses_tensor = modified_tensor
+            
+            # No need to store first_position separately in metadata
             metadata_first_position = None
         else:
             metadata_first_position = None
@@ -757,14 +905,14 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         attention_mask = torch.zeros(self.trajectory_length, dtype=torch.float32)
         attention_mask[:real_length] = 1.0
         
-        # Pad the positions tensor if needed
-        if len(positions_tensor) < self.trajectory_length:
-            # Make sure padding has the same shape [M, 3]
+        # Pad the poses tensor if needed
+        if len(poses_tensor) < self.trajectory_length:
+            # Make sure padding has the same shape [M, 6]
             # Pad with zeros in the normalized space if normalizing, otherwise world space zeros
-            padding = torch.zeros(self.trajectory_length - len(positions_tensor), 3, dtype=torch.float32)
-            positions_tensor = torch.cat([positions_tensor, padding], dim=0)
+            padding = torch.zeros(self.trajectory_length - len(poses_tensor), 6, dtype=torch.float32)
+            poses_tensor = torch.cat([poses_tensor, padding], dim=0)
         else:
-            positions_tensor = positions_tensor[:self.trajectory_length]
+            poses_tensor = poses_tensor[:self.trajectory_length]
         
         # Create metadata with only essential information
         metadata = {
@@ -779,7 +927,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             'is_displacement': self.use_displacements,
             'active_motion_segment': True,  # Flag indicating this is an active motion segment
             'segment_duration_s': float((tracked_timestamps[-1] - tracked_timestamps[0]) / 1e9) if len(tracked_timestamps) > 1 else 0.0,
-            'original_length': len(positions),  # Store the length of the active segment
+            'original_length': len(poses),  # Store the length of the active segment
             'start_timestamp_ns': int(tracked_timestamps[0]) if tracked_timestamps else None,  # Store segment start timestamp
             # Store normalization parameters for denormalization later
             'normalization': {
@@ -794,17 +942,13 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         if segment_idx is not None:
             metadata['segment_idx'] = segment_idx
         
-        # Add first position if using displacements (not needed with our new approach)
-        # if metadata_first_position is not None:
-        #     metadata['first_position'] = metadata_first_position
-        
         # Extract category and subcategory if available
         metadata['category'] = getattr(instance_info, 'category', 'unknown')
         metadata['subcategory'] = getattr(instance_info, 'subcategory', 'unknown')
         
         # Create trajectory data dict
         trajectory_data = {
-            'positions': positions_tensor,
+            'poses': poses_tensor,  # Now contains [x, y, z, roll, pitch, yaw]
             'attention_mask': attention_mask,
         }
         
@@ -826,13 +970,15 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             timestamps: List of timestamps to track at
             
         Returns:
-            list: List of (positions, timestamps) tuples for all active motion segments,
+            list: List of (poses, timestamps) tuples for all active motion segments,
+                  where poses contains both position and orientation [x, y, z, roll, pitch, yaw]
                   or a list with a single tuple of the entire trajectory if motion detection is disabled
         """
         from collections import deque
+        import numpy as np
         
         # Lists to store trajectory data
-        positions = []
+        poses = []  # Will store [x, y, z, roll, pitch, yaw]
         tracked_timestamps = []
         
         # Track object at each timestamp
@@ -867,12 +1013,21 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                     center = bbox.transform_scene_object.translation()[0]
                     pos = [center[0], center[1], center[2]]
                     
-                    # Store the position and timestamp
-                    positions.append(pos)
+                    # Extract rotation matrix from transform_scene_object
+                    rotation_matrix = bbox.transform_scene_object.rotation().to_matrix()
+                    
+                    # Convert rotation matrix to Euler angles
+                    roll, pitch, yaw = self._rotation_matrix_to_euler_angles(rotation_matrix)
+                    
+                    # Create combined pose [x, y, z, roll, pitch, yaw]
+                    pose = pos + [roll, pitch, yaw]
+                    
+                    # Store the combined pose and timestamp
+                    poses.append(pose)
                     tracked_timestamps.append(ts)
                 except Exception as e:
                     if time_idx % 100 == 0 or time_idx == 1:
-                        print(f"Warning: Could not get position for object {object_id} at time {ts}: {e}")
+                        print(f"Warning: Could not get pose for object {object_id} at time {ts}: {e}")
                     # Skip this timestamp
                     continue
         except Exception as e:
@@ -880,14 +1035,14 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             traceback.print_exc()
         
         # If we didn't collect enough points or motion detection is disabled, return raw trajectory as a single segment
-        if len(positions) < self.min_segment_frames or not self.detect_motion_segments:
-            return [(positions, tracked_timestamps)]  # Return as a list with one segment
+        if len(poses) < self.min_segment_frames or not self.detect_motion_segments:
+            return [(poses, tracked_timestamps)]  # Return as a list with one segment
         
-        # Calculate velocity between each pair of points
+        # Calculate velocity between each pair of points - only considering position component (not rotation)
         velocities = []
         time_differences = []
         
-        for i in range(1, len(positions)):
+        for i in range(1, len(poses)):
             # Calculate time difference in seconds
             dt = (tracked_timestamps[i] - tracked_timestamps[i-1]) / 1e9  # Convert ns to seconds
             
@@ -895,8 +1050,8 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                 # Skip invalid time differences
                 continue
                 
-            # Calculate displacement vector
-            dx = np.array(positions[i]) - np.array(positions[i-1])
+            # Calculate displacement vector (just for position part - first 3 elements)
+            dx = np.array(poses[i][:3]) - np.array(poses[i-1][:3])
             
             # Calculate velocity in m/s
             velocity = np.linalg.norm(dx) / dt
@@ -911,10 +1066,10 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         stationary_count = 0
         
         # Process each position with its velocity
-        for i in range(len(positions)):
+        for i in range(len(poses)):
             # Handle first point
             if i == 0:
-                current_segment.append(positions[i])
+                current_segment.append(poses[i])
                 current_segment_timestamps.append(tracked_timestamps[i])
                 continue
                 
@@ -923,7 +1078,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                 velocity = velocities[i-1]
             else:
                 # No velocity data available, add point and continue
-                current_segment.append(positions[i])
+                current_segment.append(poses[i])
                 current_segment_timestamps.append(tracked_timestamps[i])
                 continue
             
@@ -932,7 +1087,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             
             if is_moving:
                 # Add point to current segment and reset stationary counter
-                current_segment.append(positions[i])
+                current_segment.append(poses[i])
                 current_segment_timestamps.append(tracked_timestamps[i])
                 stationary_count = 0
             else:
@@ -941,7 +1096,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                 
                 # Still include stationary points up to max_stationary_frames
                 if stationary_count <= self.max_stationary_frames:
-                    current_segment.append(positions[i])
+                    current_segment.append(poses[i])
                     current_segment_timestamps.append(tracked_timestamps[i])
                 else:
                     # Too many stationary frames - end current segment if long enough
@@ -950,7 +1105,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                         active_segments.append((current_segment.copy(), current_segment_timestamps.copy()))
                     
                     # Start a new segment with this point
-                    current_segment = [positions[i]]
+                    current_segment = [poses[i]]
                     current_segment_timestamps = [tracked_timestamps[i]]
                     stationary_count = 0
         
@@ -960,21 +1115,48 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         
         # If no segments found or all too short, return the original trajectory
         if not active_segments:
-            return [(positions, tracked_timestamps)]
-        
-        # # Print stats about all segments found
-        # segment_lengths = [len(segment[0]) for segment in active_segments]
-        # segment_durations = [(segment[1][-1] - segment[1][0]) / 1e9 for segment in active_segments]
-        
-        # # Get object name from instance_info
-        # object_name = self.adt_provider.get_instance_info_by_id(object_id).name
-        
-        # print(f"Object {object_name}: Found {len(active_segments)} motion segments")
-        # print(f"  Longest segment: {max(segment_lengths) if segment_lengths else 0} frames, {max(segment_durations) if segment_durations else 0:.2f}s")
-        # print(f"  Total trajectory: {len(positions)} frames")
+            return [(poses, tracked_timestamps)]
         
         # Return all active segments in their original chronological order
         return active_segments
+    
+    def _rotation_matrix_to_euler_angles(self, rotation_matrix):
+        """
+        Convert a rotation matrix to Euler angles (roll, pitch, yaw) in radians.
+        
+        Args:
+            rotation_matrix: 3x3 rotation matrix
+            
+        Returns:
+            tuple: (roll, pitch, yaw) in radians
+        """
+        import numpy as np
+        import math
+        
+        # Extract individual elements from the rotation matrix
+        r11, r12, r13 = rotation_matrix[0]
+        r21, r22, r23 = rotation_matrix[1]
+        r31, r32, r33 = rotation_matrix[2]
+        
+        # Check for gimbal lock (when pitch is +/- 90 degrees)
+        if abs(r31) > 0.9999:
+            # Gimbal lock case
+            yaw = 0.0  # Can be set to any value, typically 0
+            if r31 < 0:
+                # pitch is -90 degrees
+                pitch = -math.pi/2
+                roll = math.atan2(r12, r22)
+            else:
+                # pitch is +90 degrees
+                pitch = math.pi/2
+                roll = math.atan2(-r12, -r22)
+        else:
+            # Standard case
+            pitch = -math.asin(r31)
+            roll = math.atan2(r32/math.cos(pitch), r33/math.cos(pitch))
+            yaw = math.atan2(r21/math.cos(pitch), r11/math.cos(pitch))
+        
+        return roll, pitch, yaw
     
     def get_scene_pointcloud(self):
         """
@@ -996,7 +1178,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             idx: Index of the trajectory
         
         Returns:
-            dict: Trajectory data including positions, attention mask, and basic metadata
+            dict: Trajectory data including poses (positions+orientations), attention mask, and basic metadata
         """
         item = self.trajectories[idx]
         trajectory_data = item['trajectory_data']
@@ -1008,7 +1190,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         
         # Create the result with minimal metadata and split trajectories
         result = {
-            'positions': trajectory_data['positions'],
+            'poses': trajectory_data['poses'],  # [N, 6] tensor with [x,y,z,roll,pitch,yaw]
             'attention_mask': trajectory_data['attention_mask'],
             'object_type': metadata['prototype_name'],
             'object_name': metadata['name'],
@@ -1019,10 +1201,10 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             'is_displacement': metadata.get('is_displacement', False)
         }
         
-        # Add first position if using displacements (and not using the newer displacement representation)
-        # if 'first_position' in metadata:
-        #     result['first_position'] = torch.tensor(metadata['first_position'], dtype=torch.float32)
-            
+        # Include trajectory-specific point cloud if available
+        if 'trajectory_specific_pointcloud' in item:
+            result['trajectory_specific_pointcloud'] = item['trajectory_specific_pointcloud']
+        
         # Add normalization parameters to the sample
         if 'normalization' in metadata:
              # Convert normalization numpy arrays to tensors for collation
@@ -1035,14 +1217,36 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
              }
         else:
              # Include default normalization parameters if not found in metadata
-             # (should only happen if loading old cache without normalization info)
              result['normalization'] = {
-                 'is_normalized': self.normalize_data, # Use the dataset's current setting
+                 'is_normalized': self.normalize_data,
                  'scene_min': torch.tensor(self.scene_min, dtype=torch.float32),
                  'scene_max': torch.tensor(self.scene_max, dtype=torch.float32),
                  'scene_scale': torch.tensor(self.scene_scale, dtype=torch.float32)
              }
 
-        # Bounding box logic removed here
+        # Add segment index if available in metadata
+        if 'segment_idx' in metadata:
+            result['segment_idx'] = metadata['segment_idx']
 
         return result
+    
+    def get_trajectory_specific_pointcloud(self, idx):
+        """
+        Get the trajectory-specific pointcloud for a specific trajectory.
+        
+        Args:
+            idx: Index of the trajectory
+            
+        Returns:
+            Numpy array of point cloud coordinates or None if not available
+        """
+        if idx < 0 or idx >= len(self.trajectories):
+            print(f"Error: Index {idx} out of range [0, {len(self.trajectories)-1}]")
+            return None
+            
+        item = self.trajectories[idx]
+        if 'trajectory_specific_pointcloud' in item:
+            return item['trajectory_specific_pointcloud']
+        else:
+            print(f"Warning: No trajectory-specific pointcloud found for trajectory {idx}")
+            return None

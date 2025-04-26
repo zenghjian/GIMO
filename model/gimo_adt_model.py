@@ -63,41 +63,30 @@ class GIMO_ADT_Model(nn.Module):
         # Predicts per token
         self.outputlayer = nn.Linear(config.cross_hidden_dim, config.object_motion_dim)
 
-    def forward(self, full_trajectory, point_cloud):
+    def forward(self, input_trajectory, point_cloud):
         """
         Forward pass with architecture more closely aligned with crossmodal_net.py.
-        Takes full trajectory as input.
+        Takes only the input portion of trajectory as input.
 
         Args:
-            full_trajectory: Tensor [B, sequence_length, 3]
+            input_trajectory: Tensor [B, input_length, 3] - Only the input portion of trajectory
             point_cloud: Tensor [B, N_points, 3]
             
         Returns:
-            Tensor: Predicted full trajectory [B, sequence_length, 3]
+            Tensor: Predicted full trajectory [B, sequence_length, 3] in standard mode,
+                   or future trajectory [B, sequence_length-1, 3] in use_first_frame_only mode
         """
-        batch_size = full_trajectory.shape[0]
-        device = full_trajectory.device
+        batch_size = input_trajectory.shape[0]
+        device = input_trajectory.device
 
-        # --- Prepare Motion Input --- 
-        if self.config.use_first_frame_only:
-             # Use only the first frame as input
-             motion_input = full_trajectory[:, 0:1, :] # Shape: [B, 1, 3]
-        else:
-             # Use a fixed portion of the history as input
-             fixed_history_length = int(np.floor(self.sequence_length * self.history_fraction))
-             motion_input = full_trajectory[:, :fixed_history_length, :] # Shape: [B, fixed_hist, 3]
-        # --------------------------
-        
-        # 1. Embed past motion
-        motion_feats = self.motion_linear(motion_input)  # [B, input_len, motion_hidden_dim]
+        # 1. Embed input motion - No slicing needed as input is already the correct portion
+        motion_feats = self.motion_linear(input_trajectory)  # [B, input_len, motion_hidden_dim]
 
         # 2. Encode point cloud (using PointNet2SemSegSSGShape)
         point_cloud_6d = point_cloud.repeat(1, 1, 2)  # [B, N, 3] -> [B, N, 6]
         scene_feats, scene_global_feats = self.scene_encoder(point_cloud_6d)  # [B, F, N_points], [B, F]
 
         # 3. Process motion with motion encoder
-        # The input to motion_encoder might need padding if we used dynamic history here.
-        # Using fixed history simplifies this.
         motion_embedding = self.motion_encoder(motion_feats)
         # [B, sequence_length, motion_latent_dim]
 
@@ -133,30 +122,40 @@ class GIMO_ADT_Model(nn.Module):
         """
         Computes the loss for the predicted trajectories using L1 norm, 
         incorporating dynamic history/future split based on attention mask.
-        Losses are averaged per sequence based on valid points before batch averaging.
+        Losses are simplified to translation (position) and orientation components.
         
         When config.use_first_frame_only is True:
-            - `predictions` tensor has shape [B, sequence_length-1, 3]
+            - `predictions` tensor has shape [B, sequence_length-1, motion_dim]
             - Loss is calculated only on the future frames (GT indices 1 to N).
-            - Reconstruction loss is set to 0.
 
         Args:
             predictions: The model's output tensor. Shape depends on config.use_first_frame_only.
-                         [B, sequence_length, 3] if False.
-                         [B, sequence_length-1, 3] if True.
+                         [B, sequence_length, motion_dim] if False.
+                         [B, sequence_length-1, motion_dim] if True.
             batch: The batch dictionary from the DataLoader, containing ground truth.
-                   Expected keys: 'full_positions' [B, sequence_length, 3]
+                   Expected keys: 'full_poses' [B, sequence_length, motion_dim]
                                   'full_attention_mask' [B, sequence_length]
 
         Returns:
             torch.Tensor: The computed total loss value (scalar).
             dict: A dictionary containing individual loss components (batch averaged).
         """
-        gt_full_positions = batch['full_positions'].to(predictions.device)
+        gt_full_poses = batch['full_poses'].to(predictions.device)
         gt_full_mask = batch['full_attention_mask'].to(predictions.device) # Shape [B, seq_len]
-        batch_size = gt_full_positions.shape[0]
+        batch_size = gt_full_poses.shape[0]
         device = predictions.device
-
+        
+        # Split poses into positions and orientations for separate loss calculation
+        position_dim = 3  # Assuming first 3 dimensions are x, y, z
+        
+        # Extract ground truth positions and orientations
+        gt_full_positions = gt_full_poses[..., :position_dim]
+        gt_full_orientations = gt_full_poses[..., position_dim:]
+        
+        # Extract predicted positions and orientations
+        pred_positions = predictions[..., :position_dim]
+        pred_orientations = predictions[..., position_dim:]
+        
         # --- Calculate Dynamic Split Lengths --- 
         actual_lengths = torch.sum(gt_full_mask, dim=1) # [B]
         # Ensure history length is at least 1 and doesn't exceed actual length, and handle dtypes
@@ -180,97 +179,125 @@ class GIMO_ADT_Model(nn.Module):
         if self.config.use_first_frame_only:
             # Loss is calculated on GT indices 1 onwards, prediction indices 0 onwards
             gt_future_positions = gt_full_positions[:, 1:, :] # [B, seq_len-1, 3]
+            gt_future_orientations = gt_full_orientations[:, 1:, :] # [B, seq_len-1, 3]
             dynamic_future_mask_for_loss = dynamic_future_mask[:, 1:] # [B, seq_len-1]
+            
             # Predictions tensor already corresponds to GT indices 1 onwards
-            pred_future_positions = predictions # [B, seq_len-1, 3]
+            pred_future_positions = pred_positions # [B, seq_len-1, 3]
+            pred_future_orientations = pred_orientations # [B, seq_len-1, 3]
         else:
             # Use full GT and prediction for standard mode loss calculation
             gt_future_positions = gt_full_positions
-            pred_future_positions = predictions
+            gt_future_orientations = gt_full_orientations
+            pred_future_positions = pred_positions
+            pred_future_orientations = pred_orientations
             dynamic_future_mask_for_loss = dynamic_future_mask
             
-        # --- Calculate L1 Reconstruction Loss (XYZ History) --- 
-        # This is only calculated if not use_first_frame_only
-        if not self.config.use_first_frame_only:
-            loss_rec_per_coord = F.l1_loss(predictions, gt_full_positions, reduction='none') # Compare full sequences
-            loss_rec_per_point = torch.sum(loss_rec_per_coord, dim=-1) # [B, seq_len]
-            masked_loss_rec = loss_rec_per_point * dynamic_history_mask # Apply DYNAMIC history mask [B, seq_len]
+        # --- Calculate Translation Loss (Position) ---
+        # This includes both history and future parts for standard mode,
+        # but only future for first_frame_only mode
+        loss_trans_per_coord = F.l1_loss(pred_future_positions, gt_future_positions, reduction='none') # [B, relevant_len, 3]
+        loss_trans_per_point = torch.sum(loss_trans_per_coord, dim=-1) # [B, relevant_len]
+        masked_loss_trans = loss_trans_per_point * dynamic_future_mask_for_loss # Apply mask [B, relevant_len]
+        
+        sum_loss_trans_per_seq = torch.sum(masked_loss_trans, dim=1) # [B]
+        num_valid_points_per_seq = torch.sum(dynamic_future_mask_for_loss, dim=1) # [B]
+        valid_trans_mask = num_valid_points_per_seq > 0
+        mean_loss_trans_per_seq = torch.zeros_like(sum_loss_trans_per_seq)
+        mean_loss_trans_per_seq[valid_trans_mask] = sum_loss_trans_per_seq[valid_trans_mask] / num_valid_points_per_seq[valid_trans_mask]
+        mean_trans_loss = torch.sum(mean_loss_trans_per_seq) / torch.sum(valid_trans_mask) if torch.sum(valid_trans_mask) > 0 else torch.tensor(0.0, device=device)
+        
+        # --- Calculate Orientation Loss --- 
+        loss_ori_per_coord = F.l1_loss(pred_future_orientations, gt_future_orientations, reduction='none') # [B, relevant_len, 3]
+        loss_ori_per_point = torch.sum(loss_ori_per_coord, dim=-1) # [B, relevant_len]
+        masked_loss_ori = loss_ori_per_point * dynamic_future_mask_for_loss # Apply mask [B, relevant_len]
+        
+        sum_loss_ori_per_seq = torch.sum(masked_loss_ori, dim=1) # [B]
+        mean_loss_ori_per_seq = torch.zeros_like(sum_loss_ori_per_seq)
+        mean_loss_ori_per_seq[valid_trans_mask] = sum_loss_ori_per_seq[valid_trans_mask] / num_valid_points_per_seq[valid_trans_mask]
+        mean_ori_loss = torch.sum(mean_loss_ori_per_seq) / torch.sum(valid_trans_mask) if torch.sum(valid_trans_mask) > 0 else torch.tensor(0.0, device=device)
+        
+        # --- Calculate Reconstruction Loss (for input segment) ---
+        if not self.config.use_first_frame_only and dynamic_history_lengths.max() > 0:
+            # Get the history segment of ground truth
+            hist_indices = torch.arange(self.sequence_length, device=device).unsqueeze(0)  # [1, seq_len]
+            hist_mask = (hist_indices < dynamic_history_lengths.unsqueeze(1)) * gt_full_mask  # [B, seq_len]
             
-            sum_loss_rec_per_seq = torch.sum(masked_loss_rec, dim=1) # [B]
-            num_valid_hist_per_seq = torch.sum(dynamic_history_mask, dim=1) # [B]
-            valid_rec_mask = num_valid_hist_per_seq > 0
+            # Extract predictions and ground truth for history segment only
+            hist_gt_poses = gt_full_poses  # [B, seq_len, 6]
+            hist_pred_poses = predictions  # [B, seq_len, 6]
+            
+            # Calculate reconstruction loss for full poses (positions + orientations)
+            loss_rec_per_coord = F.l1_loss(hist_pred_poses, hist_gt_poses, reduction='none')  # [B, seq_len, 6]
+            loss_rec_per_point = torch.sum(loss_rec_per_coord, dim=-1)  # [B, seq_len]
+            masked_loss_rec = loss_rec_per_point * hist_mask  # Apply mask [B, seq_len]
+            
+            sum_loss_rec_per_seq = torch.sum(masked_loss_rec, dim=1)  # [B]
+            num_valid_hist_points_per_seq = torch.sum(hist_mask, dim=1)  # [B]
+            valid_hist_mask = num_valid_hist_points_per_seq > 0
             mean_loss_rec_per_seq = torch.zeros_like(sum_loss_rec_per_seq)
-            mean_loss_rec_per_seq[valid_rec_mask] = sum_loss_rec_per_seq[valid_rec_mask] / num_valid_hist_per_seq[valid_rec_mask]
-            mean_rec_loss_xyz = torch.sum(mean_loss_rec_per_seq) / torch.sum(valid_rec_mask) if torch.sum(valid_rec_mask) > 0 else torch.tensor(0.0, device=device)
-            rec_loss_weight = self.config.lambda_rec_xyz
+            mean_loss_rec_per_seq[valid_hist_mask] = sum_loss_rec_per_seq[valid_hist_mask] / num_valid_hist_points_per_seq[valid_hist_mask]
+            mean_rec_loss = torch.sum(mean_loss_rec_per_seq) / torch.sum(valid_hist_mask) if torch.sum(valid_hist_mask) > 0 else torch.tensor(0.0, device=device)
         else:
-            mean_rec_loss_xyz = torch.tensor(0.0, device=device)
-            rec_loss_weight = 0.0
-        # ------------------------------------------------------
-
-        # --- Calculate L1 Path Loss (XYZ Future) --- 
-        # Compare predicted future with GT future using the future mask
-        loss_path_per_coord = F.l1_loss(pred_future_positions, gt_future_positions, reduction='none') # [B, relevant_len, 3]
-        loss_path_per_point = torch.sum(loss_path_per_coord, dim=-1) # [B, relevant_len]
+            # No history to reconstruct
+            mean_rec_loss = torch.tensor(0.0, device=device)
         
-        # Ensure the mask matches the dimensions being compared
-        masked_loss_path = loss_path_per_point * dynamic_future_mask_for_loss # [B, relevant_len]
+        # --- Apply weights ---
+        # Use simplified weights: lambda_trans, lambda_ori, lambda_rec
+        lambda_trans = getattr(self.config, 'lambda_trans', 1.0)
+        lambda_ori = getattr(self.config, 'lambda_ori', 1.0)
+        lambda_rec = getattr(self.config, 'lambda_rec', 1.0)  # Single weight for reconstruction loss
         
-        sum_loss_path_per_seq = torch.sum(masked_loss_path, dim=1) # [B]
-        num_valid_future_per_seq = torch.sum(dynamic_future_mask_for_loss, dim=1) # [B]
-        valid_path_mask = num_valid_future_per_seq > 0
-        mean_loss_path_per_seq = torch.zeros_like(sum_loss_path_per_seq)
-        mean_loss_path_per_seq[valid_path_mask] = sum_loss_path_per_seq[valid_path_mask] / num_valid_future_per_seq[valid_path_mask]
-        mean_path_loss_xyz = torch.sum(mean_loss_path_per_seq) / torch.sum(valid_path_mask) if torch.sum(valid_path_mask) > 0 else torch.tensor(0.0, device=device)
-        # -------------------------------------------
-
-        # --- Calculate L1 Destination Loss (XYZ) --- 
-        # Find the index of the last valid point in the *original* GT sequence
-        last_valid_indices_gt = actual_lengths.long() - 1
-        last_valid_indices_gt = torch.clamp(last_valid_indices_gt, min=0)
+        weighted_trans_loss = lambda_trans * mean_trans_loss
+        weighted_ori_loss = lambda_ori * mean_ori_loss
+        weighted_rec_loss = lambda_rec * mean_rec_loss
         
+        # --- Calculate Destination Loss (终点损失) ---
+        # Find the last valid point for each sequence in the batch
+        batch_size = gt_full_poses.shape[0]
+        last_valid_indices = (torch.sum(gt_full_mask, dim=1) - 1).long().clamp(min=0)  # [B]
         batch_indices = torch.arange(batch_size, device=device)
         
-        # Get the last valid ground truth position
-        last_gt_positions = gt_full_positions[batch_indices, last_valid_indices_gt, :]
+        # Extract the last valid GT and predicted positions
+        last_gt_poses = gt_full_poses[batch_indices, last_valid_indices]  # [B, 6]
         
-        # Get the corresponding predicted position
+        # Handle the first_frame_only case differently for predictions
         if self.config.use_first_frame_only:
-            # Prediction indices are shifted by 1 relative to GT indices
-            # Last valid prediction index corresponds to GT index last_valid_indices_gt - 1
-            last_valid_indices_pred = last_valid_indices_gt - 1
-            # Clamp to ensure index is valid for prediction tensor (length seq_len-1)
-            last_valid_indices_pred = torch.clamp(last_valid_indices_pred, min=0, max=predictions.shape[1] - 1) 
-            last_pred_positions = predictions[batch_indices, last_valid_indices_pred, :]
+            # In this mode, prediction indices are shifted by 1 relative to GT
+            pred_indices = torch.clamp(last_valid_indices - 1, min=0)
+            if predictions.shape[1] > 1:  # Make sure predictions has enough frames
+                last_pred_poses = predictions[batch_indices, pred_indices]  # [B, 6]
+            else:
+                last_pred_poses = predictions[:, -1]  # Use last available prediction
         else:
-            # Standard case: index directly corresponds
-            last_pred_positions = predictions[batch_indices, last_valid_indices_gt, :]
-            
-        # Calculate L1 loss per destination point
-        dest_loss_per_seq = torch.sum(F.l1_loss(last_pred_positions, last_gt_positions, reduction='none'), dim=1) # [B]
+            last_pred_poses = predictions[batch_indices, last_valid_indices]  # [B, 6]
         
-        # Only consider sequences that have at least two points (actual_lengths >= 2 for future prediction)
-        # or at least one point in the standard case.
-        min_len_for_dest = 2 if self.config.use_first_frame_only else 1
-        valid_dest_mask = actual_lengths >= min_len_for_dest
-        masked_dest_loss = dest_loss_per_seq * valid_dest_mask.float()
+        # Calculate destination loss for both positions and orientations
+        dest_loss_per_coord = F.l1_loss(last_pred_poses, last_gt_poses, reduction='none')  # [B, 6]
         
-        # Batch average of destination loss (only over valid sequences)
-        mean_dest_loss_xyz = torch.sum(masked_dest_loss) / torch.sum(valid_dest_mask) if torch.sum(valid_dest_mask) > 0 else torch.tensor(0.0, device=device)
-        # -----------------------------------------
-
-        # --- Combine Losses --- 
-        # rec_loss_weight is determined above based on use_first_frame_only
-        total_loss = (rec_loss_weight * mean_rec_loss_xyz + 
-                      self.config.lambda_path_xyz * mean_path_loss_xyz + 
-                      self.config.lambda_dest_xyz * mean_dest_loss_xyz)
+        # Split into position and orientation components
+        dest_trans_loss_per_seq = torch.sum(dest_loss_per_coord[:, :position_dim], dim=1)  # [B]
+        dest_ori_loss_per_seq = torch.sum(dest_loss_per_coord[:, position_dim:], dim=1)  # [B]
+        
+        # Apply mask to handle invalid sequences
+        valid_dest_mask = last_valid_indices > 0  # Sequences with at least one valid point
+        dest_trans_loss = torch.sum(dest_trans_loss_per_seq * valid_dest_mask.float()) / torch.sum(valid_dest_mask.float()) if torch.sum(valid_dest_mask) > 0 else torch.tensor(0.0, device=device)
+        dest_ori_loss = torch.sum(dest_ori_loss_per_seq * valid_dest_mask.float()) / torch.sum(valid_dest_mask.float()) if torch.sum(valid_dest_mask) > 0 else torch.tensor(0.0, device=device)
+        
+        weighted_dest_trans_loss = lambda_trans * dest_trans_loss 
+        weighted_dest_ori_loss = lambda_ori * dest_ori_loss 
+        
+        # Total loss
+        total_loss = weighted_trans_loss + weighted_ori_loss + weighted_rec_loss + weighted_dest_trans_loss + weighted_dest_ori_loss
                      
         # Store individual batch-averaged losses for logging/debugging
         loss_dict = {
             'total_loss': total_loss,
-            'rec_loss_xyz': rec_loss_weight * mean_rec_loss_xyz,
-            'path_loss_xyz': self.config.lambda_path_xyz * mean_path_loss_xyz,
-            'dest_loss_xyz': self.config.lambda_dest_xyz * mean_dest_loss_xyz
+            'trans_loss': weighted_trans_loss,
+            'ori_loss': weighted_ori_loss,
+            'rec_loss': weighted_rec_loss,
+            'dest_trans_loss': weighted_dest_trans_loss,
+            'dest_ori_loss': weighted_dest_ori_loss
         }
             
         return total_loss, loss_dict
