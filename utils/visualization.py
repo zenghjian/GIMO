@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.cm as cm # Import colormap library
 
-def visualize_trajectory(past_positions, future_positions, past_mask=None, future_mask=None, title="Trajectory", save_path=None, segment_idx=None, show_orientation=False, past_orientations=None, future_orientations=None, arrow_scale=0.2):
+def visualize_trajectory(past_positions, future_positions, past_mask=None, future_mask=None, title="Trajectory", save_path=None, segment_idx=None, show_orientation=False, past_orientations=None, future_orientations=None):
     """
     Visualize past (history) and future (ground truth) trajectory segments.
     
@@ -20,7 +20,6 @@ def visualize_trajectory(past_positions, future_positions, past_mask=None, futur
         show_orientation: Whether to show orientation arrows
         past_orientations: Tensor of past orientations [N, 3] (roll, pitch, yaw)
         future_orientations: Tensor of future orientations [M, 3] (roll, pitch, yaw)
-        arrow_scale: Scale factor for orientation arrows
     """
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
@@ -61,18 +60,34 @@ def visualize_trajectory(past_positions, future_positions, past_mask=None, futur
         
     num_valid_future = future_positions_valid.shape[0]
 
-    # Combine valid positions for plotting limits if needed, ensure not empty
-    all_valid_positions = np.empty((0,3))
+    # Combine valid positions for plotting limits and arrow scale, ensure not empty
+    all_valid_positions = []
     if num_valid_past > 0:
-        all_valid_positions = np.vstack((all_valid_positions, past_positions_valid))
+        all_valid_positions.append(past_positions_valid)
     if num_valid_future > 0:
-        all_valid_positions = np.vstack((all_valid_positions, future_positions_valid))
-        
-    if all_valid_positions.shape[0] == 0:
+        all_valid_positions.append(future_positions_valid)
+
+    if not all_valid_positions:
         # print("Warning: No valid points found in past or future trajectory.") # Can be noisy
         plt.close(fig)
         return
-        
+
+    all_valid_positions = np.vstack(all_valid_positions)
+
+    # --- Calculate Dynamic Arrow Scale ---
+    dynamic_arrow_scale = 0.1 # Default value if no points or range is zero
+    if all_valid_positions.shape[0] > 1:
+        min_coords = np.min(all_valid_positions, axis=0)
+        max_coords = np.max(all_valid_positions, axis=0)
+        ranges = max_coords - min_coords
+        max_range = np.max(ranges)
+        if max_range > 1e-6: # Avoid division by zero or tiny scales
+            dynamic_arrow_scale = max_range * 0.05 # 5% of the max range
+        else:
+            # Handle case where all points are very close or identical
+            dynamic_arrow_scale = 0.05 # Small default absolute scale
+    # -----------------------------------
+
     # Plot Past Trajectory (History)
     if num_valid_past > 0:
         past_colors = cm.Blues(np.linspace(0.3, 1, num_valid_past)) # Use Blues colormap
@@ -85,14 +100,19 @@ def visualize_trajectory(past_positions, future_positions, past_mask=None, futur
         if show_orientation and past_orientations is not None:
             if isinstance(past_orientations, torch.Tensor):
                 past_orientations = past_orientations.detach().cpu().numpy()
-            for i in range(len(past_positions_valid)):
-                roll, pitch, yaw = past_orientations[i]
-                dx = arrow_scale * np.cos(yaw) * np.cos(pitch)
-                dy = arrow_scale * np.sin(yaw) * np.cos(pitch)
-                dz = arrow_scale * np.sin(pitch)
-                
-                ax.quiver(past_positions_valid[i, 0], past_positions_valid[i, 1], past_positions_valid[i, 2],
-                         dx, dy, dz, color='r', arrow_length_ratio=0.3)
+            # Ensure orientations match valid points
+            valid_past_orientations = past_orientations[valid_past_indices] if past_mask is not None else past_orientations
+            if valid_past_orientations.shape[0] == past_positions_valid.shape[0]:
+                for i in range(len(past_positions_valid)):
+                    roll, pitch, yaw = valid_past_orientations[i]
+                    dx = dynamic_arrow_scale * np.cos(yaw) * np.cos(pitch)
+                    dy = dynamic_arrow_scale * np.sin(yaw) * np.cos(pitch)
+                    dz = dynamic_arrow_scale * np.sin(pitch)
+                    
+                    ax.quiver(past_positions_valid[i, 0], past_positions_valid[i, 1], past_positions_valid[i, 2],
+                             dx, dy, dz, color='r', arrow_length_ratio=0.3)
+            else:
+                print("Warning: Mismatch between valid past positions and orientations. Skipping past orientation arrows.")
 
     # Plot Future Trajectory (Ground Truth)
     if num_valid_future > 0:
@@ -106,14 +126,19 @@ def visualize_trajectory(past_positions, future_positions, past_mask=None, futur
         if show_orientation and future_orientations is not None:
             if isinstance(future_orientations, torch.Tensor):
                 future_orientations = future_orientations.detach().cpu().numpy()
-            for i in range(len(future_positions_valid)):
-                roll, pitch, yaw = future_orientations[i]
-                dx = arrow_scale * np.cos(yaw) * np.cos(pitch)
-                dy = arrow_scale * np.sin(yaw) * np.cos(pitch)
-                dz = arrow_scale * np.sin(pitch)
-                
-                ax.quiver(future_positions_valid[i, 0], future_positions_valid[i, 1], future_positions_valid[i, 2],
-                         dx, dy, dz, color='b', arrow_length_ratio=0.3)
+            # Ensure orientations match valid points
+            valid_future_orientations = future_orientations[valid_future_indices] if future_mask is not None else future_orientations
+            if valid_future_orientations.shape[0] == future_positions_valid.shape[0]:
+                for i in range(len(future_positions_valid)):
+                    roll, pitch, yaw = valid_future_orientations[i]
+                    dx = dynamic_arrow_scale * np.cos(yaw) * np.cos(pitch)
+                    dy = dynamic_arrow_scale * np.sin(yaw) * np.cos(pitch)
+                    dz = dynamic_arrow_scale * np.sin(pitch)
+                    
+                    ax.quiver(future_positions_valid[i, 0], future_positions_valid[i, 1], future_positions_valid[i, 2],
+                             dx, dy, dz, color='b', arrow_length_ratio=0.3)
+            else:
+                print("Warning: Mismatch between valid future positions and orientations. Skipping future orientation arrows.")
 
     # Set labels and title
     ax.set_xlabel('X')
@@ -142,9 +167,9 @@ def visualize_trajectory(past_positions, future_positions, past_mask=None, futur
     
     plt.close(fig)
 
-def visualize_prediction(past_positions, future_positions_gt, future_positions_pred, 
-                         past_mask=None, future_mask_gt=None, 
-                         title="Prediction vs Ground Truth", save_path=None, segment_idx=None, show_orientation=False, past_orientations=None, future_orientations_gt=None, future_orientations_pred=None, arrow_scale=0.2):
+def visualize_prediction(past_positions, future_positions_gt, future_positions_pred,
+                         past_mask=None, future_mask_gt=None,
+                         title="Prediction vs Ground Truth", save_path=None, segment_idx=None, show_orientation=False, past_orientations=None, future_orientations_gt=None, future_orientations_pred=None):
     """
     Visualize past trajectory, ground truth future, and predicted future.
     Uses masks for past and ground truth future trajectories.
@@ -162,7 +187,6 @@ def visualize_prediction(past_positions, future_positions_gt, future_positions_p
         past_orientations: Tensor of past orientations [N, 3] (roll, pitch, yaw)
         future_orientations_gt: Tensor of ground truth future orientations [M, 3]
         future_orientations_pred: Tensor of predicted future orientations [M, 3]
-        arrow_scale: Scale factor for orientation arrows
     """
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
@@ -179,7 +203,7 @@ def visualize_prediction(past_positions, future_positions_gt, future_positions_p
         if len(valid_past_indices) > 0:
             past_positions_valid = past_positions[valid_past_indices]
         else:
-            past_positions_valid = np.empty((0, 3)) 
+            past_positions_valid = np.empty((0, 3))
     else:
         past_positions_valid = past_positions
     num_valid_past = past_positions_valid.shape[0]
@@ -203,11 +227,38 @@ def visualize_prediction(past_positions, future_positions_gt, future_positions_p
     num_valid_future_gt = future_positions_gt_valid.shape[0]
     # ----------------------------------------------------
 
-    # --- Process Future Trajectory (Prediction) - No Mask --- 
+    # --- Process Future Trajectory (Prediction) - No Mask ---
     if isinstance(future_positions_pred, torch.Tensor):
         future_positions_pred = future_positions_pred.detach().cpu().numpy()
     num_future_pred = future_positions_pred.shape[0]
+    future_positions_pred_valid = future_positions_pred # Assuming prediction is always 'valid' or dense
     # -----------------------------------------------------
+
+    # --- Calculate Dynamic Arrow Scale ---
+    dynamic_arrow_scale = 0.1 # Default value if no points or range is zero
+    all_plot_points = []
+    if num_valid_past > 0:
+        all_plot_points.append(past_positions_valid)
+    if num_valid_future_gt > 0:
+        all_plot_points.append(future_positions_gt_valid)
+    # The key change: Don't include predicted positions in arrow scale calculation
+    # if num_future_pred > 0:
+    #      # Use prediction points as well for scale calculation
+    #     all_plot_points.append(future_positions_pred_valid)
+
+    if all_plot_points:
+        all_plot_points = np.vstack(all_plot_points)
+        if all_plot_points.shape[0] > 1:
+            min_coords = np.min(all_plot_points, axis=0)
+            max_coords = np.max(all_plot_points, axis=0)
+            ranges = max_coords - min_coords
+            max_range = np.max(ranges)
+            if max_range > 1e-6: # Avoid division by zero or tiny scales
+                dynamic_arrow_scale = max_range * 0.05 # 5% of the max range
+            else:
+                # Handle case where all points are very close or identical
+                dynamic_arrow_scale = 0.05 # Small default absolute scale
+    # -----------------------------------
 
     # Plot Past Trajectory (History) - Blue (using valid points)
     if num_valid_past > 0:
@@ -220,14 +271,19 @@ def visualize_prediction(past_positions, future_positions_gt, future_positions_p
         if show_orientation and past_orientations is not None:
             if isinstance(past_orientations, torch.Tensor):
                 past_orientations = past_orientations.detach().cpu().numpy()
-            for i in range(len(past_positions_valid)):
-                roll, pitch, yaw = past_orientations[i]
-                dx = arrow_scale * np.cos(yaw) * np.cos(pitch)
-                dy = arrow_scale * np.sin(yaw) * np.cos(pitch)
-                dz = arrow_scale * np.sin(pitch)
-                
-                ax.quiver(past_positions_valid[i, 0], past_positions_valid[i, 1], past_positions_valid[i, 2],
-                         dx, dy, dz, color='r', arrow_length_ratio=0.3)
+            # Ensure orientations match valid points
+            valid_past_orientations = past_orientations[valid_past_indices] if past_mask is not None else past_orientations
+            if valid_past_orientations.shape[0] == past_positions_valid.shape[0]:
+                for i in range(len(past_positions_valid)):
+                    roll, pitch, yaw = valid_past_orientations[i]
+                    dx = dynamic_arrow_scale * np.cos(yaw) * np.cos(pitch)
+                    dy = dynamic_arrow_scale * np.sin(yaw) * np.cos(pitch)
+                    dz = dynamic_arrow_scale * np.sin(pitch)
+
+                    ax.quiver(past_positions_valid[i, 0], past_positions_valid[i, 1], past_positions_valid[i, 2],
+                              dx, dy, dz, color='r', arrow_length_ratio=0.3)
+            else:
+                 print("Warning: Mismatch between valid past positions and orientations. Skipping past orientation arrows.")
 
     # Plot Future Trajectory (Ground Truth) - Green (using valid points)
     if num_valid_future_gt > 0:
@@ -240,34 +296,43 @@ def visualize_prediction(past_positions, future_positions_gt, future_positions_p
         if show_orientation and future_orientations_gt is not None:
             if isinstance(future_orientations_gt, torch.Tensor):
                 future_orientations_gt = future_orientations_gt.detach().cpu().numpy()
-            for i in range(len(future_positions_gt_valid)):
-                roll, pitch, yaw = future_orientations_gt[i]
-                dx = arrow_scale * np.cos(yaw) * np.cos(pitch)
-                dy = arrow_scale * np.sin(yaw) * np.cos(pitch)
-                dz = arrow_scale * np.sin(pitch)
-                
-                ax.quiver(future_positions_gt_valid[i, 0], future_positions_gt_valid[i, 1], future_positions_gt_valid[i, 2],
-                         dx, dy, dz, color='b', arrow_length_ratio=0.3)
+            # Ensure orientations match valid points
+            valid_future_gt_orientations = future_orientations_gt[valid_future_gt_indices] if future_mask_gt is not None else future_orientations_gt
+            if valid_future_gt_orientations.shape[0] == future_positions_gt_valid.shape[0]:
+                for i in range(len(future_positions_gt_valid)):
+                    roll, pitch, yaw = valid_future_gt_orientations[i]
+                    dx = dynamic_arrow_scale * np.cos(yaw) * np.cos(pitch)
+                    dy = dynamic_arrow_scale * np.sin(yaw) * np.cos(pitch)
+                    dz = dynamic_arrow_scale * np.sin(pitch)
+
+                    ax.quiver(future_positions_gt_valid[i, 0], future_positions_gt_valid[i, 1], future_positions_gt_valid[i, 2],
+                              dx, dy, dz, color='b', arrow_length_ratio=0.3)
+            else:
+                print("Warning: Mismatch between valid GT future positions and orientations. Skipping GT orientation arrows.")
 
     # Plot Future Trajectory (Prediction) - Red (plotting all points)
     if num_future_pred > 0:
         pred_colors = cm.Reds(np.linspace(0.3, 1, num_future_pred))
-        ax.plot(future_positions_pred[:, 0], future_positions_pred[:, 1], future_positions_pred[:, 2], 'black', linestyle=':', linewidth=1, alpha=0.6, label='_nolegend_')
-        ax.scatter(future_positions_pred[:, 0], future_positions_pred[:, 1], future_positions_pred[:, 2], c=pred_colors, marker='x', s=35, label=f'Predicted Future ({num_future_pred} pts)')
-        ax.scatter(future_positions_pred[-1, 0], future_positions_pred[-1, 1], future_positions_pred[-1, 2], c='cyan', marker='o', s=100, label='End Predicted Future', edgecolors='black')
+        ax.plot(future_positions_pred_valid[:, 0], future_positions_pred_valid[:, 1], future_positions_pred_valid[:, 2], 'black', linestyle=':', linewidth=1, alpha=0.6, label='_nolegend_')
+        ax.scatter(future_positions_pred_valid[:, 0], future_positions_pred_valid[:, 1], future_positions_pred_valid[:, 2], c=pred_colors, marker='x', s=35, label=f'Predicted Future ({num_future_pred} pts)')
+        ax.scatter(future_positions_pred_valid[-1, 0], future_positions_pred_valid[-1, 1], future_positions_pred_valid[-1, 2], c='cyan', marker='o', s=100, label='End Predicted Future', edgecolors='black')
 
         # Add orientation arrows for predicted future
         if show_orientation and future_orientations_pred is not None:
             if isinstance(future_orientations_pred, torch.Tensor):
                 future_orientations_pred = future_orientations_pred.detach().cpu().numpy()
-            for i in range(len(future_positions_pred)):
-                roll, pitch, yaw = future_orientations_pred[i]
-                dx = arrow_scale * np.cos(yaw) * np.cos(pitch)
-                dy = arrow_scale * np.sin(yaw) * np.cos(pitch)
-                dz = arrow_scale * np.sin(pitch)
-                
-                ax.quiver(future_positions_pred[i, 0], future_positions_pred[i, 1], future_positions_pred[i, 2],
-                         dx, dy, dz, color='g', arrow_length_ratio=0.3)
+            # Prediction orientations should match prediction points directly
+            if future_orientations_pred.shape[0] == future_positions_pred_valid.shape[0]:
+                for i in range(len(future_positions_pred_valid)):
+                    roll, pitch, yaw = future_orientations_pred[i]
+                    dx = dynamic_arrow_scale * np.cos(yaw) * np.cos(pitch)
+                    dy = dynamic_arrow_scale * np.sin(yaw) * np.cos(pitch)
+                    dz = dynamic_arrow_scale * np.sin(pitch)
+
+                    ax.quiver(future_positions_pred_valid[i, 0], future_positions_pred_valid[i, 1], future_positions_pred_valid[i, 2],
+                              dx, dy, dz, color='g', arrow_length_ratio=0.3)
+            else:
+                print("Warning: Mismatch between predicted future positions and orientations. Skipping predicted orientation arrows.")
 
     # Set labels and title
     ax.set_xlabel('X')
@@ -293,7 +358,7 @@ def visualize_prediction(past_positions, future_positions_gt, future_positions_p
 
     plt.close(fig)
 
-def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, title="Full Trajectory", save_path=None, segment_idx=None, show_orientation=False, orientations=None, arrow_scale=0.2, num_pc_points=10000):
+def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, title="Full Trajectory", save_path=None, segment_idx=None):
     """
     Visualize a complete trajectory without past/future split, optionally with surrounding point cloud.
     
@@ -304,9 +369,7 @@ def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, 
         title: Plot title
         save_path: Path to save the figure
         segment_idx: Optional segment index for multi-segment objects
-        show_orientation: Whether to show orientation arrows
-        orientations: Tensor of orientations [N, 3] (roll, pitch, yaw)
-        arrow_scale: Scale factor for orientation arrows
+
         num_pc_points: Max number of point cloud points to plot
     """
     fig = plt.figure(figsize=(12, 10))
@@ -368,19 +431,6 @@ def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, 
               c='lime', marker='o', s=100, label='Start', edgecolors='black')
     ax.scatter(positions_valid[-1, 0], positions_valid[-1, 1], positions_valid[-1, 2],
               c='magenta', marker='o', s=100, label='End', edgecolors='black')
-    
-    # Add orientation arrows if available
-    if show_orientation and orientations is not None:
-        for i in range(len(positions_valid)):
-            roll, pitch, yaw = orientations[i]
-            dx = arrow_scale * np.cos(yaw) * np.cos(pitch)
-            dy = arrow_scale * np.sin(yaw) * np.cos(pitch)
-            dz = arrow_scale * np.sin(pitch)
-            
-            # Use color gradient for arrows too
-            arrow_color = point_colors[i]
-            ax.quiver(positions_valid[i, 0], positions_valid[i, 1], positions_valid[i, 2],
-                     dx, dy, dz, color=arrow_color, arrow_length_ratio=0.3)
     
     # Add labels and title
     ax.set_xlabel('X')

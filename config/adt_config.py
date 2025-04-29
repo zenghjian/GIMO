@@ -16,7 +16,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.traj_dataset_configs.add_argument('--val_split_file', default=None, type=str, help='Path to validation split file (overrides dataroot scan/split)')
         self.traj_dataset_configs.add_argument('--train_ratio', default=0.9, type=float, help='Ratio of sequences to use for training (default: 0.9, used if split files not provided)')
         self.traj_dataset_configs.add_argument('--split_seed', default=42, type=int, help='Random seed for train/val split (used if split files not provided)')
-        self.traj_dataset_configs.add_argument('--trajectory_length', default=100, type=int, help='Total length of trajectory segments extracted (before split)')
+        self.traj_dataset_configs.add_argument('--trajectory_length', default=200, type=int, help='Total length of trajectory segments extracted (before split)')
         self.traj_dataset_configs.add_argument('--history_fraction', default=0.3, type=float, help='Fraction of trajectory_length to use for history (e.g., 0.6 for 3/5 ratio)')
         self.traj_dataset_configs.add_argument('--object_position_dim', default=3, type=int, help='Dimension of object position (x, y, z)')
         self.traj_dataset_configs.add_argument('--object_orientation_dim', default=3, type=int, help='Dimension of object orientation (roll, pitch, yaw)')
@@ -26,7 +26,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.traj_dataset_configs.add_argument('--use_displacements', default=False, action='store_true', help='Use relative displacements instead of absolute positions')
         self.traj_dataset_configs.add_argument('--use_first_frame_only', default=False, action='store_true', help='Use only the first frame as input, predict full sequence')
         self.traj_dataset_configs.add_argument('--load_pointcloud', default=True, action='store_true', help='Enable loading point cloud data from sequences')
-        self.traj_dataset_configs.add_argument('--pointcloud_subsample', default=10, type=int, help='Subsample factor for point cloud (higher means fewer points)')
+        self.traj_dataset_configs.add_argument('--pointcloud_subsample', default=1, type=int, help='Subsample factor for point cloud (higher means fewer points)')
         self.traj_dataset_configs.add_argument('--trajectory_pointcloud_radius', default=1.0, type=float, help='Radius (in meters) around trajectory to collect points for trajectory-specific point clouds')
         self.traj_dataset_configs.add_argument('--min_motion_threshold', default=1.0, type=float, help='Minimum motion threshold in meters for trajectory filtering')
         self.traj_dataset_configs.add_argument('--min_motion_percentile', default=0.0, type=float, help='Filter trajectories below this percentile of motion')
@@ -40,7 +40,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         # === Scene/Point Cloud Configuration ===
         self.scene_configs = self.add_argument_group('Scene Encoder')
         self.scene_configs.add_argument('--scene_feats_dim', default=256, type=int, help='Output dimension of the PointNet scene encoder')
-        self.scene_configs.add_argument('--sample_points', default=30000, type=int, help='Number of points to sample from the scene point cloud') 
+        self.scene_configs.add_argument('--sample_points', default=50000, type=int, help='Number of points to sample from the scene point cloud') 
         # self.scene_configs.add_argument('--pointnet_chkpoints', default='pretrained/point.model', type=str, help='Path to pretrained PointNet weights') # Consider adding back later
 
         # === Motion Pathway Configuration (Based on GIMO) ===
@@ -58,6 +58,16 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.cross_modal_configs.add_argument('--cross_hidden_dim', default=256, type=int)
         self.cross_modal_configs.add_argument('--cross_intermediate_dim', default=1024, type=int)
         self.cross_modal_configs.add_argument('--cross_n_layers', default=3, type=int)
+        
+        # === Category Encoder Configuration ===
+        self.category_configs = self.add_argument_group('Category Encoder')
+        self.category_configs.add_argument('--category_embed_dim', default=64, type=int, help='Embedding dimension for category tokens')
+        self.category_configs.add_argument('--category_latent_dim', default=128, type=int, help='Latent dimension for encoded categories')
+        self.category_configs.add_argument('--category_n_heads', default=4, type=int, help='Number of attention heads in category encoder')
+        self.category_configs.add_argument('--category_n_layers', default=2, type=int, help='Number of layers in category encoder')
+        self.category_configs.add_argument('--max_category_tokens', default=30, type=int, help='Maximum number of tokens per category string')
+        self.category_configs.add_argument('--vocab_size', default=128, type=int, help='Vocabulary size for token embedding (ASCII characters + special tokens)')
+        self.category_configs.add_argument('--no_text_embedding', action='store_true', default=False, help='Disable text embedding for object categories')
 
         # === Training Configuration ===
         self.train_configs = self.add_argument_group('Training')
@@ -65,7 +75,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.train_configs.add_argument('--save_fre', type=int, default=50, help='Checkpoint saving frequency (epochs)')
         # self.train_configs.add_argument('--vis_fre', type=int, default=1000) # Maybe redefine for trajectory viz
         self.train_configs.add_argument('--val_fre', type=int, default=50, help='Validation frequency (epochs)')
-        self.train_configs.add_argument('--num_val_visualizations', type=int, default=10, help='Number of samples to visualize during validation')
+        self.train_configs.add_argument('--num_val_visualizations', type=int, default=100, help='Number of samples to visualize during validation')
         self.train_configs.add_argument('--load_model_dir', type=str, default=None, help='Path to load a pretrained model checkpoint')
         self.train_configs.add_argument('--load_optim_dir', type=str, default=None, help='Path to load optimizer state separately')
 

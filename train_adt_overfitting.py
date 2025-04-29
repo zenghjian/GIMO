@@ -78,6 +78,11 @@ def validate(model, dataloader, device, config, epoch):
                 object_names = batch.get('object_name', [f"unknown_{i}" for i in range(full_trajectory_batch.shape[0])])
                 # Ensure object IDs are usable
                 object_ids = batch.get('object_id', torch.arange(full_trajectory_batch.shape[0])).cpu().numpy()
+                # Get object categories for the model
+                object_categories = batch.get('object_category', [f"unknown" for i in range(full_trajectory_batch.shape[0])])
+                # Convert categories to list of strings if they're tensors
+                if isinstance(object_categories, torch.Tensor):
+                    object_categories = [cat.item() if isinstance(cat.item(), str) else str(cat.item()) for cat in object_categories]
 
             except KeyError as e:
                 print(f"Error: Missing key {e} in validation batch {batch_idx}. Skipping batch.")
@@ -87,7 +92,7 @@ def validate(model, dataloader, device, config, epoch):
                 continue
 
             # Forward pass with input trajectory only
-            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch)
+            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, object_categories)
             total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
 
             val_total_loss += total_loss.item()
@@ -173,7 +178,7 @@ def validate(model, dataloader, device, config, epoch):
                     
                     # Check if orientation visualization is enabled
                     show_ori_arrows = getattr(config, 'show_ori_arrows', False)
-                    viz_ori_scale = getattr(config, 'viz_ori_scale', 0.2)
+
                     
                     # Full Trajectory Visualization - now with point cloud and orientation
                     full_traj_path = os.path.join(vis_output_dir, f"{filename_base}_full_trajectory_with_scene_epoch{epoch}.png")
@@ -183,10 +188,7 @@ def validate(model, dataloader, device, config, epoch):
                         point_cloud=sample_pointcloud,  # Pass the point cloud
                         title=f"Full GT - {vis_title_base}",
                         save_path=full_traj_path,
-                        segment_idx=segment_idx,
-                        show_orientation=show_ori_arrows,
-                        orientations=gt_full_orientations,
-                        arrow_scale=viz_ori_scale
+                        segment_idx=segment_idx
                     )
                     
                     # Split Trajectory Visualization (uses dynamically sliced data)
@@ -198,11 +200,7 @@ def validate(model, dataloader, device, config, epoch):
                         future_mask=vis_future_mask_gt,
                         title=f"Split GT - {vis_title_base}",
                         save_path=split_traj_path,
-                        segment_idx=segment_idx,
-                        show_orientation=show_ori_arrows,
-                        past_orientations=vis_past_orientations,
-                        future_orientations=vis_future_orientations_gt,
-                        arrow_scale=viz_ori_scale
+                        segment_idx=segment_idx
                     )
                     
                     # Prediction vs GT Visualization (uses dynamically sliced data)
@@ -219,8 +217,7 @@ def validate(model, dataloader, device, config, epoch):
                         show_orientation=show_ori_arrows,
                         past_orientations=vis_past_orientations,
                         future_orientations_gt=vis_future_orientations_gt,
-                        future_orientations_pred=predicted_future_orientations,
-                        arrow_scale=viz_ori_scale
+                        future_orientations_pred=predicted_future_orientations
                     )
                     
                     visualized_count += 1
@@ -517,7 +514,53 @@ def main():
     # --- Model Initialization --- 
     logger("Initializing model...")
     model = GIMO_ADT_Model(config).to(device)
-    logger(f"Model initialized. Parameter count: {sum(p.numel() for p in model.parameters())}")
+    
+    # --- Log Model Architecture ---
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    logger("\n=== MODEL ARCHITECTURE ===")
+    logger(f"Total Parameters: {total_params:,}")
+    logger(f"Trainable Parameters: {trainable_params:,}")
+    logger(f"Text Embedding Enabled: {not getattr(config, 'no_text_embedding', False)}")
+    logger(f"Overfitting Mode: True")
+    
+    # Log model components
+    components = {
+        'Motion Encoder': (model.motion_encoder, ['n_input_channels', 'n_latent', 'n_latent_channels']),
+        'Scene Encoder': (model.scene_encoder, ['feat_dim']),
+        'Output Encoder': (model.output_encoder, ['n_input_channels', 'n_latent_channels']),
+    }
+    
+    # Add text embedding components if enabled
+    if model.use_text_embedding:
+        components.update({
+            'Category Encoder': (model.category_encoder, ['n_input_channels', 'n_latent', 'n_latent_channels']),
+            'Motion-Category Decoder': (model.motion_category_decoder, ['n_query_channels', 'n_latent_channels']),
+            'Category-Motion Decoder': (model.category_motion_decoder, ['n_query_channels', 'n_latent_channels']),
+        })
+    
+    # Log each component's structure and parameters
+    for name, (component, attrs) in components.items():
+        params = sum(p.numel() for p in component.parameters())
+        logger(f"\n{name}:")
+        logger(f"  Parameters: {params:,}")
+        try:
+            # Try to log attributes if available
+            for attr in attrs:
+                if hasattr(component, attr):
+                    logger(f"  {attr}: {getattr(component, attr)}")
+        except:
+            pass
+    
+    # Log sample information for overfitting
+    logger(f"\nOverfitting on sample:")
+    logger(f"  Object: {first_sample_name}")
+    logger(f"  Sequence: {first_sample_seq_name}")
+    logger(f"  Category: {first_sample.get('object_category', 'Unknown')}")
+    
+    logger("=== END MODEL ARCHITECTURE ===\n")
+    
     if config.wandb_mode != 'disabled':
         wandb.watch(model)
 
@@ -582,12 +625,18 @@ def main():
                     # Use a fixed portion of the history as input
                     fixed_history_length = int(np.floor(full_trajectory_batch.shape[1] * config.history_fraction))
                     input_trajectory_batch = full_trajectory_batch[:, :fixed_history_length, :]
+                
+                # Get object categories for the model
+                object_categories = batch.get('object_category', [f"unknown" for i in range(full_trajectory_batch.shape[0])])
+                # Convert categories to list of strings if they're tensors
+                if isinstance(object_categories, torch.Tensor):
+                    object_categories = [cat.item() if isinstance(cat.item(), str) else str(cat.item()) for cat in object_categories]
 
             except KeyError as e: logger(f"Error: Missing key {e} in batch {batch_idx}. Skipping."); continue
             except Exception as e: logger(f"Error processing batch {batch_idx}: {e}. Skipping."); continue
 
             # Forward pass with input trajectory only
-            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch)
+            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, object_categories)
             total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
 
             optimizer.zero_grad()

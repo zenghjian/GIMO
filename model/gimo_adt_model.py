@@ -5,7 +5,7 @@ import numpy as np
 
 # Actual GIMO components
 from .pointnet_plus2 import PointNet2SemSegSSGShape
-from .base_cross_model import PerceiveEncoder, PositionwiseFeedForward
+from .base_cross_model import PerceiveEncoder, PositionwiseFeedForward, PerceiveDecoder
 
 class GIMO_ADT_Model(nn.Module):
     """
@@ -19,6 +19,9 @@ class GIMO_ADT_Model(nn.Module):
         # Store history fraction for dynamic splitting
         self.history_fraction = config.history_fraction
         
+        # Check if text embedding is disabled
+        self.use_text_embedding = not getattr(config, 'no_text_embedding', False)
+        
         # Still keep fixed trajectory_length for model definition
         self.sequence_length = config.trajectory_length 
 
@@ -29,6 +32,53 @@ class GIMO_ADT_Model(nn.Module):
 
         # 2. Point Cloud Encoder
         self.scene_encoder = PointNet2SemSegSSGShape({'feat_dim': config.scene_feats_dim})
+
+        # --- Category Encoding Components ---
+        # Only initialize if text embedding is enabled
+        if self.use_text_embedding:
+            # Define token embedding dimension
+            self.category_embed_dim = getattr(config, 'category_embed_dim', 64)
+            
+            # Max number of tokens per category string
+            self.max_category_tokens = getattr(config, 'max_category_tokens', 30)
+            
+            # Vocabulary size for token embedding - keep simple for now
+            self.vocab_size = getattr(config, 'vocab_size', 128)  # ASCII characters + special tokens
+            
+            # Create token embedding layer
+            self.token_embedding = nn.Embedding(self.vocab_size, self.category_embed_dim)
+            
+            # Create category encoder using PerceiveEncoder to process tokens
+            self.category_encoder = PerceiveEncoder(
+                n_input_channels=self.category_embed_dim,
+                n_latent=self.max_category_tokens,  # Match token sequence length
+                n_latent_channels=getattr(config, 'category_latent_dim', 128),  # Output dimension for category encoding
+                n_self_att_heads=getattr(config, 'category_n_heads', 4),
+                n_self_att_layers=getattr(config, 'category_n_layers', 2),
+                dropout=config.dropout
+            )
+            
+            # Linear projector to match category features to same dimension as motion + scene
+            self.category_projector = nn.Linear(
+                getattr(config, 'category_latent_dim', 128),
+                config.motion_latent_dim
+            )
+            
+            # --- Cross-Modal Decoders (for motion-category interaction) ---
+            # Similar to gaze_motion_decoder and motion_gaze_decoder in crossmodal_net.py
+            self.motion_category_decoder = PerceiveDecoder(
+                n_query_channels=config.motion_latent_dim,
+                n_query=self.sequence_length,
+                n_latent_channels=config.motion_latent_dim,  # Category features projected to this dimension
+                dropout=config.dropout
+            )
+            
+            self.category_motion_decoder = PerceiveDecoder(
+                n_query_channels=config.motion_latent_dim,  # Category features projected to this dimension
+                n_query=self.sequence_length,
+                n_latent_channels=config.motion_latent_dim,
+                dropout=config.dropout
+            )
 
         # 3. Motion Encoder
         # Use fixed sequence length for latent definition
@@ -42,10 +92,11 @@ class GIMO_ADT_Model(nn.Module):
         )
 
         # 4. Output Encoder (renamed to match crossmodal_net.py)
-        # Analogous to output_encoder in crossmodal_net.py
-        # Use fixed sequence length for latent definition
+        # Now with input size dependent on whether we use text embedding
+        input_dim = config.motion_latent_dim + config.scene_feats_dim
+        
         self.output_encoder = PerceiveEncoder(
-            n_input_channels=config.motion_latent_dim + config.scene_feats_dim,  # Motion latent + scene features
+            n_input_channels=input_dim,  # Scene features + (optionally fused) motion features
             n_latent=self.sequence_length,
             n_latent_channels=config.cross_hidden_dim,
             n_self_att_heads=config.cross_n_heads,
@@ -53,24 +104,86 @@ class GIMO_ADT_Model(nn.Module):
             dropout=config.dropout
         )
 
-        # 5. Embedding layer for processing combined features (analogous to embedding_layer in crossmodal_net.py)
+        # 5. Embedding layer for processing combined features
         self.embedding_layer = PositionwiseFeedForward(
-            config.motion_latent_dim + config.scene_feats_dim,
-            config.motion_latent_dim + config.scene_feats_dim
+            input_dim,  # Scene + (optionally fused) motion features
+            input_dim
         )
 
-        # 6. Output Layer (analogous to outputlayer in crossmodal_net.py)
+        # 6. Output Layer
         # Predicts per token
         self.outputlayer = nn.Linear(config.cross_hidden_dim, config.object_motion_dim)
+    
+    def tokenize_category(self, category_strings):
+        """
+        Simple tokenizer to convert category strings to token IDs.
+        
+        Args:
+            category_strings: List of category strings [batch_size]
+            
+        Returns:
+            Tensor of token IDs [batch_size, max_category_tokens]
+        """
+        if not self.use_text_embedding:
+            # Return dummy tensor if text embedding is disabled
+            return torch.zeros((len(category_strings), 1), dtype=torch.long, device=self.motion_encoder.latent.device)
+            
+        batch_size = len(category_strings)
+        tokens = torch.zeros((batch_size, self.max_category_tokens), dtype=torch.long, device=self.token_embedding.weight.device)
+        
+        for b, cat_str in enumerate(category_strings):
+            # Truncate if too long
+            cat_str = cat_str[:self.max_category_tokens]
+            
+            # Convert characters to ASCII values (simple tokenization)
+            for i, char in enumerate(cat_str):
+                # Add +1 to avoid 0 (which we use as padding)
+                tokens[b, i] = min(ord(char) + 1, self.vocab_size - 1)
+                
+        return tokens
+    
+    def encode_category(self, category_strings):
+        """
+        Encode category strings into feature vectors.
+        
+        Args:
+            category_strings: List of category strings [batch_size]
+            
+        Returns:
+            Tensor of category features [batch_size, category_latent_dim]
+        """
+        if not self.use_text_embedding:
+            # Return zeros with the correct shape if text embedding is disabled
+            return torch.zeros((len(category_strings), self.config.motion_latent_dim), 
+                               device=self.motion_encoder.latent.device)
+        
+        # Tokenize the category strings
+        tokens = self.tokenize_category(category_strings)
+        
+        # Embed the tokens
+        token_embeddings = self.token_embedding(tokens)  # [B, max_tokens, embed_dim]
+        
+        # Encode the token embeddings
+        encoded_categories = self.category_encoder(token_embeddings)  # [B, max_tokens, latent_dim]
+        
+        # Pool across tokens to get a single vector per category
+        # Using mean pooling here, but could also use max pooling or attention
+        category_features = torch.mean(encoded_categories, dim=1)  # [B, latent_dim]
+        
+        # Project to match motion latent dimensions
+        category_features = self.category_projector(category_features)  # [B, motion_latent_dim]
+        
+        return category_features
 
-    def forward(self, input_trajectory, point_cloud):
+    def forward(self, input_trajectory, point_cloud, object_categories):
         """
         Forward pass with architecture more closely aligned with crossmodal_net.py.
-        Takes only the input portion of trajectory as input.
+        Now includes object category information for improved prediction.
 
         Args:
             input_trajectory: Tensor [B, input_length, 3] - Only the input portion of trajectory
             point_cloud: Tensor [B, N_points, 3]
+            object_categories: List of strings [B] - Category of each object (e.g., 'car', 'pedestrian')
             
         Returns:
             Tensor: Predicted full trajectory [B, sequence_length, 3] in standard mode,
@@ -90,24 +203,54 @@ class GIMO_ADT_Model(nn.Module):
         motion_embedding = self.motion_encoder(motion_feats)
         # [B, sequence_length, motion_latent_dim]
 
-        # 4. Combine global scene features with motion embedding for cross-modal fusion
-        out_seq_len = motion_embedding.shape[1]
-        
+        # 4. Encode object categories
+        if self.use_text_embedding:
+            category_features = self.encode_category(object_categories)  # [B, motion_latent_dim]
+            
+            # 5. Expand category features to match sequence length for cross-attention
+            category_features_expanded = category_features.unsqueeze(1).repeat(1, motion_embedding.shape[1], 1)
+            # [B, sequence_length, motion_latent_dim]
+            
+            # 6. Apply cross-attention between motion and category features
+            # Motion attends to Category
+            motion_with_category_context = self.motion_category_decoder(
+                motion_embedding,  # Query [B, sequence_length, motion_latent_dim]
+                category_features_expanded  # Latent [B, sequence_length, motion_latent_dim]
+            )
+            
+            # Category attends to Motion
+            category_with_motion_context = self.category_motion_decoder(
+                category_features_expanded,  # Query [B, sequence_length, motion_latent_dim]
+                motion_embedding  # Latent [B, sequence_length, motion_latent_dim]
+            )
+            
+            # 7. Combine results from bidirectional cross-attention (element-wise addition)
+            fused_motion_category = motion_with_category_context + category_with_motion_context
+            # [B, sequence_length, motion_latent_dim]
+        else:
+            # Skip text embedding and cross-attention if disabled
+            fused_motion_category = motion_embedding
+            # [B, sequence_length, motion_latent_dim]
+
+        # 8. Combine global scene features with fused motion-category features
         # Expand scene_global_feats to match sequence length
-        cross_modal_embedding = scene_global_feats.unsqueeze(1).repeat(1, out_seq_len, 1)
+        scene_features_expanded = scene_global_feats.unsqueeze(1).repeat(1, motion_embedding.shape[1], 1)
         
-        # Concatenate scene global features and motion embedding
-        cross_modal_embedding = torch.cat([cross_modal_embedding, motion_embedding], dim=2)
+        # Concatenate scene features with the fused motion-category features
+        cross_modal_embedding = torch.cat([
+            scene_features_expanded,   # [B, sequence_length, scene_feats_dim]
+            fused_motion_category      # [B, sequence_length, motion_latent_dim]
+        ], dim=2)
         # [B, sequence_length, scene_feats_dim + motion_latent_dim]
 
-        # 5. Apply embedding layer (like in crossmodal_net.py)
+        # 9. Apply embedding layer
         cross_modal_embedding = self.embedding_layer(cross_modal_embedding)
         
-        # 6. Final encoding with output encoder
+        # 10. Final encoding with output encoder
         cross_modal_embedding = self.output_encoder(cross_modal_embedding)
         # [B, sequence_length, cross_hidden_dim]
 
-        # 7. Predict trajectory for all tokens in the sequence
+        # 11. Predict trajectory for all tokens in the sequence
         all_predictions = self.outputlayer(cross_modal_embedding)
 
         # Return the full sequence prediction or only future if first_frame_only
@@ -328,23 +471,31 @@ if __name__ == '__main__':
     config.batch_size = 4 # Example batch size
     config.sample_points = 1024 # Example point cloud size
     
-    # Create dummy input data
-    past_traj_dummy = torch.randn(config.batch_size, config.history_length, config.object_motion_dim)
-    point_cloud_dummy = torch.randn(config.batch_size, config.sample_points, config.point_cloud_dim)
+    # Test both with and without text embedding
+    for no_text_embedding in [False, True]:
+        # Set the text embedding flag
+        config.no_text_embedding = no_text_embedding
+        print(f"\n--- Testing with {'NO' if no_text_embedding else ''} text embedding ---")
+        
+        # Create dummy input data
+        past_traj_dummy = torch.randn(config.batch_size, config.history_length, config.object_motion_dim)
+        point_cloud_dummy = torch.randn(config.batch_size, config.sample_points, config.point_cloud_dim)
+        object_categories_dummy = ["car", "pedestrian", "bicycle", "car"]  # Example category strings
+        
+        # Instantiate model
+        model = GIMO_ADT_Model(config)
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
+        print(f"Text embedding enabled: {model.use_text_embedding}")
     
-    # Instantiate model
-    model = GIMO_ADT_Model(config)
-    print(model)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
-
-    # Forward pass
-    output = model(past_traj_dummy, point_cloud_dummy)
-    
-    print(f"Input past trajectory shape: {past_traj_dummy.shape}")
-    print(f"Input point cloud shape: {point_cloud_dummy.shape}")
-    print(f"Output predicted future shape: {output.shape}")
-    
-    # Check output shape
-    expected_shape = (config.batch_size, config.sequence_length, config.object_motion_dim)
-    assert output.shape == expected_shape, f"Output shape mismatch! Expected {expected_shape}, Got {output.shape}"
-    print("Output shape check passed.") 
+        # Forward pass (updated to include object_categories)
+        output = model(past_traj_dummy, point_cloud_dummy, object_categories_dummy)
+        
+        print(f"Input past trajectory shape: {past_traj_dummy.shape}")
+        print(f"Input point cloud shape: {point_cloud_dummy.shape}")
+        print(f"Input object categories: {object_categories_dummy}")
+        print(f"Output predicted future shape: {output.shape}")
+        
+        # Check output shape
+        expected_shape = (config.batch_size, config.sequence_length, config.object_motion_dim)
+        assert output.shape == expected_shape, f"Output shape mismatch! Expected {expected_shape}, Got {output.shape}"
+        print("Output shape check passed.") 
