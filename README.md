@@ -9,7 +9,7 @@ python train_adt_overfitting.py \
     --train_ratio 1.0 \
     --weight_decay 0.0 \
     --gamma 1.0 
-
+```
 Key Parameters (`config/adt_config.py`):
 
 *   `--use_first_frame_only`: Default: `False`. If `True`, use only the first frame's pose as input to predict the entire subsequent trajectory.
