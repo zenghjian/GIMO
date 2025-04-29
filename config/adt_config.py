@@ -98,7 +98,6 @@ class ADTObjectMotionConfig(ArgumentParser):
         # === Evaluation Configuration ===
         self.eval_configs = self.add_argument_group('Evaluation')
         self.eval_configs.add_argument('--output_path', default='results_adt/', type=str, help='Directory to save evaluation outputs')
-        self.eval_configs.add_argument('--comment', default='', type=str, help='Custom comment for evaluation run')
         
         # === Visualization Configuration ===
         self.viz_configs = self.add_argument_group('Visualization')

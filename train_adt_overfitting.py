@@ -43,17 +43,99 @@ def log_metrics(epoch, title, metrics, logger_func):
     log_str += " | Components: " + " | ".join([f"{k}: {v:.4f}" for k, v in metrics.items() if k != 'total_loss'])
     logger_func(log_str)
 
+def compute_metrics_for_sample(pred_future, gt_future, future_mask):
+    """
+    Compute L1 Mean, L2 Mean (for RMSE), and FDE for a single trajectory sample.
+
+    Args:
+        pred_future (torch.Tensor): Predicted future trajectory [Fut_Len, 3] (position only)
+        gt_future (torch.Tensor): Ground truth future trajectory [Fut_Len, 3] (position only)
+        future_mask (torch.Tensor): Mask for valid future points [Fut_Len]
+
+    Returns:
+        l1_mean (torch.Tensor): Mean L1 distance (scalar)
+        rmse_ade (torch.Tensor): Mean L2 distance (RMSE analog for ADE) (scalar)
+        fde (torch.Tensor): Final Displacement Error (scalar)
+    """
+    # Ensure tensors are on the same device
+    device = pred_future.device
+    gt_future = gt_future.to(device)
+    future_mask = future_mask.to(device)
+
+    # Calculate L1 distance for all points
+    l1_diff = torch.abs(pred_future - gt_future)  # Shape: [Fut_Len, 3]
+    # Calculate per-timestep L2 distance (Euclidean norm)
+    l2_dist_per_step = torch.norm(pred_future - gt_future, dim=-1)  # Shape: [Fut_Len]
+
+    # Expand mask to match 3D coordinates (for L1)
+    future_mask_expanded = future_mask.unsqueeze(-1).expand_as(l1_diff)  # Shape: [Fut_Len, 3]
+
+    # Count valid points (use original 1D mask)
+    num_valid_points = future_mask.sum()
+    if num_valid_points == 0:
+        # Return zeros if no valid points to avoid division by zero
+        return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+        
+    num_valid_coords = num_valid_points * 3  # Total number of valid coordinate values
+
+    # --- L1 Mean (MAE) Calculation ---
+    # Mask out invalid points
+    masked_l1_diff = l1_diff * future_mask_expanded
+    # Sum distances over all valid coordinates
+    sum_l1_diff = masked_l1_diff.sum()
+    # Calculate average L1 distance
+    l1_mean = sum_l1_diff / num_valid_coords
+
+    # --- RMSE / ADE (L2) Calculation ---
+    # Mask out invalid points
+    masked_l2_dist = l2_dist_per_step * future_mask  # Use 1D mask here
+    # Sum L2 distances over all valid timesteps
+    sum_l2_dist = masked_l2_dist.sum()
+    # Calculate average L2 distance over valid timesteps
+    rmse_ade = sum_l2_dist / num_valid_points
+
+    # --- FDE Calculation ---
+    # Find the index of the last valid point (using 1D mask)
+    last_valid_index = num_valid_points.long() - 1
+    last_valid_index = torch.clamp(last_valid_index, min=0)  # Clamp index to avoid negative indices
+
+    # Get the predicted and ground truth points at the final valid timestep
+    final_pred_point = pred_future[last_valid_index]
+    final_gt_point = gt_future[last_valid_index]
+
+    # Calculate FDE as the L2 distance between these final points
+    fde = torch.norm(final_pred_point - final_gt_point, dim=-1)
+
+    return l1_mean, rmse_ade, fde
+
 def validate(model, dataloader, device, config, epoch):
     model.eval() # Set model to evaluation mode
     val_total_loss = 0.0
     val_loss_components = {}
     visualized_count = 0 # Counter for visualizations this epoch
     vis_limit = config.num_val_visualizations
-    # Make vis_output_dir specific to overfitting run
+    
+    # Check if this is the first validation run for special visualization handling
+    is_first_validation = epoch == config.val_fre
+    
+    # Create different output directories based on whether it's the first validation
     vis_output_dir = os.path.join(config.save_path, "overfitting_val_visualizations", f"epoch_{epoch}")
+    
+    # Create special directory for trajectory and split visualizations (only used on first run)
+    if is_first_validation:
+        trajectory_vis_dir = os.path.join(config.save_path, "overfitting_trajectory_visualizations")
+        os.makedirs(trajectory_vis_dir, exist_ok=True)
+        print(f"First validation run: trajectory visualizations will be saved to: {trajectory_vis_dir}")
+    
     if vis_limit > 0:
         os.makedirs(vis_output_dir, exist_ok=True)
         print(f"Validation visualizations will be saved to: {vis_output_dir}")
+
+    # Add metrics tracking
+    total_l1 = 0.0
+    total_rmse = 0.0
+    total_fde = 0.0
+    total_valid_samples = 0
 
     print("\nRunning validation...")
     with torch.no_grad():
@@ -102,6 +184,52 @@ def validate(model, dataloader, device, config, epoch):
 
             # Optional: Log validation loss per step if desired for overfitting
             # print(f"Validation step loss: {total_loss.item():.4f}")
+
+            # --- Calculate Additional Metrics for Each Sample in Batch ---
+            batch_size = full_trajectory_batch.shape[0]
+            for i in range(batch_size):
+                # Extract ground truth and prediction
+                gt_full_poses = batch['full_poses'][i]
+                gt_full_mask = batch['full_attention_mask'][i]
+                pred_full_trajectory = predicted_full_trajectory[i]
+                
+                # Get actual length from mask
+                actual_length = torch.sum(gt_full_mask).int().item()
+                if actual_length < 2:
+                    continue  # Skip samples with too few valid points
+                
+                # Determine split between history and future
+                if config.use_first_frame_only:
+                    history_length = 1
+                else:
+                    history_length = int(np.floor(actual_length * config.history_fraction))
+                    history_length = max(1, min(history_length, actual_length - 1))
+                
+                # Extract position components (first 3 dimensions)
+                position_dim = config.object_position_dim
+                gt_positions = gt_full_poses[:, :position_dim]
+                pred_positions = pred_full_trajectory[:, :position_dim]
+                
+                # Split into history and future
+                gt_future_positions = gt_positions[history_length:actual_length]
+                pred_future_positions = pred_positions[history_length:actual_length]
+                future_mask = gt_full_mask[history_length:actual_length]
+                
+                if future_mask.sum() == 0:
+                    continue  # Skip if no valid future points
+                
+                # Compute metrics
+                l1_mean, rmse_ade, fde = compute_metrics_for_sample(
+                    pred_future_positions, 
+                    gt_future_positions, 
+                    future_mask
+                )
+                
+                # Accumulate metrics
+                total_l1 += l1_mean.item()
+                total_rmse += rmse_ade.item()
+                total_fde += fde.item()
+                total_valid_samples += 1
 
             # --- Visualization Logic (Adapted for single sample) ---
             if visualized_count < vis_limit:
@@ -179,31 +307,32 @@ def validate(model, dataloader, device, config, epoch):
                     # Check if orientation visualization is enabled
                     show_ori_arrows = getattr(config, 'show_ori_arrows', False)
 
+                    # Only generate full trajectory and split visualizations on first validation
+                    if is_first_validation:
+                        # Full Trajectory Visualization - now with point cloud and orientation
+                        full_traj_path = os.path.join(trajectory_vis_dir, f"{filename_base}_full_trajectory_with_scene.png")
+                        visualize_full_trajectory(
+                            positions=gt_full_positions,
+                            attention_mask=gt_full_mask,
+                            point_cloud=sample_pointcloud,  # Pass the point cloud
+                            title=f"Full GT - {vis_title_base}",
+                            save_path=full_traj_path,
+                            segment_idx=segment_idx
+                        )
+                        
+                        # Split Trajectory Visualization (uses dynamically sliced data)
+                        split_traj_path = os.path.join(trajectory_vis_dir, f"{filename_base}_trajectory_split.png")
+                        visualize_trajectory(
+                            past_positions=vis_past_positions,
+                            future_positions=vis_future_positions_gt,
+                            past_mask=vis_past_mask,
+                            future_mask=vis_future_mask_gt,
+                            title=f"Split GT - {vis_title_base}",
+                            save_path=split_traj_path,
+                            segment_idx=segment_idx
+                        )
                     
-                    # Full Trajectory Visualization - now with point cloud and orientation
-                    full_traj_path = os.path.join(vis_output_dir, f"{filename_base}_full_trajectory_with_scene_epoch{epoch}.png")
-                    visualize_full_trajectory(
-                        positions=gt_full_positions,
-                        attention_mask=gt_full_mask,
-                        point_cloud=sample_pointcloud,  # Pass the point cloud
-                        title=f"Full GT - {vis_title_base}",
-                        save_path=full_traj_path,
-                        segment_idx=segment_idx
-                    )
-                    
-                    # Split Trajectory Visualization (uses dynamically sliced data)
-                    split_traj_path = os.path.join(vis_output_dir, f"{filename_base}_trajectory_split.png")
-                    visualize_trajectory(
-                        past_positions=vis_past_positions,
-                        future_positions=vis_future_positions_gt,
-                        past_mask=vis_past_mask,
-                        future_mask=vis_future_mask_gt,
-                        title=f"Split GT - {vis_title_base}",
-                        save_path=split_traj_path,
-                        segment_idx=segment_idx
-                    )
-                    
-                    # Prediction vs GT Visualization (uses dynamically sliced data)
+                    # Always generate the prediction vs ground truth visualization
                     pred_vs_gt_path = os.path.join(vis_output_dir, f"{filename_base}_prediction_vs_gt_epoch{epoch}.png")
                     visualize_prediction(
                         past_positions=vis_past_positions,
@@ -227,6 +356,19 @@ def validate(model, dataloader, device, config, epoch):
     avg_val_loss = val_total_loss
     avg_loss_components = val_loss_components # No division needed
     avg_loss_components['total_loss'] = avg_val_loss
+    
+    # Calculate average metrics if samples were processed
+    if total_valid_samples > 0:
+        avg_l1 = total_l1 / total_valid_samples
+        avg_rmse = total_rmse / total_valid_samples
+        avg_fde = total_fde / total_valid_samples
+        
+        # Add metrics to the returned components
+        avg_loss_components['l1_mean'] = avg_l1
+        avg_loss_components['rmse'] = avg_rmse
+        avg_loss_components['fde'] = avg_fde
+        
+        print(f"Validation Metrics - L1: {avg_l1:.4f}, RMSE: {avg_rmse:.4f}, FDE: {avg_fde:.4f}")
     
     return avg_loss_components
 
@@ -341,8 +483,9 @@ def main():
     # --- WandB Initialization --- 
     if config.wandb_mode != 'disabled':
         try:
-            comment_suffix = f"_overfit_{config.comment}" if config.comment else "_overfit"
-            run_name = f"GIMO_ADT_{time.strftime('%Y%m%d_%H%M%S')}{comment_suffix}" # Add overfit tag
+            # Extract the last part of save_path as the comment
+            save_path_comment = os.path.basename(os.path.normpath(config.save_path))
+            run_name = f"GIMO_ADT_{time.strftime('%Y%m%d_%H%M%S')}_overfit_{save_path_comment}"
             wandb.init(
                 project=config.wandb_project,
                 config=vars(config),
@@ -667,17 +810,34 @@ def main():
             if config.wandb_mode != 'disabled':
                 wandb.log({"val/" + k: v for k, v in val_metrics.items()}, step=epoch)
                 if config.num_val_visualizations > 0:
+                    # For the first validation run, log both trajectory visualizations and prediction visualizations
+                    if epoch == config.val_fre:
+                        trajectory_vis_dir = os.path.join(config.save_path, "overfitting_trajectory_visualizations")
+                        if os.path.exists(trajectory_vis_dir):
+                            try:
+                                # Log trajectory visualizations (full trajectory and split)
+                                traj_images = [img for img in os.listdir(trajectory_vis_dir) 
+                                             if img.endswith('.png')]
+                                
+                                if traj_images:
+                                    wandb.log({"trajectory_visualizations": [wandb.Image(os.path.join(trajectory_vis_dir, img)) 
+                                                                           for img in sorted(traj_images)]}, step=epoch)
+                            except Exception as e:
+                                logger(f"Warning: Failed to log trajectory visualizations to WandB: {e}")
+                    
+                    # Always log prediction vs ground truth visualizations
                     vis_output_dir = os.path.join(config.save_path, "overfitting_val_visualizations", f"epoch_{epoch}")
                     if os.path.exists(vis_output_dir):
-                         try:
-                             all_images = [img for img in os.listdir(vis_output_dir) 
-                                          if img.endswith('.png') and 'epoch' in img]
-                             # Since it's only one object, log all its images
-                             if all_images:
-                                 wandb.log({"val_visualizations": [wandb.Image(os.path.join(vis_output_dir, img)) 
-                                                                  for img in sorted(all_images)]}, step=epoch)
-                         except Exception as e:
-                              logger(f"Warning: Failed to log validation images to WandB: {e}")
+                        try:
+                            # Only log prediction vs GT visualizations 
+                            pred_images = [img for img in os.listdir(vis_output_dir) 
+                                          if img.endswith('.png') and 'prediction_vs_gt' in img]
+                            
+                            if pred_images:
+                                wandb.log({"prediction_visualizations": [wandb.Image(os.path.join(vis_output_dir, img)) 
+                                                                       for img in sorted(pred_images)]}, step=epoch)
+                        except Exception as e:
+                            logger(f"Warning: Failed to log prediction visualizations to WandB: {e}")
 
             current_val_loss = val_metrics['total_loss']
             if current_val_loss < best_val_loss:
