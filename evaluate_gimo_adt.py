@@ -77,8 +77,13 @@ def parse_args():
     parser.add_argument(
         "--num_vis_samples",
         type=int,
-        default=10, # Number of trajectory samples to visualize
+        default=50, # Number of trajectory samples to visualize
         help="Number of trajectory samples to visualize"
+    )
+    parser.add_argument(
+        "--visualize_bbox",
+        action="store_true",
+        help="Enable visualization of bounding boxes"
     )
     
     # --- Other Options ---
@@ -95,10 +100,22 @@ def parse_args():
         help="Number of workers for data loading"
     )
     parser.add_argument(
-        "--comment",
+        "--global_cache_dir",
         type=str,
-        default="",
-        help="Optional comment for the evaluation run"
+        default=None,
+        help="Path to a shared global directory for trajectory cache (overrides cache within output_dir)"
+    )
+    
+    # --- Model Configuration Overrides ---
+    parser.add_argument(
+        "--use_first_frame_only",
+        action="store_true",
+        help="Override config: Use only the first frame as input to predict the future"
+    )
+    parser.add_argument(
+        "--show_ori_arrows",
+        action="store_true",
+        help="Show orientation arrows in visualizations"
     )
 
     return parser.parse_args()
@@ -114,6 +131,7 @@ def load_model_and_config(checkpoint_path, device):
     Returns:
         model: Loaded GIMO_ADT_Model
         config: Configuration object from the checkpoint
+        best_epoch (int): The epoch number at which this checkpoint was saved (usually the best validation epoch). Returns 0 if not found.
     """
     print(f"Loading checkpoint from {checkpoint_path}")
     if not os.path.exists(checkpoint_path):
@@ -144,7 +162,14 @@ def load_model_and_config(checkpoint_path, device):
     param_count_millions = param_count / 1_000_000
     print(f"Loaded GIMO_ADT_Model with {param_count_millions:.2f}M parameters.")
     
-    return model, config
+    # Get the epoch number
+    best_epoch = checkpoint.get('epoch', 0) # Default to 0 if epoch key doesn't exist
+    if best_epoch > 0:
+        print(f"Checkpoint was saved at epoch: {best_epoch}")
+    else:
+        print("Warning: Epoch number not found in checkpoint.")
+        
+    return model, config, best_epoch
 
 def denormalize_trajectory(normalized_trajectory, normalization_params):
     """Denormalize a trajectory using provided parameters."""
@@ -235,9 +260,15 @@ def compute_metrics_for_sample(pred_future, gt_future, future_mask):
 
     return l1_mean, rmse_ade, fde
 
-def evaluate(model, config, args):
+def evaluate(model, config, args, best_epoch):
     """
     Run the evaluation loop.
+    
+    Args:
+        model: The loaded GIMO_ADT_Model.
+        config: The configuration object (usually loaded from checkpoint).
+        args: Command line arguments for evaluation.
+        best_epoch (int): The epoch number the model checkpoint was saved at.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -312,9 +343,15 @@ def evaluate(model, config, args):
              return None
 
     # Use cache dir based on output dir to avoid conflicts with training cache
-    eval_cache_dir = os.path.join(args.output_dir, 'trajectory_cache_eval')
-    os.makedirs(eval_cache_dir, exist_ok=True)
-    print(f"Using evaluation cache directory: {eval_cache_dir}")
+    # Prioritize global_cache_dir if provided
+    if args.global_cache_dir:
+        eval_cache_dir = args.global_cache_dir
+        os.makedirs(eval_cache_dir, exist_ok=True)
+        print(f"Using global cache directory for evaluation: {eval_cache_dir}")
+    else:
+        eval_cache_dir = os.path.join(args.output_dir, 'trajectory_cache_eval')
+        os.makedirs(eval_cache_dir, exist_ok=True)
+        print(f"Using evaluation-specific cache directory: {eval_cache_dir}")
 
     test_dataset = GIMOMultiSequenceDataset(
         sequence_paths=test_sequences,
@@ -356,8 +393,9 @@ def evaluate(model, config, args):
         for batch_idx, batch in enumerate(progress_bar):
             try:
                 # --- Prepare Batch Data ---
-                full_trajectory_batch = batch['full_positions'].float().to(device)
+                full_trajectory_batch = batch['full_poses'].float().to(device)  # Use full_poses (position + orientation)
                 point_cloud_batch = batch['point_cloud'].float().to(device)
+                bbox_corners_batch = batch['bbox_corners'].float().to(device) # Get bbox corners
                 full_attention_mask = batch['full_attention_mask'].to(device)
                 # Get normalization params (assuming they are added to the batch by dataset/collate)
                 # Need to handle potential variations in how normalization info is stored/batched
@@ -378,9 +416,38 @@ def evaluate(model, config, args):
                 # Get object names/IDs if needed for saving visualizations
                 object_names = batch.get('object_name', [])
                 segment_indices = batch.get('segment_idx', [])
+                
+                # Get object categories for the model
+                # Get object category IDs (using mapped dense IDs, not strings)
+                object_category_ids = batch.get('object_category_id', None)
+                if object_category_ids is not None:
+                    object_category_ids = object_category_ids.to(device)
+                
+                # For backward compatibility and visualization purposes, also get category strings
+                object_categories = batch.get('object_category', [f"unknown" for i in range(full_trajectory_batch.shape[0])])
+                # Convert categories to list of strings if they're tensors
+                if isinstance(object_categories, torch.Tensor):
+                    object_categories = [cat.item() if isinstance(cat.item(), str) else str(cat.item()) for cat in object_categories]
+
+                # Prepare input trajectory for the model based on config
+                if config.use_first_frame_only:
+                    # Use only the first frame as input
+                    input_trajectory_batch = full_trajectory_batch[:, 0:1, :]
+                    bbox_corners_input_batch = bbox_corners_batch[:, 0:1, :, :]  # Also slice bbox corners
+                else:
+                    # Use a fixed portion of the history as input
+                    fixed_history_length = int(np.floor(full_trajectory_batch.shape[1] * config.history_fraction))
+                    input_trajectory_batch = full_trajectory_batch[:, :fixed_history_length, :]
+                    bbox_corners_input_batch = bbox_corners_batch[:, :fixed_history_length, :, :]  # Also slice bbox corners
 
                 # --- Model Inference ---
-                predicted_full_trajectory = model(full_trajectory_batch, point_cloud_batch)
+                predicted_full_trajectory = model(
+                    input_trajectory=input_trajectory_batch,
+                    point_cloud=point_cloud_batch,
+                    bounding_box_corners=bbox_corners_input_batch,
+                    object_category_ids=object_category_ids
+                )
+                total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
 
                 # --- Process Each Sample in Batch ---
                 batch_l1 = 0.0
@@ -389,9 +456,15 @@ def evaluate(model, config, args):
                 valid_samples_in_batch = 0
 
                 for i in range(full_trajectory_batch.shape[0]):
-                    gt_full = full_trajectory_batch[i]
-                    pred_full = predicted_full_trajectory[i]
+                    # Extract full poses (positions + orientations)
+                    gt_full_poses = full_trajectory_batch[i]
+                    pred_full_poses = predicted_full_trajectory[i]
                     mask_full = full_attention_mask[i]
+                    
+                    # Extract position component (first 3 dimensions) for metrics
+                    position_dim = 3  # First 3 dimensions are positions
+                    gt_full = gt_full_poses[:, :position_dim]
+                    pred_full = pred_full_poses[:, :position_dim]
 
                     # Extract normalization params for this specific sample
                     sample_norm_params = {}
@@ -432,6 +505,12 @@ def evaluate(model, config, args):
                     pred_hist = pred_full[:dynamic_history_length]
                     pred_future = pred_full[dynamic_history_length:actual_length] # Slice prediction same as GT
                     
+                    # Also extract orientation data for visualization
+                    gt_hist_ori = gt_full_poses[:dynamic_history_length, position_dim:]
+                    gt_future_ori = gt_full_poses[dynamic_history_length:actual_length, position_dim:]
+                    pred_hist_ori = pred_full_poses[:dynamic_history_length, position_dim:]
+                    pred_future_ori = pred_full_poses[dynamic_history_length:actual_length, position_dim:]
+                    
                     # Get Masks
                     hist_mask = mask_full[:dynamic_history_length]
                     future_mask = mask_full[dynamic_history_length:actual_length]
@@ -447,12 +526,43 @@ def evaluate(model, config, args):
 
                         gt_future_denorm = denormalize_trajectory(gt_future, sample_norm_params)
                         pred_future_denorm = denormalize_trajectory(pred_future, sample_norm_params)
+                        
+                        # Also denormalize history for visualization and potential first-frame metrics
+                        gt_hist_denorm = denormalize_trajectory(gt_hist, sample_norm_params)
+                        pred_hist_denorm = denormalize_trajectory(pred_hist, sample_norm_params)
+                        
+                        # For orientations, no normalization was applied, just copy the values
+                        gt_hist_ori_denorm = gt_hist_ori
+                        gt_future_ori_denorm = gt_future_ori
+                        pred_hist_ori_denorm = pred_hist_ori
+                        pred_future_ori_denorm = pred_future_ori
                     else:
                         gt_future_denorm = gt_future
                         pred_future_denorm = pred_future
+                        gt_hist_denorm = gt_hist
+                        pred_hist_denorm = pred_hist
+                        
+                        # For orientations, just copy the values
+                        gt_hist_ori_denorm = gt_hist_ori
+                        gt_future_ori_denorm = gt_future_ori
+                        pred_hist_ori_denorm = pred_hist_ori
+                        pred_future_ori_denorm = pred_future_ori
 
                     # Compute Metrics for this sample
                     l1_mean, rmse_ade, fde = compute_metrics_for_sample(pred_future_denorm, gt_future_denorm, future_mask)
+                    
+                    # For first_frame_only mode, also check reconstruction of the first frame
+                    first_frame_rec_error = 0.0
+                    if config.use_first_frame_only and gt_hist.shape[0] > 0 and hist_mask.sum() > 0:
+                        # Calculate first frame reconstruction error
+                        # This aligns with our model update for reconstruction loss in first_frame_only mode
+                        first_frame_gt = gt_hist_denorm[0]
+                        first_frame_pred = pred_hist_denorm[0]
+                        first_frame_diff = torch.abs(first_frame_gt - first_frame_pred).mean().item()
+                        first_frame_rec_error = first_frame_diff
+                        # Optionally log first frame error
+                        if batch_idx == 0 and i == 0:  # Just log for the first sample
+                            print(f"First frame reconstruction error: {first_frame_rec_error:.4f}")
 
                     batch_l1 += l1_mean.item()
                     batch_rmse_ade += rmse_ade.item()
@@ -462,14 +572,6 @@ def evaluate(model, config, args):
                     # --- Visualization ---
                     if args.visualize:
                          try:
-                             # Denormalize history as well for visualization
-                             if is_normalized:
-                                 gt_hist_denorm = denormalize_trajectory(gt_hist, sample_norm_params)
-                                 # pred_hist_denorm = denormalize_trajectory(pred_hist, sample_norm_params) # Not needed for pred viz usually
-                             else:
-                                 gt_hist_denorm = gt_hist
-                                 # pred_hist_denorm = pred_hist
-
                              obj_name = object_names[i] if i < len(object_names) else f"obj_{batch_idx}_{i}"
                              seg_idx = segment_indices[i].item() if i < len(segment_indices) and segment_indices[i].item() != -1 else None
 
@@ -479,9 +581,10 @@ def evaluate(model, config, args):
                              else:
                                  filename_base = f"{obj_name}"
                                  vis_title_base = f"{obj_name}"
-                                 
+                             
+                             # Standard prediction vs ground truth visualization
                              pred_vs_gt_path = os.path.join(vis_output_dir, f"{filename_base}_prediction_vs_gt.png")
-
+                              
                              visualize_prediction(
                                  past_positions=gt_hist_denorm.cpu(),
                                  future_positions_gt=gt_future_denorm.cpu(),
@@ -490,8 +593,51 @@ def evaluate(model, config, args):
                                  future_mask_gt=future_mask.cpu(), # Use the future mask
                                  title=f"Pred vs GT - {vis_title_base} (Eval)",
                                  save_path=pred_vs_gt_path,
-                                 segment_idx=seg_idx
+                                 segment_idx=seg_idx,
+                                 show_orientation=args.show_ori_arrows,
+                                 past_orientations=gt_hist_ori_denorm.cpu(),
+                                 future_orientations_gt=gt_future_ori_denorm.cpu(),
+                                 future_orientations_pred=pred_future_ori_denorm.cpu()
                              )
+                             
+                             # Add full trajectory visualization with bounding boxes if requested
+                             if args.visualize_bbox:
+                                 # Extract full GT positions and mask for visualization
+                                 gt_full_denorm = torch.cat([gt_hist_denorm, gt_future_denorm], dim=0)[:actual_length]
+                                 full_mask = torch.cat([hist_mask, future_mask], dim=0)[:actual_length]
+                                 
+                                 # Create path for full trajectory visualization
+                                 full_traj_path = os.path.join(vis_output_dir, f"{filename_base}_full_trajectory_with_bbox.png")
+                                 
+                                 # Get the sample's bounding box corners
+                                 sample_bbox_corners = bbox_corners_batch[i, :actual_length].cpu()
+                                 
+                                 # Denormalize bounding box corners if the data is normalized
+                                 if sample_norm_params.get('is_normalized', False):
+                                     # Reshape bbox corners for denormalization [T, 8, 3] -> [T*8, 3]
+                                     bbox_shape = sample_bbox_corners.shape
+                                     sample_bbox_corners_flat = sample_bbox_corners.reshape(-1, 3)
+                                     
+                                     # Denormalize
+                                     sample_bbox_corners_flat_denorm = denormalize_trajectory(
+                                         sample_bbox_corners_flat, 
+                                         sample_norm_params
+                                     )
+                                     
+                                     # Reshape back to original shape
+                                     sample_bbox_corners = sample_bbox_corners_flat_denorm.reshape(bbox_shape)
+                                 
+                                 # Visualize the full trajectory with bbox
+                                 visualize_full_trajectory(
+                                     positions=gt_full_denorm,
+                                     attention_mask=full_mask,
+                                     point_cloud=point_cloud_batch[i].cpu(),  # Use point cloud for this sample
+                                     bbox_corners_sequence=sample_bbox_corners,  # Add bounding box corners
+                                     title=f"Full Trajectory - {vis_title_base} (Eval)",
+                                     save_path=full_traj_path,
+                                     segment_idx=seg_idx
+                                 )
+                             
                          except Exception as vis_e:
                               print(f"Warning: Error during visualization for sample {i} in batch {batch_idx}: {vis_e}")
 
@@ -522,9 +668,15 @@ def evaluate(model, config, args):
         mean_rmse = total_rmse_ade / total_valid_samples # This is the overall mean RMSE
         mean_fde = total_fde / total_valid_samples
         print(f"--- Evaluation Complete ---")
+        print(f" Model from Epoch: {best_epoch}") # Print the epoch
         print(f" Mean L1 (MAE): {mean_l1:.4f}")
         print(f" Mean RMSE: {mean_rmse:.4f}")
         print(f" Mean FDE: {mean_fde:.4f}")
+        
+        # Also log special metrics for first_frame_only mode
+        if config.use_first_frame_only:
+            print(f" Note: Model is in first_frame_only mode - metrics reflect future prediction only")
+            print(f" First frame is being used for context with separate reconstruction loss")
     else:
         print("Error: No batches were successfully processed.")
         mean_l1 = float('inf')
@@ -534,14 +686,16 @@ def evaluate(model, config, args):
     # --- Save Results ---
     results = {
         'model_path': args.model_path,
+        'best_model_epoch': best_epoch, # Add the epoch number here
         'config': vars(config), # Save config used
         'eval_args': vars(args), # Save evaluation args
         'mean_l1': mean_l1,
         'mean_rmse': mean_rmse,
         'mean_fde': mean_fde,
+        'first_frame_only_mode': config.use_first_frame_only, # Flag indicating special mode
         'num_test_samples_processed': total_valid_samples, # Report processed samples
         'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
-        'comment': args.comment
+        'comment': os.path.basename(os.path.normpath(args.model_path)) # Extract comment from model_path
     }
 
     results_path = os.path.join(args.output_dir, "evaluation_results.json")
@@ -553,15 +707,27 @@ def evaluate(model, config, args):
 
 
 def main():
+    """Main evaluation function."""
     args = parse_args()
+    print(f"Evaluating GIMO ADT model: {args.model_path}")
+    
+    # Set output directory with timestamp and comment if provided
+    output_dir = args.output_dir
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    # Extract comment from model path's parent directory
+    model_dir = os.path.dirname(os.path.normpath(args.model_path))
+    comment = os.path.basename(model_dir)
+    # Create timestamped output dir
+    output_dir = f"{output_dir}/{timestamp}_{comment}"
+    args.output_dir = output_dir
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Results will be saved to: {output_dir}")
     
     # Set random seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-    print(f"Evaluation results will be saved to: {args.output_dir}")
     
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -569,13 +735,84 @@ def main():
     
     # Load model and config
     try:
-        model, config = load_model_and_config(args.model_path, device)
+        model, config, best_epoch = load_model_and_config(args.model_path, device)
+        
+        # Override config with command line arguments if specified
+        if args.use_first_frame_only:
+            print(f"Overriding config: use_first_frame_only set to True (from command line)")
+            config.use_first_frame_only = True
+            
+        # Note: show_ori_arrows will be used directly from args in the evaluate function
+            
+        # --- Print Model Architecture Details ---
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        
+        print("\n=== MODEL ARCHITECTURE ===")
+        print(f"Total Parameters: {total_params:,}")
+        print(f"Trainable Parameters: {trainable_params:,}")
+        print(f"Text Embedding Enabled: {not getattr(config, 'no_text_embedding', False)}")
+        print(f"Use First Frame Only: {config.use_first_frame_only}")
+        
+        # Log model components
+        components = {
+            'Motion Linear': (model.motion_linear, []), 
+            'Scene Encoder': (model.scene_encoder, ['hparams']), 
+            'FP Layer': (model.fp_layer, []),
+            'BBox PointNet': (model.bbox_pointnet, ['conv1']), 
+            'Motion BBox Encoder': (model.motion_bbox_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
+            'Embedding Layer (Fusion 2)': (model.embedding_layer, ['in_features', 'out_features']),
+            'Output Encoder': (model.output_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
+            'Output Layer': (model.outputlayer, ['in_features', 'out_features'])
+        }
+        
+        # Add text embedding components if enabled
+        if not getattr(config, 'no_text_embedding', False): # Check if text embedding is enabled
+            if hasattr(model, 'category_embedding'): # Ensure the attribute exists
+                components.update({
+                    'Category Embedding': (model.category_embedding, ['num_embeddings', 'embedding_dim'])
+                })
+        
+        # Log each component's structure and parameters
+        for name, (component, attrs) in components.items():
+            params = sum(p.numel() for p in component.parameters())
+            print(f"\n{name}:")
+            print(f"  Parameters: {params:,}")
+            try:
+                # Try to log attributes if available
+                for attr in attrs:
+                    if hasattr(component, attr):
+                        print(f"  {attr}: {getattr(component, attr)}")
+            except:
+                pass
+        
+        print("=== END MODEL ARCHITECTURE ===\n")
+            
     except Exception as e:
         print(f"Error loading model: {e}")
         return
 
     # Run evaluation
-    evaluate(model, config, args)
+    evaluate(model, config, args, best_epoch)
 
 if __name__ == "__main__":
-    main() 
+    main()
+
+# Example usage:
+# 1. Basic evaluation with visualization
+# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --visualize --num_vis_samples 5
+#
+# 2. Evaluating a model trained with use_first_frame_only enabled
+# python evaluate_gimo_adt.py --model_path ./checkpoints/first_frame_only_model.pth --visualize --num_vis_samples 10 --output_dir eval_first_frame_only
+#
+# 3. Evaluating on a specific test set (overriding the one in the checkpoint's config)
+# python evaluate_gimo_adt.py --model_path ./checkpoints/gimo_model.pth --adt_dataroot /path/to/test_data --batch_size 8 
+#
+# 4. Example for latest GIMO model with text categories
+# python evaluate_gimo_adt.py --model_path ./checkpoints/gimo_adt_with_categories.pth --visualize --num_vis_samples 20 --output_dir eval_with_categories
+#
+# 5. Evaluating 6D pose model with orientation visualization enabled
+# python evaluate_gimo_adt.py --model_path ./checkpoints/full_6d_model.pth --visualize --num_vis_samples 30 --output_dir eval_with_orientation 
+#
+# 6. Using the new command line arguments to override config
+# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --visualize --show_ori_arrows --use_first_frame_only 

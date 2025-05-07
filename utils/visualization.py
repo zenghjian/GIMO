@@ -75,17 +75,23 @@ def visualize_trajectory(past_positions, future_positions, past_mask=None, futur
     all_valid_positions = np.vstack(all_valid_positions)
 
     # --- Calculate Dynamic Arrow Scale ---
-    dynamic_arrow_scale = 0.1 # Default value if no points or range is zero
+    # Define min/max absolute scales and percentage
+    min_abs_scale = 0.05  # Minimum arrow length in meters
+    max_abs_scale = 0.5   # Maximum arrow length in meters
+    percentage = 0.05     # Percentage of max range
+
+    dynamic_arrow_scale = min_abs_scale # Default to min scale
+
     if all_valid_positions.shape[0] > 1:
         min_coords = np.min(all_valid_positions, axis=0)
         max_coords = np.max(all_valid_positions, axis=0)
         ranges = max_coords - min_coords
-        max_range = np.max(ranges)
+        max_range = np.max(ranges) if ranges.size > 0 else 0 # Handle empty ranges
+
         if max_range > 1e-6: # Avoid division by zero or tiny scales
-            dynamic_arrow_scale = max_range * 0.05 # 5% of the max range
-        else:
-            # Handle case where all points are very close or identical
-            dynamic_arrow_scale = 0.05 # Small default absolute scale
+            calculated_scale = max_range * percentage
+            dynamic_arrow_scale = np.clip(calculated_scale, min_abs_scale, max_abs_scale)
+        # else: dynamic_arrow_scale remains min_abs_scale (already set)
     # -----------------------------------
 
     # Plot Past Trajectory (History)
@@ -235,7 +241,13 @@ def visualize_prediction(past_positions, future_positions_gt, future_positions_p
     # -----------------------------------------------------
 
     # --- Calculate Dynamic Arrow Scale ---
-    dynamic_arrow_scale = 0.1 # Default value if no points or range is zero
+    # Define min/max absolute scales and percentage
+    min_abs_scale = 0.05  # Minimum arrow length in meters
+    max_abs_scale = 0.5   # Maximum arrow length in meters
+    percentage = 0.05     # Percentage of max range
+
+    dynamic_arrow_scale = min_abs_scale # Default to min scale
+
     all_plot_points = []
     if num_valid_past > 0:
         all_plot_points.append(past_positions_valid)
@@ -247,17 +259,17 @@ def visualize_prediction(past_positions, future_positions_gt, future_positions_p
     #     all_plot_points.append(future_positions_pred_valid)
 
     if all_plot_points:
-        all_plot_points = np.vstack(all_plot_points)
-        if all_plot_points.shape[0] > 1:
-            min_coords = np.min(all_plot_points, axis=0)
-            max_coords = np.max(all_plot_points, axis=0)
+        all_plot_points_np = np.vstack(all_plot_points)
+        if all_plot_points_np.shape[0] > 1:
+            min_coords = np.min(all_plot_points_np, axis=0)
+            max_coords = np.max(all_plot_points_np, axis=0)
             ranges = max_coords - min_coords
-            max_range = np.max(ranges)
+            max_range = np.max(ranges) if ranges.size > 0 else 0 # Handle empty ranges
+
             if max_range > 1e-6: # Avoid division by zero or tiny scales
-                dynamic_arrow_scale = max_range * 0.05 # 5% of the max range
-            else:
-                # Handle case where all points are very close or identical
-                dynamic_arrow_scale = 0.05 # Small default absolute scale
+                calculated_scale = max_range * percentage
+                dynamic_arrow_scale = np.clip(calculated_scale, min_abs_scale, max_abs_scale)
+            # else: dynamic_arrow_scale remains min_abs_scale (already set)
     # -----------------------------------
 
     # Plot Past Trajectory (History) - Blue (using valid points)
@@ -358,14 +370,16 @@ def visualize_prediction(past_positions, future_positions_gt, future_positions_p
 
     plt.close(fig)
 
-def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, title="Full Trajectory", save_path=None, segment_idx=None):
+def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, bbox_corners_sequence=None, title="Full Trajectory", save_path=None, segment_idx=None):
     """
-    Visualize a complete trajectory without past/future split, optionally with surrounding point cloud.
+    Visualize a complete trajectory without past/future split, optionally with surrounding point cloud and bounding boxes.
     
     Args:
         positions: Tensor or ndarray of positions [trajectory_length, 3]
         attention_mask: Optional mask [trajectory_length]
         point_cloud: Optional tensor or ndarray of point cloud points [N, 3]
+        bbox_corners_sequence: Optional tensor or ndarray of shape [trajectory_length, 8, 3] 
+                                 representing the 8 corners of OBBs for each timestep.
         title: Plot title
         save_path: Path to save the figure
         segment_idx: Optional segment index for multi-segment objects
@@ -399,6 +413,23 @@ def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, 
         plt.close(fig)
         return
         
+    # Process and filter bbox_corners_sequence if provided and attention_mask exists
+    valid_bbox_corners = None
+    if bbox_corners_sequence is not None:
+        if isinstance(bbox_corners_sequence, torch.Tensor):
+            bbox_corners_sequence = bbox_corners_sequence.detach().cpu().numpy()
+        
+        if attention_mask is not None: # Filter bboxes based on the same mask as positions
+            if len(valid_indices) > 0 and bbox_corners_sequence.shape[0] == positions.shape[0]: # Ensure consistent length
+                valid_bbox_corners = bbox_corners_sequence[valid_indices]
+            else:
+                valid_bbox_corners = np.empty((0, 8, 3))
+        else:
+            valid_bbox_corners = bbox_corners_sequence
+
+        if valid_bbox_corners.shape[0] == 0:
+            valid_bbox_corners = None # Set to None if no valid bboxes after filtering
+            
     # Render point cloud if provided
     if point_cloud is not None:
         # Convert point cloud to numpy
@@ -432,6 +463,33 @@ def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, 
     ax.scatter(positions_valid[-1, 0], positions_valid[-1, 1], positions_valid[-1, 2],
               c='magenta', marker='o', s=100, label='End', edgecolors='black')
     
+    # Plot Bounding Boxes if provided
+    if valid_bbox_corners is not None and valid_bbox_corners.shape[0] > 0:
+        # Define the 12 edges of a bounding box based on corner indices
+        # Corners are typically ordered: 0-3 bottom face, 4-7 top face
+        # (e.g., 0:---, 1:+--, 2:++-, 3:-+-, 4:--+, 5:+-+, 6:+++, 7:-++) sx,sy,sz
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),  # Bottom face
+            (4, 5), (5, 6), (6, 7), (7, 4),  # Top face
+            (0, 4), (1, 5), (2, 6), (3, 7)   # Vertical edges
+        ]
+        bbox_color = 'cyan' # Color for bounding boxes
+        bbox_alpha = 0.3
+        bbox_linewidth = 0.8
+
+        # To avoid clutter, plot bbox for a subset of points (e.g., every Nth, or first/last)
+        # For now, plotting for all valid_bbox_corners that align with valid_positions
+        num_bboxes_to_plot = valid_bbox_corners.shape[0]
+        
+        for i in range(num_bboxes_to_plot):
+            corners = valid_bbox_corners[i] # Shape [8, 3]
+            for edge in edges:
+                ax.plot(corners[edge, 0], corners[edge, 1], corners[edge, 2], 
+                        color=bbox_color, alpha=bbox_alpha, linewidth=bbox_linewidth, label='_nolegend_')
+        # Add a legend entry for bboxes if any were plotted
+        if num_bboxes_to_plot > 0:
+            ax.plot([], [], [], color=bbox_color, linewidth=bbox_linewidth, label=f'Bounding Boxes ({num_bboxes_to_plot})')
+
     # Add labels and title
     ax.set_xlabel('X')
     ax.set_ylabel('Y')

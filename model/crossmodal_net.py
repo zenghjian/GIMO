@@ -27,12 +27,12 @@ class crossmodal_net(nn.Module):
         input_len = config.input_seq_len
         output_len = config.output_seq_len + config.input_seq_len + 1 # rec + path predict + destination
         if self.use_crossmodal:
-            self.motion_scene_encoder = PerceiveEncoder(n_input_channels=config.scene_feats_dim,
-                                                        n_latent=output_len,
-                                                        n_latent_channels=config.motion_latent_dim,
-                                                        n_self_att_heads=config.motion_n_heads,
-                                                        n_self_att_layers=config.motion_n_layers,
-                                                        dropout=config.dropout)
+            # self.motion_scene_encoder = PerceiveEncoder(n_input_channels=config.scene_feats_dim,
+            #                                             n_latent=output_len,
+            #                                             n_latent_channels=config.motion_latent_dim,
+            #                                             n_self_att_heads=config.motion_n_heads,
+            #                                             n_self_att_layers=config.motion_n_layers,
+            #                                             dropout=config.dropout)
             # encode scene feats
             self.motion_encoder = PerceiveEncoder(n_input_channels=config.motion_hidden_dim + config.scene_feats_dim,
                                                   n_latent=output_len,

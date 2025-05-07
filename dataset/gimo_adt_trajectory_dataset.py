@@ -39,6 +39,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         max_stationary_frames: int = 3,   # Maximum consecutive stationary frames allowed in a motion segment
         normalize_data: bool = True,      # Whether to normalize data using scene bounds
         trajectory_pointcloud_radius: float = 0.5,  # Radius around trajectory to collect points (meters)
+        force_use_cache: bool = False,    # Force use any compatible cache file, ignoring parameter mismatches
     ):
         """
         Initialize the ADT trajectory dataset.
@@ -64,6 +65,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             max_stationary_frames: Maximum consecutive stationary frames allowed in a motion segment (if config not provided)
             normalize_data: Whether to normalize data using scene bounds (if config not provided)
             trajectory_pointcloud_radius: Radius around trajectory to collect points (meters)
+            force_use_cache: Force use any compatible cache file, ignoring parameter mismatches
         """
         from projectaria_tools.projects.adt import (
             AriaDigitalTwinDataProvider,
@@ -89,6 +91,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             self.max_stationary_frames = getattr(config, 'max_stationary_frames', max_stationary_frames)
             self.normalize_data = getattr(config, 'normalize_data', normalize_data) # Get normalize_data from config
             self.trajectory_pointcloud_radius = getattr(config, 'trajectory_pointcloud_radius', trajectory_pointcloud_radius)
+            self.force_use_cache = getattr(config, 'force_use_cache', force_use_cache) # Get force_use_cache from config
             # For cache_dir, don't use config directly - it might be set based on save_path
         else:
             self.trajectory_length = trajectory_length
@@ -105,6 +108,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             self.max_stationary_frames = max_stationary_frames
             self.normalize_data = normalize_data # Use passed parameter if no config
             self.trajectory_pointcloud_radius = trajectory_pointcloud_radius
+            self.force_use_cache = force_use_cache # Use passed parameter if no config
         
         # Force load_pointcloud to True when normalize_data is True for maximum precision
         self.load_pointcloud = self.load_pointcloud or self.normalize_data
@@ -115,15 +119,10 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         self.pointcloud = None
         self.trajectories = []
         
-        # Use provided cache_dir if not None, otherwise use config.save_path if available
-        if cache_dir is not None:
-            self.cache_dir = cache_dir
-        elif config is not None and hasattr(config, 'save_path'):
-            self.cache_dir = os.path.join(config.save_path, 'trajectory_cache')
-        else:
-            self.cache_dir = './trajectory_cache'  # Default fallback
-        
-        # Create cache directory if it doesn't exist
+        # Cache directory is now determined by the caller (GIMOMultiSequenceDataset) or defaults
+        self.cache_dir = cache_dir if cache_dir is not None else './trajectory_cache'
+
+        # Create cache directory if it doesn't exist and caching is enabled
         if self.use_cache and not os.path.exists(self.cache_dir):
             try:
                 os.makedirs(self.cache_dir)
@@ -131,7 +130,11 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             except Exception as e:
                 print(f"Warning: Could not create cache directory: {e}")
                 self.use_cache = False
-        
+
+        # --- Log cache directory being used by this specific dataset instance ---
+        print(f"GimoAriaDigitalTwinTrajectoryDataset using cache directory: {self.cache_dir}")
+        # -----------------------------------------------------------------------
+
         print(f"Loading ADT sequence from: {sequence_path}")
         print(f"Data Normalization: {'Enabled' if self.normalize_data else 'Disabled'}")
         
@@ -309,9 +312,18 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
     
     def _get_cache_filename(self):
         """Generate a unique filename for the cache based on the dataset parameters."""
-        # Create a unique identifier based on relevant parameters
+        # Get sequence name instead of full path for more portable caches
+        sequence_name = os.path.basename(self.sequence_path)
+        
+        # When force_use_cache is enabled, don't include parameters in the hash
+        # This will create a simpler filename that can be matched across different parameter configurations
+        if self.force_use_cache:
+            # Just use sequence name with a simple file extension
+            return os.path.join(self.cache_dir, f"{sequence_name}_cache.pkl")
+        
+        # Create a unique identifier based on relevant parameters, excluding the full path
         params = {
-            'sequence_path': self.sequence_path,
+            'sequence_name': sequence_name,  # Use sequence name, not full path
             'trajectory_length': self.trajectory_length,
             'skip_frames': self.skip_frames,
             'max_objects': self.max_objects,
@@ -324,7 +336,8 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             'min_motion_percentile': self.min_motion_percentile,
             'pointcloud_subsample': self.pointcloud_subsample,
             'normalize_data': self.normalize_data, # Add normalize_data to cache key
-            'trajectory_pointcloud_radius': self.trajectory_pointcloud_radius # Add new parameter to cache key
+            'trajectory_pointcloud_radius': self.trajectory_pointcloud_radius, # Add new parameter to cache key
+            'include_bbox_corners': True # New parameter for bbox corners
         }
         
         # Generate hash from parameters
@@ -332,10 +345,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         hash_obj = hashlib.md5(params_str.encode())
         hash_str = hash_obj.hexdigest()
         
-        # Extract sequence name from the path for more readable filenames
-        sequence_name = os.path.basename(self.sequence_path)
-        
-        # Create filename
+        # Create filename using sequence name and hash
         return os.path.join(self.cache_dir, f"{sequence_name}_{hash_str}.pkl")
     
     def _save_to_cache(self):
@@ -346,6 +356,9 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         cache_file = self._get_cache_filename()
         
         try:
+            # Get sequence name for consistency
+            sequence_name = os.path.basename(self.sequence_path)
+            
             # Prepare data to save
             cache_data = {
                 'trajectories': self.trajectories,
@@ -355,7 +368,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                 'scene_max': self.scene_max,
                 'scene_scale': self.scene_scale,
                 'params': {
-                    'sequence_path': self.sequence_path,
+                    'sequence_name': sequence_name,  # Store sequence name, not full path
                     'trajectory_length': self.trajectory_length,
                     'skip_frames': self.skip_frames,
                     'max_objects': self.max_objects,
@@ -368,7 +381,8 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                     'min_motion_percentile': self.min_motion_percentile,
                     'pointcloud_subsample': self.pointcloud_subsample,
                     'normalize_data': self.normalize_data, # Save normalize_data state
-                    'trajectory_pointcloud_radius': self.trajectory_pointcloud_radius # Save new parameter
+                    'trajectory_pointcloud_radius': self.trajectory_pointcloud_radius, # Save new parameter
+                    'include_bbox_corners': True # Save new parameter state
                 }
             }
             
@@ -387,36 +401,81 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         if not self.use_cache:
             return False
             
+        # Get current cache file path with hash
         cache_file = self._get_cache_filename()
         
+        # Get sequence name for potential fallback search
+        sequence_name = os.path.basename(self.sequence_path)
+        
+        # Try loading the exact cache file first
         if not os.path.exists(cache_file):
             print(f"No cache file found at {cache_file}")
-            return False
+            
+            # Fallback: try to find any cache file for this sequence
+            potential_files = []
+            if os.path.exists(self.cache_dir):
+                for filename in os.listdir(self.cache_dir):
+                    if filename.startswith(f"{sequence_name}_") and filename.endswith(".pkl"):
+                        potential_files.append(os.path.join(self.cache_dir, filename))
+            
+            if potential_files:
+                # Sort by modification time (newest first)
+                potential_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+                cache_file = potential_files[0]
+                print(f"Found potential cache file: {cache_file}")
+            else:
+                print(f"No potential cache files found for {sequence_name}")
+                return False
             
         try:
             # Load data from file
             with open(cache_file, 'rb') as f:
                 cache_data = pickle.load(f)
                 
-            # Verify parameters match
-            params = cache_data['params']
-            if (params['sequence_path'] != self.sequence_path or
-                params['trajectory_length'] != self.trajectory_length or
-                params['skip_frames'] != self.skip_frames or
-                params['max_objects'] != self.max_objects or
-                params.get('use_displacements', False) != self.use_displacements or
-                params.get('detect_motion_segments', True) != self.detect_motion_segments or
-                params.get('motion_velocity_threshold', 0.05) != self.motion_velocity_threshold or
-                params.get('min_segment_frames', 5) != self.min_segment_frames or
-                params.get('max_stationary_frames', 3) != self.max_stationary_frames or
-                params.get('min_motion_threshold', 0.0) != self.min_motion_threshold or
-                params.get('min_motion_percentile', 0.0) != self.min_motion_percentile or
-                params.get('pointcloud_subsample', 1) != self.pointcloud_subsample or
-                params.get('normalize_data', True) != self.normalize_data or # Verify normalize_data
-                params.get('trajectory_pointcloud_radius', 0.5) != self.trajectory_pointcloud_radius): # Verify new parameter
-                print("Cache parameters don't match, regenerating trajectories")
+            # Get sequence name for comparison (not full path)
+            sequence_name = os.path.basename(self.sequence_path)
+            
+            # Print the actual parameters for debugging
+            stored_params = cache_data['params']
+            current_params = {
+                'sequence_name': sequence_name,
+                'trajectory_length': self.trajectory_length,
+                'skip_frames': self.skip_frames,
+                'max_objects': self.max_objects,
+                'use_displacements': self.use_displacements,
+                'detect_motion_segments': self.detect_motion_segments,
+                'motion_velocity_threshold': self.motion_velocity_threshold,
+                'min_segment_frames': self.min_segment_frames,
+                'max_stationary_frames': self.max_stationary_frames,
+                'min_motion_threshold': self.min_motion_threshold,
+                'min_motion_percentile': self.min_motion_percentile,
+                'pointcloud_subsample': self.pointcloud_subsample,
+                'normalize_data': self.normalize_data,
+                'trajectory_pointcloud_radius': self.trajectory_pointcloud_radius,
+                'include_bbox_corners': True # Current setting for bbox corners
+            }
+            
+            # Verify parameters match, with extra debug info
+            stored_sequence = stored_params.get('sequence_name', os.path.basename(stored_params.get('sequence_path', '')))
+            if stored_sequence != sequence_name:
+                print(f"Sequence mismatch: {stored_sequence} vs {sequence_name}")
                 return False
                 
+            # Check other critical parameters (skip if force_use_cache is enabled)
+            if not self.force_use_cache:
+                critical_params = ['trajectory_length', 'skip_frames', 'use_displacements', 
+                                'normalize_data', 'motion_velocity_threshold',
+                                'include_bbox_corners'] # Add new param to critical check
+                
+                for param in critical_params:
+                    stored_value = stored_params.get(param, None)
+                    current_value = current_params.get(param, None)
+                    if stored_value != current_value:
+                        print(f"Parameter mismatch: {param} - stored: {stored_value}, current: {current_value}")
+                        return False
+            else:
+                print("Force use cache enabled: Ignoring parameter mismatches")
+            
             # Load data
             self.trajectories = cache_data['trajectories']
             self.pointcloud = cache_data['pointcloud']
@@ -425,9 +484,11 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             self.scene_max = cache_data.get('scene_max', np.ones(3, dtype=np.float32))
             self.scene_scale = cache_data.get('scene_scale', np.ones(3, dtype=np.float32))
             # Ensure normalize_data flag is set correctly based on cache
-            self.normalize_data = params.get('normalize_data', True)
+            self.normalize_data = stored_params.get('normalize_data', True)
+            # Bbox corners are already part of self.trajectories, no separate loading needed here
+            # if they were saved correctly. The check for 'include_bbox_corners' ensures compatibility.
             
-            print(f"Loaded {len(self.trajectories)} trajectories from cache")
+            print(f"Successfully loaded {len(self.trajectories)} trajectories from cache: {cache_file}")
             return True
         except Exception as e:
             print(f"Error loading trajectory cache: {e}")
@@ -760,7 +821,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                 segments = self._track_object_motion(obj_id, timestamps)
                 
                 # Process each segment as a separate trajectory
-                for segment_idx, (poses, tracked_timestamps) in enumerate(segments):
+                for segment_idx, (poses, tracked_timestamps, bbox_corners_sequence) in enumerate(segments):
                     if len(poses) < 2:
                         # Skip segments that are too short
                         continue
@@ -772,7 +833,8 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                         instance_info, 
                         obj_id, 
                         trajectories_with_motion,
-                        segment_idx=segment_idx
+                        segment_idx=segment_idx,
+                        bbox_corners_sequence=bbox_corners_sequence
                     )
                 
             except Exception as e:
@@ -841,7 +903,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         
         print(f"Final dataset contains {len(self.trajectories)} trajectories")
     
-    def _process_trajectory_segment(self, poses, tracked_timestamps, instance_info, obj_id, trajectories_with_motion, segment_idx=None):
+    def _process_trajectory_segment(self, poses, tracked_timestamps, instance_info, obj_id, trajectories_with_motion, segment_idx=None, bbox_corners_sequence=None):
         """
         Process a single trajectory segment and add it to the trajectories list.
         
@@ -852,6 +914,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             obj_id: Object ID
             trajectories_with_motion: List to store processed trajectories
             segment_idx: Optional index of the segment (for multi-segment objects)
+            bbox_corners_sequence: List of 8 corners of the Oriented Bounding Box (OBB) for each timestamp
         """
         # Extract positions (first 3 elements of each pose) for motion metrics
         positions = [pose[:3] for pose in poses]
@@ -914,6 +977,41 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         else:
             poses_tensor = poses_tensor[:self.trajectory_length]
         
+        # Create trajectory data dict
+        trajectory_data = {
+            'poses': poses_tensor,  # Now contains [x, y, z, roll, pitch, yaw]
+            'attention_mask': attention_mask,
+        }
+        
+        # Add bbox_corners_sequence to trajectory_data after processing
+        if bbox_corners_sequence is not None and len(bbox_corners_sequence) > 0:
+            # Convert list of [8,3] arrays to a single numpy array [N, 8, 3]
+            bbox_corners_array = np.array(bbox_corners_sequence, dtype=np.float32)
+            
+            # Normalize bbox corners if normalize_data is True
+            if self.normalize_data:
+                # Reshape for normalization: [N*8, 3]
+                original_shape = bbox_corners_array.shape
+                bbox_corners_flat = bbox_corners_array.reshape(-1, 3)
+                normalized_corners_flat = self.normalize_position(bbox_corners_flat)
+                bbox_corners_array = normalized_corners_flat.reshape(original_shape)
+
+            bbox_corners_tensor = torch.tensor(bbox_corners_array, dtype=torch.float32)
+            
+            # Pad or truncate bbox_corners_tensor to self.trajectory_length
+            # Real length is determined by the poses/attention_mask
+            current_len_bbox = bbox_corners_tensor.shape[0]
+            if current_len_bbox < self.trajectory_length:
+                padding_bbox = torch.zeros(self.trajectory_length - current_len_bbox, 8, 3, dtype=torch.float32)
+                padded_bbox_corners_tensor = torch.cat([bbox_corners_tensor, padding_bbox], dim=0)
+            else:
+                padded_bbox_corners_tensor = bbox_corners_tensor[:self.trajectory_length, :, :]
+            
+            trajectory_data['bbox_corners'] = padded_bbox_corners_tensor
+        else:
+            # If no bbox data, add zeros as placeholder
+            trajectory_data['bbox_corners'] = torch.zeros(self.trajectory_length, 8, 3, dtype=torch.float32)
+
         # Create metadata with only essential information
         metadata = {
             'name': instance_info.name,
@@ -946,11 +1044,17 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         metadata['category'] = getattr(instance_info, 'category', 'unknown')
         metadata['subcategory'] = getattr(instance_info, 'subcategory', 'unknown')
         
-        # Create trajectory data dict
-        trajectory_data = {
-            'poses': poses_tensor,  # Now contains [x, y, z, roll, pitch, yaw]
-            'attention_mask': attention_mask,
-        }
+        # Extract or assign category_id directly
+        # First try to get a direct category_id/uid from instance_info
+        category_id = getattr(instance_info, 'category_id', None)
+        if category_id is None:
+            # If not available, use a simple hash of the category string as backup
+            # This provides a consistent ID for the same category string
+            category_string = metadata['category']
+            category_id = hash(category_string) % 10000  # Limit to a reasonable range
+        
+        # Store the category_id in metadata
+        metadata['category_id'] = int(category_id)
         
         # Create complete trajectory item
         trajectory_item = {
@@ -958,6 +1062,10 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             'metadata': metadata,
             'motion_value': total_path_length  # Store total path length for filtering (absolute distance moved)
         }
+        
+        # Add bbox_corners_sequence to metadata
+        if bbox_corners_sequence is not None:
+            metadata['bbox_corners_sequence'] = bbox_corners_sequence
         
         trajectories_with_motion.append(trajectory_item)
     
@@ -970,7 +1078,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             timestamps: List of timestamps to track at
             
         Returns:
-            list: List of (poses, timestamps) tuples for all active motion segments,
+            list: List of (poses, timestamps, bbox_corners_sequence) tuples for all active motion segments,
                   where poses contains both position and orientation [x, y, z, roll, pitch, yaw]
                   or a list with a single tuple of the entire trajectory if motion detection is disabled
         """
@@ -980,6 +1088,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         # Lists to store trajectory data
         poses = []  # Will store [x, y, z, roll, pitch, yaw]
         tracked_timestamps = []
+        bbox_corners_sequence = [] # New list to store 8 corners of OBB for each timestamp
         
         # Track object at each timestamp
         time_idx = 0  # For debug print limiting
@@ -1025,6 +1134,47 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                     # Store the combined pose and timestamp
                     poses.append(pose)
                     tracked_timestamps.append(ts)
+
+                    # --- Extract 8 corners of the Oriented Bounding Box (OBB) ---
+                    # sx = bbox.extent_x # Causes AttributeError
+                    # sy = bbox.extent_y # Causes AttributeError
+                    # sz = bbox.extent_z # Causes AttributeError
+
+                    # Use dimensions from AABB as a fallback, acknowledging this is not the true OBB extent if rotated
+                    aabb = bbox.aabb
+                    sx = aabb[1] - aabb[0]  # width from world AABB
+                    sy = aabb[3] - aabb[2]  # height from world AABB
+                    sz = aabb[5] - aabb[4]  # depth from world AABB
+
+
+                    local_corners = np.array([
+                        [-sx/2, -sy/2, -sz/2], [sx/2, -sy/2, -sz/2], [sx/2, sy/2, -sz/2], [-sx/2, sy/2, -sz/2],
+                        [-sx/2, -sy/2, sz/2], [sx/2, -sy/2, sz/2], [sx/2, sy/2, sz/2], [-sx/2, sy/2, sz/2]
+                    ])
+
+                    # Get the 4x4 transformation matrix - FIX: SE3 may not have matrix() method
+                    try:
+                        # Try the original method first
+                        T_scene_object = bbox.transform_scene_object.matrix()
+                    except AttributeError:
+                        # If matrix() not available, construct the matrix manually
+                        rotation = bbox.transform_scene_object.rotation().to_matrix()
+                        translation = bbox.transform_scene_object.translation()[0]
+                        
+                        # Construct 4x4 transformation matrix
+                        T_scene_object = np.eye(4)
+                        T_scene_object[:3, :3] = rotation
+                        T_scene_object[:3, 3] = translation
+                        
+
+                    # Transform local corners to world coordinates
+                    local_corners_h = np.hstack((local_corners, np.ones((8, 1)))) # Homogeneous coordinates
+                    world_corners_h = (T_scene_object @ local_corners_h.T).T
+                    world_corners = world_corners_h[:, :3] # De-homogenize
+
+                    bbox_corners_sequence.append(world_corners)
+                    # --------------------------------------------------------------
+
                 except Exception as e:
                     if time_idx % 100 == 0 or time_idx == 1:
                         print(f"Warning: Could not get pose for object {object_id} at time {ts}: {e}")
@@ -1036,7 +1186,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         
         # If we didn't collect enough points or motion detection is disabled, return raw trajectory as a single segment
         if len(poses) < self.min_segment_frames or not self.detect_motion_segments:
-            return [(poses, tracked_timestamps)]  # Return as a list with one segment
+            return [(poses, tracked_timestamps, bbox_corners_sequence)]  # Return as a list with one segment
         
         # Calculate velocity between each pair of points - only considering position component (not rotation)
         velocities = []
@@ -1102,7 +1252,18 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                     # Too many stationary frames - end current segment if long enough
                     if len(current_segment) >= self.min_segment_frames:
                         # Store current segment
-                        active_segments.append((current_segment.copy(), current_segment_timestamps.copy()))
+                        # 修复可能出现的IndexError，更安全地从bbox_corners_sequence获取数据
+                        current_bbox_segment = []
+                        for t in current_segment_timestamps:
+                            if t in tracked_timestamps:
+                                try:
+                                    idx = tracked_timestamps.index(t)
+                                    if 0 <= idx < len(bbox_corners_sequence):
+                                        current_bbox_segment.append(bbox_corners_sequence[idx])
+                                except (ValueError, IndexError) as e:
+                                    print(f"Warning: Failed to get bbox corners for timestamp {t}: {e}")
+                        
+                        active_segments.append((current_segment.copy(), current_segment_timestamps.copy(), current_bbox_segment.copy()))
                     
                     # Start a new segment with this point
                     current_segment = [poses[i]]
@@ -1111,11 +1272,21 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         
         # Add the final segment if it's long enough
         if len(current_segment) >= self.min_segment_frames:
-            active_segments.append((current_segment, current_segment_timestamps))
+            current_bbox_segment = []
+            for t in current_segment_timestamps:
+                if t in tracked_timestamps:
+                    try:
+                        idx = tracked_timestamps.index(t)
+                        if 0 <= idx < len(bbox_corners_sequence):
+                            current_bbox_segment.append(bbox_corners_sequence[idx])
+                    except (ValueError, IndexError) as e:
+                        print(f"Warning: Failed to get bbox corners for timestamp {t}: {e}")
+            
+            active_segments.append((current_segment, current_segment_timestamps, current_bbox_segment))
         
         # If no segments found or all too short, return the original trajectory
         if not active_segments:
-            return [(poses, tracked_timestamps)]
+            return [(poses, tracked_timestamps, bbox_corners_sequence)]
         
         # Return all active segments in their original chronological order
         return active_segments
@@ -1227,6 +1398,13 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         # Add segment index if available in metadata
         if 'segment_idx' in metadata:
             result['segment_idx'] = metadata['segment_idx']
+
+        # Retrieve bbox_corners from trajectory_data and add to result
+        if 'bbox_corners' in trajectory_data:
+            result['bbox_corners'] = trajectory_data['bbox_corners']
+        else:
+            # Fallback if not present, though it should be due to _process_trajectory_segment
+            result['bbox_corners'] = torch.zeros(self.trajectory_length, 8, 3, dtype=torch.float32)
 
         return result
     

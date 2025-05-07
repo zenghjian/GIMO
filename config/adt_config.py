@@ -36,6 +36,8 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.traj_dataset_configs.add_argument('--min_segment_frames', default=5, type=int, help='Minimum number of frames for a valid motion segment')
         self.traj_dataset_configs.add_argument('--max_stationary_frames', default=3, type=int, help='Maximum consecutive stationary frames allowed in a motion segment')
         self.traj_dataset_configs.add_argument('--normalize_data', default=False, action='store_true', help='Enable normalization of trajectory data using scene bounds')
+        self.traj_dataset_configs.add_argument('--global_cache_dir', type=str, default=None, help='Path to a shared global directory for trajectory cache (overrides cache within save_path)')
+        self.traj_dataset_configs.add_argument('--force_use_cache', action='store_true', default=False, help='Force using available cache files even if parameters don\'t match')
 
         # === Scene/Point Cloud Configuration ===
         self.scene_configs = self.add_argument_group('Scene Encoder')
@@ -52,22 +54,18 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.motion_configs.add_argument('--motion_intermediate_dim', default=1024, type=int, help='Intermediate dimension in FFN')
         self.motion_configs.add_argument('--dropout', default=0.0, type=float, help='Dropout rate')
 
-        # === Cross-Modal Configuration (Based on GIMO) ===
-        self.cross_modal_configs = self.add_argument_group('Cross-Modal Transformer')
-        self.cross_modal_configs.add_argument('--cross_n_heads', default=8, type=int)
-        self.cross_modal_configs.add_argument('--cross_hidden_dim', default=256, type=int)
-        self.cross_modal_configs.add_argument('--cross_intermediate_dim', default=1024, type=int)
-        self.cross_modal_configs.add_argument('--cross_n_layers', default=3, type=int)
+        # === Output Pathway Configuration ===
+        self.output_configs = self.add_argument_group('Output Pathway')
+        self.output_configs.add_argument('--embedding_hidden_dim', default=256, type=int, help='Hidden dimension for the embedding layer')
+        self.output_configs.add_argument('--output_latent_dim', default=256, type=int, help='Latent dimension in output encoder')
+        self.output_configs.add_argument('--output_n_heads', default=8, type=int, help='Number of attention heads in output encoder')
+        self.output_configs.add_argument('--output_n_layers', default=3, type=int, help='Number of transformer layers in output encoder')
         
         # === Category Encoder Configuration ===
         self.category_configs = self.add_argument_group('Category Encoder')
-        self.category_configs.add_argument('--category_embed_dim', default=64, type=int, help='Embedding dimension for category tokens')
-        self.category_configs.add_argument('--category_latent_dim', default=128, type=int, help='Latent dimension for encoded categories')
-        self.category_configs.add_argument('--category_n_heads', default=4, type=int, help='Number of attention heads in category encoder')
-        self.category_configs.add_argument('--category_n_layers', default=2, type=int, help='Number of layers in category encoder')
-        self.category_configs.add_argument('--max_category_tokens', default=30, type=int, help='Maximum number of tokens per category string')
-        self.category_configs.add_argument('--vocab_size', default=128, type=int, help='Vocabulary size for token embedding (ASCII characters + special tokens)')
-        self.category_configs.add_argument('--no_text_embedding', action='store_true', default=False, help='Disable text embedding for object categories')
+        self.category_configs.add_argument('--num_object_categories', default=512, type=int, help='Total number of unique object categories for embedding lookup.')
+        self.category_configs.add_argument('--category_embed_dim', default=64, type=int, help='Embedding dimension for category IDs')
+        self.category_configs.add_argument('--no_text_embedding', action='store_true', default=False, help='Disable category ID embedding and conditioning')
 
         # === Training Configuration ===
         self.train_configs = self.add_argument_group('Training')
@@ -102,7 +100,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         # === Visualization Configuration ===
         self.viz_configs = self.add_argument_group('Visualization')
         self.viz_configs.add_argument('--viz_ori_scale', type=float, default=0.2, help='Scale factor for orientation arrows in visualization')
-        self.viz_configs.add_argument('--show_ori_arrows', action='store_true', default=True, help='Show orientation arrows in visualization')
+        self.viz_configs.add_argument('--show_ori_arrows', action='store_true', default=False, help='Show orientation arrows in visualization')
 
     def get_configs(self):
         # Basic validation

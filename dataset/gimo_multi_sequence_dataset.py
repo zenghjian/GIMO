@@ -100,6 +100,7 @@ class GIMOMultiSequenceDataset(Dataset):
             self.use_cache = getattr(config, 'use_cache', use_cache)
             self.normalize_data = getattr(config, 'normalize_data', normalize_data)
             self.trajectory_pointcloud_radius = getattr(config, 'trajectory_pointcloud_radius', trajectory_pointcloud_radius)
+            self.force_use_cache = getattr(config, 'force_use_cache', False) # Get force_use_cache from config
             # For cache_dir, don't use config directly - it will be set below from save_path if provided
         else:
             self.trajectory_length = trajectory_length
@@ -120,13 +121,22 @@ class GIMOMultiSequenceDataset(Dataset):
         self.transform = transform
         
         
-        # Use provided cache_dir if not None, otherwise use config.save_path if available
+        # --- Determine Cache Directory ---
+        effective_cache_dir = None
         if cache_dir is not None:
-            self.cache_dir = cache_dir
+            effective_cache_dir = cache_dir
+            print(f"Using explicitly provided cache directory: {effective_cache_dir}")
+        elif config is not None and getattr(config, 'global_cache_dir', None):
+            effective_cache_dir = config.global_cache_dir
+            print(f"Using global cache directory from config: {effective_cache_dir}")
         elif config is not None and hasattr(config, 'save_path'):
-            self.cache_dir = os.path.join(config.save_path, 'trajectory_cache')
+            effective_cache_dir = os.path.join(config.save_path, 'trajectory_cache')
+            print(f"Using experiment-specific cache directory derived from save_path: {effective_cache_dir}")
         else:
-            self.cache_dir = './trajectory_cache'  # Default fallback
+            effective_cache_dir = './trajectory_cache'  # Default fallback
+            print(f"Using default cache directory: {effective_cache_dir}")
+        self.cache_dir = effective_cache_dir
+        # -----------------------------------
         
         # Calculate history and future lengths based on fraction
         # Use floor for history length to ensure it's an integer
@@ -156,6 +166,45 @@ class GIMOMultiSequenceDataset(Dataset):
         # Load all sequences
         self._load_sequences()
         
+        # --- Create Category ID Mapping ---
+        # This maps original (potentially sparse) category IDs to dense indices (0 to N-1)
+        self.original_to_dense_category_id = {}
+        self.dense_to_original_category_id = []
+        
+        # Scan all trajectories to collect unique category IDs
+        unique_category_ids = set()
+        for dataset_instance in self.individual_datasets:
+            for traj_item in dataset_instance.trajectories:
+                original_category_id = traj_item.get('metadata', {}).get('category_id', 0)
+                unique_category_ids.add(original_category_id)
+        
+        # Sort original IDs for deterministic mapping
+        sorted_unique_ids = sorted(list(unique_category_ids))
+        
+        # Create bidirectional mappings
+        for dense_id, original_id in enumerate(sorted_unique_ids):
+            self.original_to_dense_category_id[original_id] = dense_id
+            self.dense_to_original_category_id.append(original_id)
+        
+        # Set the number of categories to the actual number of unique categories
+        self.num_object_categories = len(unique_category_ids)
+        print(f"Found {self.num_object_categories} unique category IDs.")
+        if len(sorted_unique_ids) > 0:
+            print(f"Original ID range: min={sorted_unique_ids[0]}, max={sorted_unique_ids[-1]}")
+            print(f"Created mapping from original sparse IDs to dense IDs (0 to {self.num_object_categories-1}).")
+        
+        # Update config with the actual number of categories
+        if config is not None and hasattr(config, 'num_object_categories'):
+            if config.num_object_categories < self.num_object_categories:
+                print(f"WARNING: Configured num_object_categories ({config.num_object_categories}) is less than "
+                      f"discovered unique category count ({self.num_object_categories}). "
+                      f"Setting to {self.num_object_categories}.")
+                config.num_object_categories = self.num_object_categories
+            elif config.num_object_categories > self.num_object_categories and self.num_object_categories > 0:
+                print(f"INFO: Configured num_object_categories ({config.num_object_categories}) is greater than "
+                      f"discovered unique category count ({self.num_object_categories}). "
+                      f"This is acceptable if padding for future categories is intended.")
+
         print(f"GIMOMultiSequenceDataset initialized with {len(self.loaded_sequences)} sequences")
         print(f"Total trajectories: {len(self)}")
     
@@ -187,7 +236,8 @@ class GIMOMultiSequenceDataset(Dataset):
                     min_segment_frames=getattr(self, 'min_segment_frames', 5),
                     max_stationary_frames=getattr(self, 'max_stationary_frames', 3),
                     normalize_data=self.normalize_data,
-                    trajectory_pointcloud_radius=self.trajectory_pointcloud_radius
+                    trajectory_pointcloud_radius=self.trajectory_pointcloud_radius,
+                    force_use_cache=self.force_use_cache  # Pass force_use_cache parameter
                 )
                 
                 # If the dataset has trajectories, add it to our collection
@@ -237,7 +287,27 @@ class GIMOMultiSequenceDataset(Dataset):
         sequence_path = self.loaded_sequences[dataset_idx]
         sample['sequence_path'] = sequence_path
         sample['sequence_name'] = os.path.basename(sequence_path)
-        sample['dataset_idx'] = dataset_idx # Add dataset_idx to the sample
+        sample['dataset_idx'] = dataset_idx # Ensure dataset_idx is in the sample for collate_fn
+
+        # --- Add Category ID to the sample ---
+        # Get original category_id from metadata
+        original_category_id = original_traj_item.get('metadata', {}).get('category_id', 0)
+        
+        # Map original ID to dense ID for embedding
+        if original_category_id in self.original_to_dense_category_id:
+            dense_category_id = self.original_to_dense_category_id[original_category_id]
+        else:
+            # Fallback for any unforeseen category IDs (should not happen)
+            print(f"Warning: Encountered unmapped category ID: {original_category_id}")
+            dense_category_id = 0  # Default to first category
+            
+        # Store both original and dense IDs
+        sample['object_category_id'] = dense_category_id
+        sample['original_category_id'] = original_category_id
+        
+        # Also include the category string for reference/debugging
+        sample['object_category'] = original_traj_item.get('metadata', {}).get('category', 'unknown')
+        # -------------------------------------
         
         # --- Perform Past/Future Split Here --- 
         # Check if we have poses (6D) or positions (3D) - handle both for backward compatibility

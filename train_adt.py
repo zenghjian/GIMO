@@ -143,37 +143,32 @@ def validate(model, dataloader, device, config, epoch):
             try:
                 full_trajectory_batch = batch['full_poses'].float().to(device)
                 point_cloud_batch = batch['point_cloud'].float().to(device) # Get point cloud from collated batch
+                bbox_corners_batch = batch['bbox_corners'].float().to(device) # Get bbox_corners
                 # Move mask to device for loss calc
                 batch['full_attention_mask'] = batch['full_attention_mask'].to(device)
                 
                 # Prepare input trajectory for the model based on config
                 if config.use_first_frame_only:
-                    # Use only the first frame as input
                     input_trajectory_batch = full_trajectory_batch[:, 0:1, :]
+                    bbox_corners_input_batch = bbox_corners_batch[:, 0:1, :, :] 
                 else:
-                    # Use a fixed portion of the history as input
                     fixed_history_length = int(np.floor(full_trajectory_batch.shape[1] * config.history_fraction))
                     input_trajectory_batch = full_trajectory_batch[:, :fixed_history_length, :]
+                    bbox_corners_input_batch = bbox_corners_batch[:, :fixed_history_length, :, :]
                 
-                # Ensure object names are usable (e.g., list of strings)
-                object_names = batch.get('object_name', [f"unknown_{i}" for i in range(full_trajectory_batch.shape[0])])
-                # Ensure object IDs are usable
-                object_ids = batch.get('object_id', torch.arange(full_trajectory_batch.shape[0])).cpu().numpy()
-                # Get object categories for the model
-                object_categories = batch.get('object_category', [f"unknown" for i in range(full_trajectory_batch.shape[0])])
-                # Convert categories to list of strings if they're tensors
-                if isinstance(object_categories, torch.Tensor):
-                    object_categories = [cat.item() if isinstance(cat.item(), str) else str(cat.item()) for cat in object_categories]
+                # Get object category IDs if embedding is enabled
+                if not config.no_text_embedding:
+                    object_category_ids = batch['object_category_id'].to(device)
+                else:
+                    object_category_ids = None
 
-            except KeyError as e:
-                print(f"Error: Missing key {e} in validation batch {batch_idx}. Skipping batch.")
-                continue
-            except Exception as e:
-                print(f"Error processing validation batch {batch_idx}: {e}. Skipping batch.")
-                continue
+            except KeyError as e: logger(f"Error: Missing key {e} in batch {batch_idx}. Skipping."); continue
+            except Exception as e: logger(f"Error processing batch {batch_idx}: {e}. Skipping."); continue
 
-            # Forward pass with input trajectory only
-            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, object_categories)
+            # 1. Forward pass with input trajectory, point cloud, bbox corners, and category IDs
+            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids)
+
+            # 2. Compute loss
             total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
 
             val_total_loss += total_loss.item()
@@ -206,6 +201,8 @@ def validate(model, dataloader, device, config, epoch):
                 # Extract position components (first 3 dimensions)
                 position_dim = config.object_position_dim
                 gt_positions = gt_full_poses[:, :position_dim]
+                
+                # Extract future predictions - model now outputs full sequence in all cases
                 pred_positions = pred_full_trajectory[:, :position_dim]
                 
                 # Split into history and future
@@ -288,9 +285,11 @@ def validate(model, dataloader, device, config, epoch):
 
                     # Slice prediction dynamically based on use_first_frame_only
                     if config.use_first_frame_only:
+                        # Now model always outputs full sequence - we need to handle appropriately
+                        # For visualization, we only care about the future portion (frames 1 onwards)
                         valid_future_len = actual_length - history_length_for_vis
-                        predicted_future_positions = pred_full_positions[:valid_future_len] 
-                        predicted_future_orientations = pred_full_orientations[:valid_future_len]
+                        predicted_future_positions = pred_full_positions[history_length_for_vis:history_length_for_vis+valid_future_len]
+                        predicted_future_orientations = pred_full_orientations[history_length_for_vis:history_length_for_vis+valid_future_len]
                     else:
                         # Standard case: model output is full trajectory
                         pred_past_positions = pred_full_positions[:history_length_for_vis]
@@ -300,7 +299,7 @@ def validate(model, dataloader, device, config, epoch):
                         predicted_future_orientations = pred_full_orientations[history_length_for_vis:actual_length]
                     # ----------------------------------------------------
 
-                    obj_name = object_names[i]
+                    obj_name = batch['object_name'][i] if 'object_name' in batch else f"unknown_{i}"
                     # Get segment_idx from batch if available
                     segment_idx = batch['segment_idx'][i].item() if 'segment_idx' in batch and batch['segment_idx'][i].item() != -1 else None
                     
@@ -320,10 +319,13 @@ def validate(model, dataloader, device, config, epoch):
                     if is_first_validation:
                         # Full Trajectory Visualization - now with point cloud and orientation
                         full_traj_path = os.path.join(trajectory_vis_dir, f"{filename_base}_full_trajectory_with_scene.png")
+                        # 获取当前样本的边界框角点数据
+                        sample_bbox_corners = bbox_corners_batch[i].cpu()  # 提取当前样本的边界框并移到CPU
                         visualize_full_trajectory(
                             positions=gt_full_positions,
                             attention_mask=gt_full_mask,
                             point_cloud=sample_pointcloud,  # Pass the point cloud
+                            bbox_corners_sequence=sample_bbox_corners,  # 添加边界框角点数据
                             title=f"Full GT - {vis_title_base}",
                             save_path=full_traj_path,
                             segment_idx=segment_idx
@@ -446,6 +448,7 @@ def gimo_collate_fn(batch, dataset, num_sample_points):
     batch_copy = []
     for item in batch:
         item_copy = {k: v for k, v in item.items() if k not in ['trajectory_specific_pointcloud', 'dataset_idx']}
+        # bbox_corners should be handled by default_collate, so no need to exclude it here.
         batch_copy.append(item_copy)
     
     # Collate the rest using default_collate
@@ -585,12 +588,12 @@ def main():
 
             with open(train_split_save_path, 'w') as f:
                 for seq_path in train_sequences:
-                    f.write(f"{seq_path}\\n")
+                    f.write(f"{seq_path}\n")
             logger(f"Saved final training sequence list ({len(train_sequences)} sequences) to {train_split_save_path}")
 
             with open(val_split_save_path, 'w') as f:
                 for seq_path in val_sequences:
-                    f.write(f"{seq_path}\\n")
+                    f.write(f"{seq_path}\n")
             logger(f"Saved final validation sequence list ({len(val_sequences)} sequences) to {val_split_save_path}")
 
         except Exception as e:
@@ -601,19 +604,26 @@ def main():
     # -------------------------------------------------------
 
     # Create datasets
-    cache_dir = os.path.join(config.save_path, 'trajectory_cache') # Use a dedicated cache dir for this run
-    os.makedirs(cache_dir, exist_ok=True)
-    print(f"Using cache directory: {cache_dir}")
+    if getattr(config, 'global_cache_dir', None):
+        # Use the globally configured cache directory
+        cache_dir = config.global_cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        print(f"Using global cache directory: {cache_dir}")
+    else:
+        # Fall back to using a dedicated cache dir for this run
+        cache_dir = os.path.join(config.save_path, 'trajectory_cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        print(f"Using experiment-specific cache directory: {cache_dir}")
     
     train_dataset = GIMOMultiSequenceDataset(
         sequence_paths=train_sequences,
         config=config,  # Pass the config object
-        cache_dir=cache_dir  # Still explicitly set cache_dir
+        cache_dir=cache_dir  # Explicitly pass the determined cache_dir
     )
     val_dataset = GIMOMultiSequenceDataset(
         sequence_paths=val_sequences,
         config=config,  # Pass the config object
-        cache_dir=cache_dir  # Still explicitly set cache_dir 
+        cache_dir=cache_dir  # Use the same cache directory for validation
     )
 
     if len(train_dataset) == 0:
@@ -648,17 +658,20 @@ def main():
     
     # Log model components
     components = {
-        'Motion Encoder': (model.motion_encoder, ['n_input_channels', 'n_latent', 'n_latent_channels']),
-        'Scene Encoder': (model.scene_encoder, ['feat_dim']),
-        'Output Encoder': (model.output_encoder, ['n_input_channels', 'n_latent_channels']),
+        'Motion Linear': (model.motion_linear, []), # Add relevant attributes if any
+        'Scene Encoder': (model.scene_encoder, ['hparams']), # PointNet2SemSegSSGShape uses hparams
+        'FP Layer': (model.fp_layer, []),
+        'BBox PointNet': (model.bbox_pointnet, ['conv1']), # Example attribute
+        'Motion BBox Encoder': (model.motion_bbox_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
+        'Embedding Layer (Fusion 2)': (model.embedding_layer, ['in_features', 'out_features']),
+        'Output Encoder': (model.output_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
+        'Output Layer': (model.outputlayer, ['in_features', 'out_features'])
     }
     
     # Add text embedding components if enabled
-    if model.use_text_embedding:
+    if model.use_text_embedding: # Corrected condition
         components.update({
-            'Category Encoder': (model.category_encoder, ['n_input_channels', 'n_latent', 'n_latent_channels']),
-            'Motion-Category Decoder': (model.motion_category_decoder, ['n_query_channels', 'n_latent_channels']),
-            'Category-Motion Decoder': (model.category_motion_decoder, ['n_query_channels', 'n_latent_channels']),
+            'Category Embedding': (model.category_embedding, ['num_embeddings', 'embedding_dim'])
         })
     
     # Log each component's structure and parameters
@@ -731,29 +744,30 @@ def main():
                 # Data is already collated, move relevant tensors to device
                 full_trajectory_batch = batch['full_poses'].float().to(device)
                 point_cloud_batch = batch['point_cloud'].float().to(device) # Get point cloud from collated batch
-                # Move other tensors needed for loss calculation (e.g., mask)
+                bbox_corners_batch = batch['bbox_corners'].float().to(device) # Get bbox_corners
+                # Move mask to device for loss calc
                 batch['full_attention_mask'] = batch['full_attention_mask'].to(device)
-
+                
                 # Prepare input trajectory for the model based on config
                 if config.use_first_frame_only:
-                    # Use only the first frame as input
                     input_trajectory_batch = full_trajectory_batch[:, 0:1, :]
+                    bbox_corners_input_batch = bbox_corners_batch[:, 0:1, :, :] 
                 else:
-                    # Use a fixed portion of the history as input
                     fixed_history_length = int(np.floor(full_trajectory_batch.shape[1] * config.history_fraction))
                     input_trajectory_batch = full_trajectory_batch[:, :fixed_history_length, :]
+                    bbox_corners_input_batch = bbox_corners_batch[:, :fixed_history_length, :, :]
                 
-                # Get object categories for the model
-                object_categories = batch.get('object_category', [f"unknown" for i in range(full_trajectory_batch.shape[0])])
-                # Convert categories to list of strings if they're tensors
-                if isinstance(object_categories, torch.Tensor):
-                    object_categories = [cat.item() if isinstance(cat.item(), str) else str(cat.item()) for cat in object_categories]
+                # Get object category IDs if embedding is enabled
+                if not config.no_text_embedding:
+                    object_category_ids = batch['object_category_id'].to(device)
+                else:
+                    object_category_ids = None
 
             except KeyError as e: logger(f"Error: Missing key {e} in batch {batch_idx}. Skipping."); continue
             except Exception as e: logger(f"Error processing batch {batch_idx}: {e}. Skipping."); continue
 
-            # 1. Forward pass with input trajectory only
-            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, object_categories)
+            # 1. Forward pass with input trajectory, point cloud, bbox corners, and category IDs
+            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids)
 
             # 2. Compute loss
             total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
