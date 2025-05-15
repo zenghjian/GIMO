@@ -290,12 +290,32 @@ def validate(model, dataloader, device, config, epoch):
                     obj_name = batch['object_name'][i] if 'object_name' in batch else f"unknown_{i}"
                     segment_idx = batch['segment_idx'][i].item() if 'segment_idx' in batch and batch['segment_idx'][i].item() != -1 else None
                     
-                    if segment_idx is not None:
-                        filename_base = f"{obj_name}_seg{segment_idx}"
-                        vis_title_base = f"{obj_name} (Seg: {segment_idx})"
-                    else:
-                        filename_base = f"{obj_name}"
-                        vis_title_base = f"{obj_name}"
+                    # --- MODIFICATION START for filename and title ---
+                    # In overfitting, sequence info comes from first_sample, batch_idx is 0 for the dataloader
+                    # `first_sample_seq_raw` should be defined earlier in the main() and accessible here or passed
+                    # For simplicity, we assume sequence_name_extracted can be derived from `batch` if it carries it
+                    # or from a variable holding the first_sample's sequence path.
+                    # Let's assume `first_sample_seq_name_for_vis` is available (derived in main and passed or re-derived)
+                    
+                    # Re-deriving sequence name from batch (which contains the first_sample data)
+                    current_sequence_path = batch['sequence_path'][i] # batch now contains sequence_path collated
+                    sequence_name_extracted = os.path.splitext(os.path.basename(current_sequence_path))[0]
+                    current_batch_idx = batch_idx # from enumerate(dataloader)
+
+                    fn_obj_name = obj_name
+                    fn_seq_name = f"seq_{sequence_name_extracted}"
+                    fn_seg_id = f"seg{segment_idx}" if segment_idx is not None else "segNA"
+                    fn_batch_id = f"batch{current_batch_idx}"
+
+                    filename_base = f"{fn_obj_name}_{fn_seq_name}_{fn_seg_id}_{fn_batch_id}"
+
+                    title_obj_name = obj_name
+                    title_seq_name = f"Seq: {sequence_name_extracted}"
+                    title_seg_id = f"Seg: {segment_idx if segment_idx is not None else 'NA'}"
+                    title_batch_id = f"Batch: {current_batch_idx}"
+
+                    vis_title_base = f"{title_obj_name} ({title_seq_name}, {title_seg_id}, {title_batch_id})"
+                    # --- MODIFICATION END ---
                     
                     # Check if orientation visualization is enabled
                     show_ori_arrows = getattr(config, 'show_ori_arrows', False)

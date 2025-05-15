@@ -22,6 +22,9 @@ class GIMO_ADT_Model(nn.Module):
         # Check if text embedding is disabled
         self.use_text_embedding = not getattr(config, 'no_text_embedding', False)
         
+        # Check if bounding box processing is disabled
+        self.use_bbox = not getattr(config, 'no_bbox', False)
+        
         # Still keep fixed trajectory_length for model definition
         self.sequence_length = config.trajectory_length 
 
@@ -38,14 +41,28 @@ class GIMO_ADT_Model(nn.Module):
         self.bbox_pointnet = PointNet(config.scene_feats_dim) # Use existing scene_feats_dim
         
         # Encoder for fusing motion and bbox_scene_features
-        self.motion_bbox_encoder = PerceiveEncoder(
-            n_input_channels=config.motion_hidden_dim + config.scene_feats_dim,
-            n_latent=self.sequence_length,  # Required parameter for number of latent tokens
-            n_latent_channels=config.motion_latent_dim,
-            n_self_att_heads=config.motion_n_heads,    
-            n_self_att_layers=config.motion_n_layers,   
-            dropout=config.dropout
-        )
+        # Adjust input dimension based on whether no_bbox is enabled
+        motion_bbox_encoder_input_dim = config.motion_hidden_dim
+        if not self.use_bbox:
+            # If bbox disabled, we only use motion features
+            self.motion_bbox_encoder = PerceiveEncoder(
+                n_input_channels=config.motion_hidden_dim,
+                n_latent=self.sequence_length,
+                n_latent_channels=config.motion_latent_dim,
+                n_self_att_heads=config.motion_n_heads,    
+                n_self_att_layers=config.motion_n_layers,   
+                dropout=config.dropout
+            )
+        else:
+            # With bbox enabled, we use both motion and bbox features
+            self.motion_bbox_encoder = PerceiveEncoder(
+                n_input_channels=config.motion_hidden_dim + config.scene_feats_dim,
+                n_latent=self.sequence_length,
+                n_latent_channels=config.motion_latent_dim,
+                n_self_att_heads=config.motion_n_heads,    
+                n_self_att_layers=config.motion_n_layers,   
+                dropout=config.dropout
+            )
 
         # --- Category Embedding (simplified approach) ---
         if not config.no_text_embedding:
@@ -56,17 +73,18 @@ class GIMO_ADT_Model(nn.Module):
         
         # Final Embedded Layer (second fusion)
         # Prepare input dims for embedding layer
+        # This layer will now potentially receive category embeddings as well
         embed_input_dim = config.motion_latent_dim + config.scene_feats_dim
+        if not config.no_text_embedding:
+            embed_input_dim += config.category_embed_dim
+        
         embed_output_dim = config.embedding_hidden_dim
         self.embedding_layer = nn.Linear(embed_input_dim, embed_output_dim)
             
-        # Determine output layer input dimension based on whether category embedding is used
-        if not config.no_text_embedding:
-            # Add category embedding dim to output layer input dim
-            output_input_dim = config.embedding_hidden_dim + config.category_embed_dim
-        else:
-            # Without category, output layer input is just embedding_hidden_dim
-            output_input_dim = config.embedding_hidden_dim
+        # Determine output layer input dimension
+        # The output_encoder's input is embed_output_dim.
+        # The outputlayer's input is output_latent_dim from output_encoder.
+        output_input_dim = config.output_latent_dim # Changed: No longer adds category_embed_dim here
         
         # --- Output components ---
         self.output_encoder = PerceiveEncoder(
@@ -81,14 +99,14 @@ class GIMO_ADT_Model(nn.Module):
         # Final output layer (predicts full motion trajectory)
         self.outputlayer = nn.Linear(output_input_dim, config.object_motion_dim)
     
-    def forward(self, input_trajectory, point_cloud, bounding_box_corners, object_category_ids=None):
+    def forward(self, input_trajectory, point_cloud, bounding_box_corners=None, object_category_ids=None):
         """
         Forward pass of the GIMO ADT model with 3D bounding box integration.
         
         Args:
             input_trajectory: [batch_size, input_length, 6] - history trajectory (positions and orientations)
             point_cloud: [batch_size, num_points, 3] - scene point cloud
-            bounding_box_corners: [batch_size, input_length, 8, 3] - 3D bbox corners for each input timestep
+            bounding_box_corners: [batch_size, input_length, 8, 3] - 3D bbox corners for each input timestep (optional if no_bbox=True)
             object_category_ids: [batch_size] - category IDs for objects (optional if no_text_embedding=True)
             
         Returns:
@@ -97,11 +115,14 @@ class GIMO_ADT_Model(nn.Module):
         batch_size = input_trajectory.shape[0]
         input_length = input_trajectory.shape[1]  # length of input trajectory
         sequence_length = self.sequence_length  # full output sequence length, get from model attribute
-        num_bbox_corners = bounding_box_corners.shape[2]  # should be 8
         
         # --- Check if object_category_ids is provided when needed ---
         if not self.config.no_text_embedding and object_category_ids is None:
             raise ValueError("object_category_ids is required when no_text_embedding=False")
+            
+        # --- Check if bounding_box_corners is provided when needed ---
+        if self.use_bbox and bounding_box_corners is None:
+            raise ValueError("bounding_box_corners is required when no_bbox=False")
             
         # Task 3.2.1: Process Input Trajectory
         # Input trajectory to motion features [B, T, motion_hidden_dim]
@@ -114,55 +135,72 @@ class GIMO_ADT_Model(nn.Module):
         point_cloud_6d = torch.cat([point_cloud, point_cloud], dim=2)  # [B, N, 6]
         scene_feats_per_point, scene_global_feats = self.scene_encoder(point_cloud_6d)
         
-        # Task 3.2.3: Process Bounding Box 
-        # First reshape everything for feature propagation to bbox corners
-        point_cloud_repeated_for_fp = point_cloud.unsqueeze(1).repeat(1, input_length, 1, 1) # [B, T, N, 3]
-        point_cloud_for_fp = point_cloud_repeated_for_fp.reshape(batch_size * input_length, -1, 3).contiguous() # [B*T, N, 3]
+        # Task 3.2.3: Process Bounding Box (if enabled)
+        if self.use_bbox and bounding_box_corners is not None:
+            num_bbox_corners = bounding_box_corners.shape[2]  # should be 8
+            
+            # First reshape everything for feature propagation to bbox corners
+            point_cloud_repeated_for_fp = point_cloud.unsqueeze(1).repeat(1, input_length, 1, 1) # [B, T, N, 3]
+            point_cloud_for_fp = point_cloud_repeated_for_fp.reshape(batch_size * input_length, -1, 3).contiguous() # [B*T, N, 3]
 
-        scene_feats_per_point_for_fp = scene_feats_per_point.unsqueeze(2).repeat(1, 1, input_length, 1) # [B, F, T, N]
-        scene_feats_per_point_for_fp = scene_feats_per_point_for_fp.permute(0, 2, 1, 3).reshape(batch_size * input_length, self.config.scene_feats_dim, -1).contiguous() # [B*T, F, N]
-        
-        bbox_corners_for_fp = bounding_box_corners.reshape(batch_size * input_length, num_bbox_corners, 3).contiguous() # [B*T, 8, 3]
-        
-        # Propagate features to bounding box corners
-        # self.fp_layer expects unknown [B*T, 8, 3], known [B*T, N, 3], known_feats [B*T, F, N]
-        # Output: propagated_feats [B*T, F, 8]
-        propagated_feats_to_bbox = self.fp_layer(
-            unknown=bbox_corners_for_fp,  # target_points [B*T, 8, 3] 
-            known=point_cloud_for_fp,     # source_points [B*T, N, 3]
-            known_feats=scene_feats_per_point_for_fp  # source_features [B*T, F, N]
-        )
-        
-        # Process propagated features with PointNet for each bounding box
-        # self.bbox_pointnet expects [B*T, F, 8]
-        # Output: f_s_b_per_ts [B*T, scene_feats_dim]
-        f_s_b_per_ts = self.bbox_pointnet(propagated_feats_to_bbox) 
+            scene_feats_per_point_for_fp = scene_feats_per_point.unsqueeze(2).repeat(1, 1, input_length, 1) # [B, F, T, N]
+            scene_feats_per_point_for_fp = scene_feats_per_point_for_fp.permute(0, 2, 1, 3).reshape(batch_size * input_length, self.config.scene_feats_dim, -1).contiguous() # [B*T, F, N]
+            
+            bbox_corners_for_fp = bounding_box_corners.reshape(batch_size * input_length, num_bbox_corners, 3).contiguous() # [B*T, 8, 3]
+            
+            # Propagate features to bounding box corners
+            # self.fp_layer expects unknown [B*T, 8, 3], known [B*T, N, 3], known_feats [B*T, F, N]
+            # Output: propagated_feats [B*T, F, 8]
+            propagated_feats_to_bbox = self.fp_layer(
+                unknown=bbox_corners_for_fp,  # target_points [B*T, 8, 3] 
+                known=point_cloud_for_fp,     # source_points [B*T, N, 3]
+                known_feats=scene_feats_per_point_for_fp  # source_features [B*T, F, N]
+            )
+            
+            # Process propagated features with PointNet for each bounding box
+            # self.bbox_pointnet expects [B*T, F, 8]
+            # Output: f_s_b_per_ts [B*T, scene_feats_dim]
+            f_s_b_per_ts = self.bbox_pointnet(propagated_feats_to_bbox) 
 
-        # Reshape f_s_b to match f_m sequence length
-        # Output: f_s_b [B, T, scene_feats_dim]
-        f_s_b = f_s_b_per_ts.reshape(batch_size, input_length, self.config.scene_feats_dim)
-        
-        # Task 3.2.4: Fusion 1 (Motion f_m + BBox Scene Features f_s_b)
-        # f_m is [B, T, motion_hidden_dim]
-        # f_s_b is [B, T, scene_feats_dim]
-        # T here is input_length. self.motion_bbox_encoder expects n_latent = self.sequence_length (full output length)
-        fused_motion_bbox_input = torch.cat([f_m, f_s_b], dim=2) # [B, T, motion_hidden_dim + scene_feats_dim]
+            # Reshape f_s_b to match f_m sequence length
+            # Output: f_s_b [B, T, scene_feats_dim]
+            f_s_b = f_s_b_per_ts.reshape(batch_size, input_length, self.config.scene_feats_dim)
+            
+            # Task 3.2.4: Fusion 1 (Motion f_m + BBox Scene Features f_s_b)
+            # f_m is [B, T, motion_hidden_dim]
+            # f_s_b is [B, T, scene_feats_dim]
+            fused_motion_bbox_input = torch.cat([f_m, f_s_b], dim=2) # [B, T, motion_hidden_dim + scene_feats_dim]
+        else:
+            # If not using bbox, just use motion features directly
+            fused_motion_bbox_input = f_m  # [B, T, motion_hidden_dim]
         
         # encoded_motion_bbox will have shape [B, self.sequence_length, motion_latent_dim]
         encoded_motion_bbox = self.motion_bbox_encoder(fused_motion_bbox_input)
 
-        # Task 3.2.5: Fusion 2 (Global Scene + Output of Fusion 1)
+        # --- Generate Category Embeddings (if used) ---
+        category_embeddings_expanded = None
+        if not self.config.no_text_embedding and object_category_ids is not None:
+            category_embeddings = self.category_embedding(object_category_ids) # [B, category_embed_dim]
+            category_embeddings_expanded = category_embeddings.unsqueeze(1).repeat(1, self.sequence_length, 1) # [B, sequence_length, category_embed_dim]
+
+        # Task 3.2.5: Fusion 2 (Global Scene + Output of Fusion 1 + Optional Category Embedding)
         # scene_global_feats is [B, scene_feats_dim]
         # encoded_motion_bbox is [B, sequence_length, motion_latent_dim]
         scene_global_feats_expanded = scene_global_feats.unsqueeze(1).repeat(1, self.sequence_length, 1) # [B, sequence_length, scene_feats_dim]
         
-        final_fused_input = torch.cat([
+        features_to_fuse = [
             scene_global_feats_expanded,  # Global scene context
             encoded_motion_bbox,          # Motion + bounding box features
-        ], dim=2) # [B, sequence_length, scene_feats_dim + motion_latent_dim]
+        ]
+
+        if category_embeddings_expanded is not None:
+            features_to_fuse.append(category_embeddings_expanded)
+            
+        final_fused_input = torch.cat(features_to_fuse, dim=2)
+        # Expected shape of final_fused_input: 
+        # [B, sequence_length, scene_feats_dim + motion_latent_dim (+ category_embed_dim if used)]
         
         # Pass through embedding layer
-        # final_fused_input is [B, sequence_length, scene_feats_dim + motion_latent_dim]
         # embedding_output is [B, sequence_length, embedding_hidden_dim]
         embedding_output = self.embedding_layer(final_fused_input)
         
@@ -170,20 +208,8 @@ class GIMO_ADT_Model(nn.Module):
         # output_features is [B, sequence_length, output_latent_dim]
         output_features = self.output_encoder(embedding_output)
         
-        # --- Simplified Category Embedding ---
-        if not self.config.no_text_embedding and object_category_ids is not None:
-            # Get category embeddings [B, category_embed_dim]
-            category_embeddings = self.category_embedding(object_category_ids)
-            
-            # Expand to match sequence length [B, sequence_length, category_embed_dim]
-            category_embeddings_expanded = category_embeddings.unsqueeze(1).repeat(1, self.sequence_length, 1)
-            
-            # Concatenate with output features for final prediction
-            # [B, sequence_length, output_latent_dim + category_embed_dim]
-            final_input_to_outputlayer = torch.cat([output_features, category_embeddings_expanded], dim=2)
-        else:
-            # Without category, just use output features
-            final_input_to_outputlayer = output_features
+        # The output_features from output_encoder is now the direct input to the final output layer
+        final_input_to_outputlayer = output_features
         
         # Task 3.2.6: Final Output Layer
         # Predict full motion trajectory

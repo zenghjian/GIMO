@@ -28,7 +28,8 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.traj_dataset_configs.add_argument('--load_pointcloud', default=True, action='store_true', help='Enable loading point cloud data from sequences')
         self.traj_dataset_configs.add_argument('--pointcloud_subsample', default=1, type=int, help='Subsample factor for point cloud (higher means fewer points)')
         self.traj_dataset_configs.add_argument('--trajectory_pointcloud_radius', default=1.0, type=float, help='Radius (in meters) around trajectory to collect points for trajectory-specific point clouds')
-        self.traj_dataset_configs.add_argument('--min_motion_threshold', default=1.0, type=float, help='Minimum motion threshold in meters for trajectory filtering')
+        self.traj_dataset_configs.add_argument('--min_motion_threshold', default=0.5, type=float, help='Minimum motion threshold in meters for trajectory filtering')
+        # 0.5 for diff
         self.traj_dataset_configs.add_argument('--min_motion_percentile', default=0.0, type=float, help='Filter trajectories below this percentile of motion')
         self.traj_dataset_configs.add_argument('--no_use_cache', dest='use_cache', action='store_false', help='Disable caching for trajectories')
         self.traj_dataset_configs.add_argument('--detect_motion_segments', default=False, action='store_true', help='Enable detection and extraction of active motion segments')
@@ -43,6 +44,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.scene_configs = self.add_argument_group('Scene Encoder')
         self.scene_configs.add_argument('--scene_feats_dim', default=256, type=int, help='Output dimension of the PointNet scene encoder')
         self.scene_configs.add_argument('--sample_points', default=50000, type=int, help='Number of points to sample from the scene point cloud') 
+        self.scene_configs.add_argument('--no_bbox', action='store_true', default=False, help='Disable bounding box processing and conditioning')
         # self.scene_configs.add_argument('--pointnet_chkpoints', default='pretrained/point.model', type=str, help='Path to pretrained PointNet weights') # Consider adding back later
 
         # === Motion Pathway Configuration (Based on GIMO) ===
@@ -73,7 +75,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.train_configs.add_argument('--save_fre', type=int, default=50, help='Checkpoint saving frequency (epochs)')
         # self.train_configs.add_argument('--vis_fre', type=int, default=1000) # Maybe redefine for trajectory viz
         self.train_configs.add_argument('--val_fre', type=int, default=50, help='Validation frequency (epochs)')
-        self.train_configs.add_argument('--num_val_visualizations', type=int, default=100, help='Number of samples to visualize during validation')
+        self.train_configs.add_argument('--num_val_visualizations', type=int, default=500, help='Number of samples to visualize during validation')
         self.train_configs.add_argument('--load_model_dir', type=str, default=None, help='Path to load a pretrained model checkpoint')
         self.train_configs.add_argument('--load_optim_dir', type=str, default=None, help='Path to load optimizer state separately')
 

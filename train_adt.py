@@ -143,18 +143,30 @@ def validate(model, dataloader, device, config, epoch):
             try:
                 full_trajectory_batch = batch['full_poses'].float().to(device)
                 point_cloud_batch = batch['point_cloud'].float().to(device) # Get point cloud from collated batch
-                bbox_corners_batch = batch['bbox_corners'].float().to(device) # Get bbox_corners
+                
+                # Only get bbox_corners if not using no_bbox
+                if not config.no_bbox:
+                    bbox_corners_batch = batch['bbox_corners'].float().to(device) # Get bbox_corners
+                else:
+                    bbox_corners_batch = None
+                
                 # Move mask to device for loss calc
                 batch['full_attention_mask'] = batch['full_attention_mask'].to(device)
                 
                 # Prepare input trajectory for the model based on config
                 if config.use_first_frame_only:
                     input_trajectory_batch = full_trajectory_batch[:, 0:1, :]
-                    bbox_corners_input_batch = bbox_corners_batch[:, 0:1, :, :] 
+                    if not config.no_bbox:
+                        bbox_corners_input_batch = bbox_corners_batch[:, 0:1, :, :] 
+                    else:
+                        bbox_corners_input_batch = None
                 else:
                     fixed_history_length = int(np.floor(full_trajectory_batch.shape[1] * config.history_fraction))
                     input_trajectory_batch = full_trajectory_batch[:, :fixed_history_length, :]
-                    bbox_corners_input_batch = bbox_corners_batch[:, :fixed_history_length, :, :]
+                    if not config.no_bbox:
+                        bbox_corners_input_batch = bbox_corners_batch[:, :fixed_history_length, :, :]
+                    else:
+                        bbox_corners_input_batch = None
                 
                 # Get object category IDs if embedding is enabled
                 if not config.no_text_embedding:
@@ -303,13 +315,25 @@ def validate(model, dataloader, device, config, epoch):
                     # Get segment_idx from batch if available
                     segment_idx = batch['segment_idx'][i].item() if 'segment_idx' in batch and batch['segment_idx'][i].item() != -1 else None
                     
-                    # Create filename base
-                    if segment_idx is not None:
-                        filename_base = f"{obj_name}_seg{segment_idx}"
-                        vis_title_base = f"{obj_name} (Seg: {segment_idx})"
-                    else:
-                        filename_base = f"{obj_name}"
-                        vis_title_base = f"{obj_name}"
+                    # --- MODIFICATION START for filename and title ---
+                    current_sequence_path = batch['sequence_path'][i]
+                    sequence_name_extracted = os.path.splitext(os.path.basename(current_sequence_path))[0]
+                    current_batch_idx = batch_idx # from enumerate(progress_bar)
+
+                    fn_obj_name = obj_name
+                    fn_seq_name = f"seq_{sequence_name_extracted}"
+                    fn_seg_id = f"seg{segment_idx}" if segment_idx is not None else "segNA"
+                    fn_batch_id = f"batch{current_batch_idx}"
+
+                    filename_base = f"{fn_obj_name}_{fn_seq_name}_{fn_seg_id}_{fn_batch_id}"
+
+                    title_obj_name = obj_name
+                    title_seq_name = f"Seq: {sequence_name_extracted}"
+                    title_seg_id = f"Seg: {segment_idx if segment_idx is not None else 'NA'}"
+                    title_batch_id = f"Batch: {current_batch_idx}"
+
+                    vis_title_base = f"{title_obj_name} ({title_seq_name}, {title_seg_id}, {title_batch_id})"
+                    # --- MODIFICATION END ---
                     
                     # Check if orientation visualization is enabled
                     show_ori_arrows = getattr(config, 'show_ori_arrows', False)
@@ -319,13 +343,16 @@ def validate(model, dataloader, device, config, epoch):
                     if is_first_validation:
                         # Full Trajectory Visualization - now with point cloud and orientation
                         full_traj_path = os.path.join(trajectory_vis_dir, f"{filename_base}_full_trajectory_with_scene.png")
-                        # 获取当前样本的边界框角点数据
-                        sample_bbox_corners = bbox_corners_batch[i].cpu()  # 提取当前样本的边界框并移到CPU
+                        # Get bbox corners for current sample if available
+                        sample_bbox_corners = None
+                        if not config.no_bbox and 'bbox_corners' in batch:
+                            sample_bbox_corners = bbox_corners_batch[i].cpu()  # Extract bbox corners for current sample
+                        
                         visualize_full_trajectory(
                             positions=gt_full_positions,
                             attention_mask=gt_full_mask,
                             point_cloud=sample_pointcloud,  # Pass the point cloud
-                            bbox_corners_sequence=sample_bbox_corners,  # 添加边界框角点数据
+                            bbox_corners_sequence=sample_bbox_corners,  # Add bbox corners data if available
                             title=f"Full GT - {vis_title_base}",
                             save_path=full_traj_path,
                             segment_idx=segment_idx
@@ -655,18 +682,27 @@ def main():
     logger(f"Total Parameters: {total_params:,}")
     logger(f"Trainable Parameters: {trainable_params:,}")
     logger(f"Text Embedding Enabled: {not getattr(config, 'no_text_embedding', False)}")
+    logger(f"Bounding Box Processing Enabled: {not getattr(config, 'no_bbox', False)}")
     
     # Log model components
     components = {
         'Motion Linear': (model.motion_linear, []), # Add relevant attributes if any
         'Scene Encoder': (model.scene_encoder, ['hparams']), # PointNet2SemSegSSGShape uses hparams
-        'FP Layer': (model.fp_layer, []),
-        'BBox PointNet': (model.bbox_pointnet, ['conv1']), # Example attribute
+    }
+    
+    # Add bounding box related components if enabled
+    if not getattr(config, 'no_bbox', False):
+        components.update({
+            'FP Layer': (model.fp_layer, []),
+            'BBox PointNet': (model.bbox_pointnet, ['conv1']), # Example attribute
+        })
+    
+    components.update({
         'Motion BBox Encoder': (model.motion_bbox_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
         'Embedding Layer (Fusion 2)': (model.embedding_layer, ['in_features', 'out_features']),
         'Output Encoder': (model.output_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
         'Output Layer': (model.outputlayer, ['in_features', 'out_features'])
-    }
+    })
     
     # Add text embedding components if enabled
     if model.use_text_embedding: # Corrected condition
@@ -744,18 +780,30 @@ def main():
                 # Data is already collated, move relevant tensors to device
                 full_trajectory_batch = batch['full_poses'].float().to(device)
                 point_cloud_batch = batch['point_cloud'].float().to(device) # Get point cloud from collated batch
-                bbox_corners_batch = batch['bbox_corners'].float().to(device) # Get bbox_corners
+                
+                # Only get bbox_corners if not using no_bbox
+                if not config.no_bbox:
+                    bbox_corners_batch = batch['bbox_corners'].float().to(device) # Get bbox_corners
+                else:
+                    bbox_corners_batch = None
+                
                 # Move mask to device for loss calc
                 batch['full_attention_mask'] = batch['full_attention_mask'].to(device)
                 
                 # Prepare input trajectory for the model based on config
                 if config.use_first_frame_only:
                     input_trajectory_batch = full_trajectory_batch[:, 0:1, :]
-                    bbox_corners_input_batch = bbox_corners_batch[:, 0:1, :, :] 
+                    if not config.no_bbox:
+                        bbox_corners_input_batch = bbox_corners_batch[:, 0:1, :, :] 
+                    else:
+                        bbox_corners_input_batch = None
                 else:
                     fixed_history_length = int(np.floor(full_trajectory_batch.shape[1] * config.history_fraction))
                     input_trajectory_batch = full_trajectory_batch[:, :fixed_history_length, :]
-                    bbox_corners_input_batch = bbox_corners_batch[:, :fixed_history_length, :, :]
+                    if not config.no_bbox:
+                        bbox_corners_input_batch = bbox_corners_batch[:, :fixed_history_length, :, :]
+                    else:
+                        bbox_corners_input_batch = None
                 
                 # Get object category IDs if embedding is enabled
                 if not config.no_text_embedding:

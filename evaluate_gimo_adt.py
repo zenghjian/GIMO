@@ -11,6 +11,7 @@ from typing import Dict, List, Tuple, Optional, Union, Any
 import json
 from torch.utils.data import DataLoader
 import time
+import logging
 from functools import partial # Import partial for binding args to collate_fn
 from torch.utils.data.dataloader import default_collate # Import default_collate
 
@@ -21,6 +22,37 @@ from dataset.gimo_adt_trajectory_dataset import GimoAriaDigitalTwinTrajectoryDat
 from config.adt_config import ADTObjectMotionConfig
 from train_adt import gimo_collate_fn # Import the custom collate function
 from utils.visualization import visualize_trajectory, visualize_prediction, visualize_full_trajectory # Import visualization utils
+
+def setup_logger(output_dir):
+    """Set up logger to both write to console and to file."""
+    # Create a logger
+    logger = logging.getLogger('evaluation')
+    logger.setLevel(logging.INFO)
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Create console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    
+    # Create file handler
+    log_file = os.path.join(output_dir, 'evaluation.log')
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    
+    # Add handlers to logger
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    
+    # Log start information
+    logger.info("=" * 50)
+    logger.info(f"Evaluation started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("=" * 50)
+    
+    return logger
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate GIMO ADT trajectory prediction model")
@@ -58,7 +90,7 @@ def parse_args():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=16, # Can override config batch size for evaluation
+        default=1, # Can override config batch size for evaluation
         help="Batch size for evaluation"
     )
     # parser.add_argument(
@@ -77,7 +109,7 @@ def parse_args():
     parser.add_argument(
         "--num_vis_samples",
         type=int,
-        default=50, # Number of trajectory samples to visualize
+        default=500, # Number of trajectory samples to visualize
         help="Number of trajectory samples to visualize"
     )
     parser.add_argument(
@@ -120,36 +152,43 @@ def parse_args():
 
     return parser.parse_args()
 
-def load_model_and_config(checkpoint_path, device):
+def load_model_and_config(checkpoint_path, device, logger):
     """
     Load GIMO_ADT_Model and its config from a checkpoint.
     
     Args:
         checkpoint_path: Path to the model checkpoint (.pth)
         device: Device to load the model on
+        logger: Logger instance for logging information
         
     Returns:
         model: Loaded GIMO_ADT_Model
         config: Configuration object from the checkpoint
         best_epoch (int): The epoch number at which this checkpoint was saved (usually the best validation epoch). Returns 0 if not found.
     """
-    print(f"Loading checkpoint from {checkpoint_path}")
+    logger.info(f"Loading checkpoint from {checkpoint_path}")
     if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+        error_msg = f"Checkpoint file not found: {checkpoint_path}"
+        logger.error(error_msg)
+        raise FileNotFoundError(error_msg)
         
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     if 'config' not in checkpoint:
-        raise ValueError("Checkpoint does not contain 'config'. Cannot instantiate model.")
+        error_msg = "Checkpoint does not contain 'config'. Cannot instantiate model."
+        logger.error(error_msg)
+        raise ValueError(error_msg)
     if 'model_state_dict' not in checkpoint:
-        raise ValueError("Checkpoint does not contain 'model_state_dict'.")
+        error_msg = "Checkpoint does not contain 'model_state_dict'."
+        logger.error(error_msg)
+        raise ValueError(error_msg)
         
     # Load config (convert dict back to Namespace or use directly if already object)
     config_dict = checkpoint['config']
     config = argparse.Namespace(**config_dict) # Convert dict back to Namespace
     
-    print("Configuration loaded from checkpoint:")
-    print(config)
+    logger.info("Configuration loaded from checkpoint:")
+    logger.info(str(config))
 
     # Create model instance using loaded config
     model = GIMO_ADT_Model(config).to(device)
@@ -160,14 +199,14 @@ def load_model_and_config(checkpoint_path, device):
     
     param_count = sum(p.numel() for p in model.parameters())
     param_count_millions = param_count / 1_000_000
-    print(f"Loaded GIMO_ADT_Model with {param_count_millions:.2f}M parameters.")
+    logger.info(f"Loaded GIMO_ADT_Model with {param_count_millions:.2f}M parameters.")
     
     # Get the epoch number
     best_epoch = checkpoint.get('epoch', 0) # Default to 0 if epoch key doesn't exist
     if best_epoch > 0:
-        print(f"Checkpoint was saved at epoch: {best_epoch}")
+        logger.info(f"Checkpoint was saved at epoch: {best_epoch}")
     else:
-        print("Warning: Epoch number not found in checkpoint.")
+        logger.warning("Warning: Epoch number not found in checkpoint.")
         
     return model, config, best_epoch
 
@@ -208,6 +247,10 @@ def compute_metrics_for_sample(pred_future, gt_future, future_mask):
         l1_mean (torch.Tensor): Mean L1 distance (scalar)
         rmse_ade (torch.Tensor): Mean L2 distance (RMSE analog for ADE) (scalar)
         fde (torch.Tensor): Final Displacement Error (scalar)
+        l1_first_half (torch.Tensor): Mean L1 for the first half of the future trajectory
+        rmse_first_half (torch.Tensor): Mean RMSE for the first half of the future trajectory
+        l1_second_half (torch.Tensor): Mean L1 for the second half of the future trajectory
+        rmse_second_half (torch.Tensor): Mean RMSE for the second half of the future trajectory
     """
     # Ensure tensors are on the same device
     device = pred_future.device
@@ -226,7 +269,9 @@ def compute_metrics_for_sample(pred_future, gt_future, future_mask):
     num_valid_points = future_mask.sum()
     if num_valid_points == 0:
         # Return zeros or NaNs if no valid points to avoid division by zero
-        return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device) # l1_mean, rmse_ade, fde
+        return (torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device),
+                torch.tensor(0.0, device=device), torch.tensor(0.0, device=device),
+                torch.tensor(0.0, device=device), torch.tensor(0.0, device=device))
         
     num_valid_coords = num_valid_points * 3 # Total number of valid coordinate values
 
@@ -258,9 +303,64 @@ def compute_metrics_for_sample(pred_future, gt_future, future_mask):
     # Calculate FDE as the L2 distance between these final points
     fde = torch.norm(final_pred_point - final_gt_point, dim=-1)
 
-    return l1_mean, rmse_ade, fde
+    # --- Metrics for Halves ---
+    l1_first_half = torch.tensor(0.0, device=device)
+    rmse_first_half = torch.tensor(0.0, device=device)
+    l1_second_half = torch.tensor(0.0, device=device)
+    rmse_second_half = torch.tensor(0.0, device=device)
 
-def evaluate(model, config, args, best_epoch):
+    future_len = pred_future.shape[0] # This is the padded length
+    
+    # Find actual valid indices based on future_mask
+    valid_indices = torch.where(future_mask)[0]
+    if len(valid_indices) > 1: # Need at least 2 points for a split
+        actual_future_len = len(valid_indices)
+        mid_point_actual = actual_future_len // 2
+        
+        # Indices for the first half (actual valid indices)
+        first_half_indices_actual = valid_indices[:mid_point_actual]
+        # Indices for the second half (actual valid indices)
+        second_half_indices_actual = valid_indices[mid_point_actual:]
+
+        if len(first_half_indices_actual) > 0:
+            # Create masks for each half based on actual valid indices
+            first_half_mask = torch.zeros_like(future_mask, dtype=torch.bool)
+            first_half_mask[first_half_indices_actual] = True
+            first_half_mask_expanded = first_half_mask.unsqueeze(-1).expand_as(l1_diff)
+            num_valid_points_first_half = first_half_mask.sum()
+            num_valid_coords_first_half = num_valid_points_first_half * 3
+
+            if num_valid_points_first_half > 0:
+                # L1 for first half
+                masked_l1_diff_first_half = l1_diff * first_half_mask_expanded
+                sum_l1_diff_first_half = masked_l1_diff_first_half.sum()
+                l1_first_half = sum_l1_diff_first_half / num_valid_coords_first_half
+                # RMSE for first half
+                masked_l2_dist_first_half = l2_dist_per_step * first_half_mask
+                sum_l2_dist_first_half = masked_l2_dist_first_half.sum()
+                rmse_first_half = sum_l2_dist_first_half / num_valid_points_first_half
+
+        if len(second_half_indices_actual) > 0:
+            # Create masks for each half based on actual valid indices
+            second_half_mask = torch.zeros_like(future_mask, dtype=torch.bool)
+            second_half_mask[second_half_indices_actual] = True
+            second_half_mask_expanded = second_half_mask.unsqueeze(-1).expand_as(l1_diff)
+            num_valid_points_second_half = second_half_mask.sum()
+            num_valid_coords_second_half = num_valid_points_second_half * 3
+            
+            if num_valid_points_second_half > 0:
+                # L1 for second half
+                masked_l1_diff_second_half = l1_diff * second_half_mask_expanded
+                sum_l1_diff_second_half = masked_l1_diff_second_half.sum()
+                l1_second_half = sum_l1_diff_second_half / num_valid_coords_second_half
+                # RMSE for second half
+                masked_l2_dist_second_half = l2_dist_per_step * second_half_mask
+                sum_l2_dist_second_half = masked_l2_dist_second_half.sum()
+                rmse_second_half = sum_l2_dist_second_half / num_valid_points_second_half
+
+    return l1_mean, rmse_ade, fde, l1_first_half, rmse_first_half, l1_second_half, rmse_second_half
+
+def evaluate(model, config, args, best_epoch, logger):
     """
     Run the evaluation loop.
     
@@ -269,13 +369,14 @@ def evaluate(model, config, args, best_epoch):
         config: The configuration object (usually loaded from checkpoint).
         args: Command line arguments for evaluation.
         best_epoch (int): The epoch number the model checkpoint was saved at.
+        logger: Logger instance for logging information.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
 
     # --- Setup Dataset and DataLoader ---
-    print("Setting up test dataset...")
+    logger.info("Setting up test dataset...")
     # Use config values from checkpoint, potentially overridden by args
     test_sequences = None
     checkpoint_dir = os.path.dirname(args.model_path)
@@ -284,14 +385,14 @@ def evaluate(model, config, args, best_epoch):
     
     if os.path.exists(val_split_path):
         try:
-            print(f"Loading test sequences from saved validation split: {val_split_path}")
+            logger.info(f"Loading test sequences from saved validation split: {val_split_path}")
             with open(val_split_path, 'r') as f:
                 test_sequences = [line.strip() for line in f if line.strip()]
             if not test_sequences:
-                 print(f"Warning: {val_split_path} is empty.")
+                 logger.warning(f"Warning: {val_split_path} is empty.")
                  test_sequences = None # Force fallback
             else:
-                 print(f"Loaded {len(test_sequences)} test sequences.")
+                 logger.info(f"Loaded {len(test_sequences)} test sequences.")
                  # Optional: Adjust paths if dataroot_override is given and paths are relative
                  if dataroot_override:
                       adjusted_sequences = []
@@ -303,43 +404,43 @@ def evaluate(model, config, args, best_epoch):
                               if os.path.exists(adjusted_path):
                                  adjusted_sequences.append(adjusted_path)
                               else:
-                                 print(f"Warning: Could not adjust path for {seq} using override {dataroot_override}")
+                                 logger.warning(f"Warning: Could not adjust path for {seq} using override {dataroot_override}")
                                  adjusted_sequences.append(seq) # Keep original if adjustment fails
                           else:
                               adjusted_sequences.append(seq)
                       test_sequences = adjusted_sequences
-                      print(f"Adjusted sequence paths using dataroot override: {dataroot_override}")
+                      logger.info(f"Adjusted sequence paths using dataroot override: {dataroot_override}")
                              
         except Exception as e:
-            print(f"Warning: Error loading {val_split_path}: {e}. Will attempt fallback.")
+            logger.warning(f"Warning: Error loading {val_split_path}: {e}. Will attempt fallback.")
             test_sequences = None
     else:
-        print(f"Warning: val_sequences.txt not found in {checkpoint_dir}. Attempting fallback using config.")
+        logger.warning(f"Warning: val_sequences.txt not found in {checkpoint_dir}. Attempting fallback using config.")
 
     # Fallback logic if val_sequences.txt was not loaded successfully
     if test_sequences is None:
-        print("Attempting fallback: Using adt_dataroot from config/args...")
+        logger.info("Attempting fallback: Using adt_dataroot from config/args...")
         dataroot = dataroot_override if dataroot_override is not None else config.adt_dataroot
         if os.path.isdir(dataroot):
              # Use all sequences in dataroot as test set (assuming no split info available)
-             print(f"Warning: Using ALL sequences found in {dataroot} as test set due to missing split info.")
+             logger.warning(f"Warning: Using ALL sequences found in {dataroot} as test set due to missing split info.")
              # Import sequence utils dynamically if needed for fallback
              try:
                  from ariaworldgaussians.adt_sequence_utils import find_adt_sequences
                  test_sequences = find_adt_sequences(dataroot)
              except ImportError:
-                 print("Warning: Cannot import find_adt_sequences. Manually scanning directory.")
+                 logger.warning("Warning: Cannot import find_adt_sequences. Manually scanning directory.")
                  test_sequences = [os.path.join(dataroot, item) for item in os.listdir(dataroot) if os.path.isdir(os.path.join(dataroot, item))]
                  
              if not test_sequences:
-                  print(f"Error: No sequences found in fallback dataroot {dataroot}.")
+                  logger.error(f"Error: No sequences found in fallback dataroot {dataroot}.")
                   return None
-             print(f"Found {len(test_sequences)} sequences in fallback dataroot.")
+             logger.info(f"Found {len(test_sequences)} sequences in fallback dataroot.")
         elif os.path.exists(dataroot): # Check if dataroot itself is a single sequence path
              test_sequences = [dataroot]
-             print(f"Using single sequence {dataroot} as test set (fallback).")
+             logger.info(f"Using single sequence {dataroot} as test set (fallback).")
         else:
-             print(f"Error: Fallback failed. Dataroot path {dataroot} not found or invalid.")
+             logger.error(f"Error: Fallback failed. Dataroot path {dataroot} not found or invalid.")
              return None
 
     # Use cache dir based on output dir to avoid conflicts with training cache
@@ -347,11 +448,11 @@ def evaluate(model, config, args, best_epoch):
     if args.global_cache_dir:
         eval_cache_dir = args.global_cache_dir
         os.makedirs(eval_cache_dir, exist_ok=True)
-        print(f"Using global cache directory for evaluation: {eval_cache_dir}")
+        logger.info(f"Using global cache directory for evaluation: {eval_cache_dir}")
     else:
         eval_cache_dir = os.path.join(args.output_dir, 'trajectory_cache_eval')
         os.makedirs(eval_cache_dir, exist_ok=True)
-        print(f"Using evaluation-specific cache directory: {eval_cache_dir}")
+        logger.info(f"Using evaluation-specific cache directory: {eval_cache_dir}")
 
     test_dataset = GIMOMultiSequenceDataset(
         sequence_paths=test_sequences,
@@ -361,7 +462,7 @@ def evaluate(model, config, args, best_epoch):
     )
 
     if len(test_dataset) == 0:
-        print("Error: Test dataset is empty. Check test split file and sequence paths.")
+        logger.error("Error: Test dataset is empty. Check test split file and sequence paths.")
         return None
 
     # Use the collate function, binding the test dataset instance
@@ -374,24 +475,35 @@ def evaluate(model, config, args, best_epoch):
         drop_last=False, # Process all samples
         collate_fn=eval_collate_func
     )
-    print(f"Test DataLoader ready with {len(test_dataset)} samples.")
+    logger.info(f"Test DataLoader ready with {len(test_dataset)} samples.")
 
     # --- Evaluation Loop ---
     total_l1 = 0.0
     total_rmse_ade = 0.0 # Accumulate RMSE/ADE (L2)
     total_fde = 0.0
+    # Add accumulators for half-trajectory metrics
+    total_l1_first_half = 0.0
+    total_rmse_first_half = 0.0
+    total_l1_second_half = 0.0
+    total_rmse_second_half = 0.0
     num_batches = 0
     total_valid_samples = 0 # Count total valid samples across all batches
+    
+    # Track visualization statistics
+    visualized_count = 0
+    skipped_visualizations = 0
     
     # For visualization
     vis_output_dir = os.path.join(args.output_dir, "visualizations")
     if args.visualize:
         os.makedirs(vis_output_dir, exist_ok=True)
+        logger.info(f"Visualizations will be saved to {vis_output_dir}")
 
     with torch.no_grad():
         progress_bar = tqdm(eval_loader, desc="Evaluating")
         for batch_idx, batch in enumerate(progress_bar):
             try:
+                logger.info(f"Processing batch {batch_idx+1}/{len(eval_loader)}")
                 # --- Prepare Batch Data ---
                 full_trajectory_batch = batch['full_poses'].float().to(device)  # Use full_poses (position + orientation)
                 point_cloud_batch = batch['point_cloud'].float().to(device)
@@ -409,7 +521,7 @@ def evaluate(model, config, args, best_epoch):
                                  normalization_params[k] = normalization_params[k].to(device)
                 else:
                     # Fallback if normalization params not in batch (might happen with older data)
-                    print(f"Warning: Normalization parameters not found in batch {batch_idx}. Cannot denormalize.")
+                    logger.warning(f"Warning: Normalization parameters not found in batch {batch_idx}. Cannot denormalize.")
                     # Create dummy params indicating no normalization happened
                     normalization_params = {'is_normalized': False}
                     
@@ -440,7 +552,10 @@ def evaluate(model, config, args, best_epoch):
                     input_trajectory_batch = full_trajectory_batch[:, :fixed_history_length, :]
                     bbox_corners_input_batch = bbox_corners_batch[:, :fixed_history_length, :, :]  # Also slice bbox corners
 
+                logger.info(f"Input trajectory shape: {input_trajectory_batch.shape}, Full trajectory shape: {full_trajectory_batch.shape}")
+                
                 # --- Model Inference ---
+                logger.info("Running model inference...")
                 predicted_full_trajectory = model(
                     input_trajectory=input_trajectory_batch,
                     point_cloud=point_cloud_batch,
@@ -448,13 +563,19 @@ def evaluate(model, config, args, best_epoch):
                     object_category_ids=object_category_ids
                 )
                 total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
+                logger.info(f"Loss: {total_loss:.4f}")
 
                 # --- Process Each Sample in Batch ---
                 batch_l1 = 0.0
                 batch_rmse_ade = 0.0
                 batch_fde = 0.0
+                batch_l1_first_half = 0.0
+                batch_rmse_first_half = 0.0
+                batch_l1_second_half = 0.0
+                batch_rmse_second_half = 0.0
                 valid_samples_in_batch = 0
 
+                logger.info(f"Processing {full_trajectory_batch.shape[0]} samples in batch")
                 for i in range(full_trajectory_batch.shape[0]):
                     # Extract full poses (positions + orientations)
                     gt_full_poses = full_trajectory_batch[i]
@@ -489,7 +610,9 @@ def evaluate(model, config, args, best_epoch):
 
                     # Dynamic split based on actual length
                     actual_length = torch.sum(mask_full).int().item()
-                    if actual_length < 2: continue # Skip trajectories that are too short
+                    if actual_length < 2:
+                        logger.info(f"Sample {i} skipped: trajectory too short (length={actual_length})")
+                        continue # Skip trajectories that are too short
 
                     # --- Determine history length based on config ---
                     if config.use_first_frame_only:
@@ -515,13 +638,15 @@ def evaluate(model, config, args, best_epoch):
                     hist_mask = mask_full[:dynamic_history_length]
                     future_mask = mask_full[dynamic_history_length:actual_length]
 
-                    if future_mask.sum() == 0: continue # Skip if no valid future points
+                    if future_mask.sum() == 0:
+                        logger.info(f"Sample {i} skipped: no valid future points")
+                        continue # Skip if no valid future points
 
                     # Denormalize if necessary
                     if is_normalized:
                         # Check if params are tensors before denormalizing
                         if not all(isinstance(sample_norm_params.get(k), torch.Tensor) for k in ['scene_min', 'scene_max', 'scene_scale']):
-                             print(f"Warning: Skipping denormalization for sample {i} in batch {batch_idx} due to missing/invalid normalization tensors.")
+                             logger.warning(f"Warning: Skipping denormalization for sample {i} in batch {batch_idx} due to missing/invalid normalization tensors.")
                              continue # Skip this sample if params are invalid
 
                         gt_future_denorm = denormalize_trajectory(gt_future, sample_norm_params)
@@ -549,7 +674,10 @@ def evaluate(model, config, args, best_epoch):
                         pred_future_ori_denorm = pred_future_ori
 
                     # Compute Metrics for this sample
-                    l1_mean, rmse_ade, fde = compute_metrics_for_sample(pred_future_denorm, gt_future_denorm, future_mask)
+                    l1_mean, rmse_ade, fde, l1_first_half, rmse_first_half, l1_second_half, rmse_second_half = compute_metrics_for_sample(pred_future_denorm, gt_future_denorm, future_mask)
+                    logger.info(f"Sample {i}: L1={l1_mean.item():.4f}, RMSE={rmse_ade.item():.4f}, FDE={fde.item():.4f}")
+                    logger.info(f"  L1 First Half={l1_first_half.item():.4f}, RMSE First Half={rmse_first_half.item():.4f}")
+                    logger.info(f"  L1 Second Half={l1_second_half.item():.4f}, RMSE Second Half={rmse_second_half.item():.4f}")
                     
                     # For first_frame_only mode, also check reconstruction of the first frame
                     first_frame_rec_error = 0.0
@@ -562,25 +690,49 @@ def evaluate(model, config, args, best_epoch):
                         first_frame_rec_error = first_frame_diff
                         # Optionally log first frame error
                         if batch_idx == 0 and i == 0:  # Just log for the first sample
-                            print(f"First frame reconstruction error: {first_frame_rec_error:.4f}")
+                            logger.info(f"First frame reconstruction error: {first_frame_rec_error:.4f}")
 
                     batch_l1 += l1_mean.item()
                     batch_rmse_ade += rmse_ade.item()
                     batch_fde += fde.item()
+                    # Accumulate new metrics
+                    batch_l1_first_half += l1_first_half.item()
+                    batch_rmse_first_half += rmse_first_half.item()
+                    batch_l1_second_half += l1_second_half.item()
+                    batch_rmse_second_half += rmse_second_half.item()
                     valid_samples_in_batch += 1
 
                     # --- Visualization ---
                     if args.visualize:
                          try:
+                             # Check if we've reached visualization limit
+                             if visualized_count >= args.num_vis_samples:
+                                 skipped_visualizations += 1
+                                 continue
+                                 
                              obj_name = object_names[i] if i < len(object_names) else f"obj_{batch_idx}_{i}"
                              seg_idx = segment_indices[i].item() if i < len(segment_indices) and segment_indices[i].item() != -1 else None
 
-                             if seg_idx is not None:
-                                 filename_base = f"{obj_name}_seg{seg_idx}"
-                                 vis_title_base = f"{obj_name} (Seg: {seg_idx})"
-                             else:
-                                 filename_base = f"{obj_name}"
-                                 vis_title_base = f"{obj_name}"
+                             # --- MODIFICATION START for filename and title ---
+                             current_sequence_path = batch['sequence_path'][i] # Get sequence path for the current sample
+                             sequence_name_extracted = os.path.splitext(os.path.basename(current_sequence_path))[0]
+
+                             fn_obj_name = obj_name
+                             fn_seq_name = f"seq_{sequence_name_extracted}"
+                             fn_seg_id = f"seg{seg_idx}" if seg_idx is not None else "segNA"
+                             fn_batch_id = f"batch{batch_idx}" # batch_idx is from the outer loop over dataloader
+
+                             filename_base = f"{fn_obj_name}_{fn_seq_name}_{fn_seg_id}_{fn_batch_id}"
+                             
+                             title_obj_name = obj_name
+                             title_seq_name = f"Seq: {sequence_name_extracted}"
+                             title_seg_id = f"Seg: {seg_idx if seg_idx is not None else 'NA'}"
+                             title_batch_id = f"Batch: {batch_idx}"
+
+                             vis_title_base = f"{title_obj_name} ({title_seq_name}, {title_seg_id}, {title_batch_id})"
+                             # --- MODIFICATION END ---
+                             
+                             logger.info(f"Visualizing sample {i}: {vis_title_base}")
                              
                              # Standard prediction vs ground truth visualization
                              pred_vs_gt_path = os.path.join(vis_output_dir, f"{filename_base}_prediction_vs_gt.png")
@@ -637,9 +789,10 @@ def evaluate(model, config, args, best_epoch):
                                      save_path=full_traj_path,
                                      segment_idx=seg_idx
                                  )
+                             visualized_count += 1
                              
                          except Exception as vis_e:
-                              print(f"Warning: Error during visualization for sample {i} in batch {batch_idx}: {vis_e}")
+                              logger.warning(f"Warning: Error during visualization for sample {i} in batch {batch_idx}: {vis_e}")
 
 
                 # --- Aggregate Batch Metrics ---
@@ -648,18 +801,35 @@ def evaluate(model, config, args, best_epoch):
                     total_l1 += batch_l1 # batch_l1 is already sum of means for the batch
                     total_rmse_ade += batch_rmse_ade # Accumulate sum of sample RMSEs
                     total_fde += batch_fde # batch_fde is already sum of means for the batch
+                    # Accumulate new metrics sums
+                    total_l1_first_half += batch_l1_first_half
+                    total_rmse_first_half += batch_rmse_first_half
+                    total_l1_second_half += batch_l1_second_half
+                    total_rmse_second_half += batch_rmse_second_half
                     total_valid_samples += valid_samples_in_batch
                     num_batches += 1
+                    batch_avg_l1 = batch_l1 / valid_samples_in_batch
+                    batch_avg_rmse = batch_rmse_ade / valid_samples_in_batch
+                    batch_avg_fde = batch_fde / valid_samples_in_batch
+                    # Log new batch average metrics
+                    batch_avg_l1_fh = batch_l1_first_half / valid_samples_in_batch
+                    batch_avg_rmse_fh = batch_rmse_first_half / valid_samples_in_batch
+                    batch_avg_l1_sh = batch_l1_second_half / valid_samples_in_batch
+                    batch_avg_rmse_sh = batch_rmse_second_half / valid_samples_in_batch
+                    
+                    logger.info(f"Batch {batch_idx} metrics: L1={batch_avg_l1:.4f}, RMSE={batch_avg_rmse:.4f}, FDE={batch_avg_fde:.4f}")
+                    logger.info(f"  Batch L1 FH={batch_avg_l1_fh:.4f}, RMSE FH={batch_avg_rmse_fh:.4f}")
+                    logger.info(f"  Batch L1 SH={batch_avg_l1_sh:.4f}, RMSE SH={batch_avg_rmse_sh:.4f}")
                     progress_bar.set_postfix({
-                         'Batch L1': f"{(batch_l1 / valid_samples_in_batch):.4f}",
-                         'Batch RMSE': f"{(batch_rmse_ade / valid_samples_in_batch):.4f}",
-                         'Batch FDE': f"{(batch_fde / valid_samples_in_batch):.4f}"
+                         'Batch L1': f"{batch_avg_l1:.4f}",
+                         'Batch RMSE': f"{batch_avg_rmse:.4f}",
+                         'Batch FDE': f"{batch_avg_fde:.4f}"
                     })
 
             except Exception as e:
-                 print(f"Error processing batch {batch_idx}: {e}")
+                 logger.error(f"Error processing batch {batch_idx}: {e}")
                  import traceback
-                 traceback.print_exc()
+                 logger.error(traceback.format_exc())
                  continue # Skip batch on error
 
     # --- Final Metrics ---
@@ -667,21 +837,42 @@ def evaluate(model, config, args, best_epoch):
         mean_l1 = total_l1 / total_valid_samples
         mean_rmse = total_rmse_ade / total_valid_samples # This is the overall mean RMSE
         mean_fde = total_fde / total_valid_samples
-        print(f"--- Evaluation Complete ---")
-        print(f" Model from Epoch: {best_epoch}") # Print the epoch
-        print(f" Mean L1 (MAE): {mean_l1:.4f}")
-        print(f" Mean RMSE: {mean_rmse:.4f}")
-        print(f" Mean FDE: {mean_fde:.4f}")
+        # Calculate mean for new metrics
+        mean_l1_first_half = total_l1_first_half / total_valid_samples
+        mean_rmse_first_half = total_rmse_first_half / total_valid_samples
+        mean_l1_second_half = total_l1_second_half / total_valid_samples
+        mean_rmse_second_half = total_rmse_second_half / total_valid_samples
+
+        logger.info(f"--- Evaluation Complete ---")
+        logger.info(f" Model from Epoch: {best_epoch}") # Print the epoch
+        logger.info(f" Mean L1 (MAE): {mean_l1:.4f}")
+        logger.info(f" Mean RMSE: {mean_rmse:.4f}")
+        logger.info(f" Mean FDE: {mean_fde:.4f}")
+        # Log new mean metrics
+        logger.info(f" Mean L1 First Half: {mean_l1_first_half:.4f}")
+        logger.info(f" Mean RMSE First Half: {mean_rmse_first_half:.4f}")
+        logger.info(f" Mean L1 Second Half: {mean_l1_second_half:.4f}")
+        logger.info(f" Mean RMSE Second Half: {mean_rmse_second_half:.4f}")
+        
+        # Log visualization statistics
+        logger.info(f" Visualized {visualized_count} samples")
+        if skipped_visualizations > 0:
+            logger.info(f" Skipped {skipped_visualizations} visualizations (limit of {args.num_vis_samples} reached)")
         
         # Also log special metrics for first_frame_only mode
         if config.use_first_frame_only:
-            print(f" Note: Model is in first_frame_only mode - metrics reflect future prediction only")
-            print(f" First frame is being used for context with separate reconstruction loss")
+            logger.info(f" Note: Model is in first_frame_only mode - metrics reflect future prediction only")
+            logger.info(f" First frame is being used for context with separate reconstruction loss")
     else:
-        print("Error: No batches were successfully processed.")
+        logger.error("Error: No batches were successfully processed.")
         mean_l1 = float('inf')
         mean_rmse = float('inf')
         mean_fde = float('inf')
+        # Initialize new metrics to inf as well
+        mean_l1_first_half = float('inf')
+        mean_rmse_first_half = float('inf')
+        mean_l1_second_half = float('inf')
+        mean_rmse_second_half = float('inf')
 
     # --- Save Results ---
     results = {
@@ -692,24 +883,76 @@ def evaluate(model, config, args, best_epoch):
         'mean_l1': mean_l1,
         'mean_rmse': mean_rmse,
         'mean_fde': mean_fde,
+        # Add new metrics to results
+        'mean_l1_first_half': mean_l1_first_half,
+        'mean_rmse_first_half': mean_rmse_first_half,
+        'mean_l1_second_half': mean_l1_second_half,
+        'mean_rmse_second_half': mean_rmse_second_half,
         'first_frame_only_mode': config.use_first_frame_only, # Flag indicating special mode
         'num_test_samples_processed': total_valid_samples, # Report processed samples
         'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
-        'comment': os.path.basename(os.path.normpath(args.model_path)) # Extract comment from model_path
+        'comment': os.path.basename(os.path.normpath(args.model_path)), # Extract comment from model_path
+        'num_visualized_samples': visualized_count
     }
 
     results_path = os.path.join(args.output_dir, "evaluation_results.json")
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=4)
-    print(f"Evaluation results saved to {results_path}")
+    logger.info(f"Evaluation results saved to {results_path}")
+
+    # Plot and save the bar chart for half-trajectory metrics
+    plot_trajectory_half_metrics(mean_l1_first_half, mean_l1_second_half, 
+                                 mean_rmse_first_half, mean_rmse_second_half, 
+                                 args.output_dir, logger)
 
     return results
 
+def plot_trajectory_half_metrics(l1_fh, l1_sh, rmse_fh, rmse_sh, output_dir, logger):
+    """Generate and save a bar chart for L1 and RMSE of trajectory halves."""
+    labels = ['L1 Error', 'RMSE']
+    first_half_metrics = [l1_fh, rmse_fh]
+    second_half_metrics = [l1_sh, rmse_sh]
+
+    x = np.arange(len(labels))  # the label locations
+    width = 0.35  # the width of the bars
+
+    fig, ax = plt.subplots()
+    rects1 = ax.bar(x - width/2, first_half_metrics, width, label='First Half')
+    rects2 = ax.bar(x + width/2, second_half_metrics, width, label='Second Half')
+
+    # Add some text for labels, title and custom x-axis tick labels, etc.
+    ax.set_ylabel('Error Metric Value')
+    ax.set_title('Trajectory Prediction Error: First Half vs. Second Half')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.legend()
+
+    def autolabel(rects):
+        """Attach a text label above each bar in *rects*, displaying its height."""
+        for rect in rects:
+            height = rect.get_height()
+            ax.annotate(f'{height:.3f}',
+                        xy=(rect.get_x() + rect.get_width() / 2, height),
+                        xytext=(0, 3),  # 3 points vertical offset
+                        textcoords="offset points",
+                        ha='center', va='bottom')
+
+    autolabel(rects1)
+    autolabel(rects2)
+
+    fig.tight_layout()
+
+    plot_path = os.path.join(output_dir, "trajectory_half_metrics_comparison.png")
+    try:
+        plt.savefig(plot_path)
+        logger.info(f"Trajectory half metrics comparison chart saved to {plot_path}")
+    except Exception as e:
+        logger.error(f"Error saving trajectory half metrics chart: {e}")
+    plt.close(fig) # Close the figure to free memory
 
 def main():
     """Main evaluation function."""
     args = parse_args()
-    print(f"Evaluating GIMO ADT model: {args.model_path}")
     
     # Set output directory with timestamp and comment if provided
     output_dir = args.output_dir
@@ -723,7 +966,11 @@ def main():
     
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
-    print(f"Results will be saved to: {output_dir}")
+    
+    # Setup logger
+    logger = setup_logger(output_dir)
+    logger.info(f"Evaluating GIMO ADT model: {args.model_path}")
+    logger.info(f"Results will be saved to: {output_dir}")
     
     # Set random seeds
     torch.manual_seed(args.seed)
@@ -731,15 +978,20 @@ def main():
     
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
+    
+    # Log command line arguments
+    logger.info("Command line arguments:")
+    for arg, value in vars(args).items():
+        logger.info(f"  {arg}: {value}")
     
     # Load model and config
     try:
-        model, config, best_epoch = load_model_and_config(args.model_path, device)
+        model, config, best_epoch = load_model_and_config(args.model_path, device, logger)
         
         # Override config with command line arguments if specified
         if args.use_first_frame_only:
-            print(f"Overriding config: use_first_frame_only set to True (from command line)")
+            logger.info(f"Overriding config: use_first_frame_only set to True (from command line)")
             config.use_first_frame_only = True
             
         # Note: show_ori_arrows will be used directly from args in the evaluate function
@@ -748,11 +1000,11 @@ def main():
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         
-        print("\n=== MODEL ARCHITECTURE ===")
-        print(f"Total Parameters: {total_params:,}")
-        print(f"Trainable Parameters: {trainable_params:,}")
-        print(f"Text Embedding Enabled: {not getattr(config, 'no_text_embedding', False)}")
-        print(f"Use First Frame Only: {config.use_first_frame_only}")
+        logger.info("\n=== MODEL ARCHITECTURE ===")
+        logger.info(f"Total Parameters: {total_params:,}")
+        logger.info(f"Trainable Parameters: {trainable_params:,}")
+        logger.info(f"Text Embedding Enabled: {not getattr(config, 'no_text_embedding', False)}")
+        logger.info(f"Use First Frame Only: {config.use_first_frame_only}")
         
         # Log model components
         components = {
@@ -776,24 +1028,27 @@ def main():
         # Log each component's structure and parameters
         for name, (component, attrs) in components.items():
             params = sum(p.numel() for p in component.parameters())
-            print(f"\n{name}:")
-            print(f"  Parameters: {params:,}")
+            logger.info(f"\n{name}:")
+            logger.info(f"  Parameters: {params:,}")
             try:
                 # Try to log attributes if available
                 for attr in attrs:
                     if hasattr(component, attr):
-                        print(f"  {attr}: {getattr(component, attr)}")
+                        logger.info(f"  {attr}: {getattr(component, attr)}")
             except:
                 pass
         
-        print("=== END MODEL ARCHITECTURE ===\n")
+        logger.info("=== END MODEL ARCHITECTURE ===\n")
             
     except Exception as e:
-        print(f"Error loading model: {e}")
+        logger.error(f"Error loading model: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return
 
     # Run evaluation
-    evaluate(model, config, args, best_epoch)
+    evaluate(model, config, args, best_epoch, logger)
+    logger.info("Evaluation completed.")
 
 if __name__ == "__main__":
     main()
