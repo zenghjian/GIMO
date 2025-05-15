@@ -40,6 +40,25 @@ def log_metrics(epoch, title, metrics, logger_func):
     log_str += " | Components: " + " | ".join([f"{k}: {v:.4f}" for k, v in metrics.items() if k != 'total_loss'])
     logger_func(log_str)
 
+def transform_coords_for_visualization(tensor_3d: torch.Tensor) -> torch.Tensor:
+    """Applies (x, y, z) -> (x, -z, y) transformation to a 3D tensor."""
+    if tensor_3d is None or tensor_3d.numel() == 0:
+        return tensor_3d
+    
+    # Ensure it's a tensor
+    if not isinstance(tensor_3d, torch.Tensor):
+        tensor_3d = torch.tensor(tensor_3d)
+
+    if tensor_3d.shape[-1] != 3:
+        # print(f"Warning: transform_coords_for_visualization expects last dim to be 3, got {tensor_3d.shape}. Skipping transformation.")
+        return tensor_3d
+
+    x = tensor_3d[..., 0]
+    y = tensor_3d[..., 1]
+    z = tensor_3d[..., 2]
+    
+    transformed_tensor = torch.stack((x, -z, y), dim=-1)
+    return transformed_tensor
 
 def compute_metrics_for_sample(pred_future, gt_future, future_mask):
     """
@@ -344,15 +363,20 @@ def validate(model, dataloader, device, config, epoch):
                         # Full Trajectory Visualization - now with point cloud and orientation
                         full_traj_path = os.path.join(trajectory_vis_dir, f"{filename_base}_full_trajectory_with_scene.png")
                         # Get bbox corners for current sample if available
-                        sample_bbox_corners = None
+                        sample_bbox_corners_cpu = None
                         if not config.no_bbox and 'bbox_corners' in batch:
-                            sample_bbox_corners = bbox_corners_batch[i].cpu()  # Extract bbox corners for current sample
+                            sample_bbox_corners_cpu = bbox_corners_batch[i].cpu()  # Extract bbox corners for current sample
                         
+                        # Apply transformations for visualization
+                        gt_full_positions_vis = transform_coords_for_visualization(gt_full_positions.cpu())
+                        sample_pointcloud_vis = transform_coords_for_visualization(sample_pointcloud.cpu())
+                        sample_bbox_corners_vis = transform_coords_for_visualization(sample_bbox_corners_cpu)
+
                         visualize_full_trajectory(
-                            positions=gt_full_positions,
-                            attention_mask=gt_full_mask,
-                            point_cloud=sample_pointcloud,  # Pass the point cloud
-                            bbox_corners_sequence=sample_bbox_corners,  # Add bbox corners data if available
+                            positions=gt_full_positions_vis,
+                            attention_mask=gt_full_mask.cpu() if gt_full_mask is not None else None,
+                            point_cloud=sample_pointcloud_vis,  # Pass the point cloud
+                            bbox_corners_sequence=sample_bbox_corners_vis,  # Add bbox corners data if available
                             title=f"Full GT - {vis_title_base}",
                             save_path=full_traj_path,
                             segment_idx=segment_idx
@@ -360,11 +384,13 @@ def validate(model, dataloader, device, config, epoch):
                         
                         # Split Trajectory Visualization (uses dynamically sliced data)
                         split_traj_path = os.path.join(trajectory_vis_dir, f"{filename_base}_trajectory_split.png")
+                        vis_past_positions_vis = transform_coords_for_visualization(vis_past_positions.cpu())
+                        vis_future_positions_gt_vis = transform_coords_for_visualization(vis_future_positions_gt.cpu())
                         visualize_trajectory(
-                            past_positions=vis_past_positions,
-                            future_positions=vis_future_positions_gt,
-                            past_mask=vis_past_mask,
-                            future_mask=vis_future_mask_gt,
+                            past_positions=vis_past_positions_vis,
+                            future_positions=vis_future_positions_gt_vis,
+                            past_mask=vis_past_mask.cpu() if vis_past_mask is not None else None,
+                            future_mask=vis_future_mask_gt.cpu() if vis_future_mask_gt is not None else None,
                             title=f"Split GT - {vis_title_base}",
                             save_path=split_traj_path,
                             segment_idx=segment_idx
@@ -372,19 +398,25 @@ def validate(model, dataloader, device, config, epoch):
                     
                     # Always generate the prediction vs ground truth visualization
                     pred_vs_gt_path = os.path.join(vis_output_dir, f"{filename_base}_prediction_vs_gt_epoch{epoch}.png")
+                    
+                    # Apply transformations for prediction visualization
+                    vis_past_positions_pred_vis = transform_coords_for_visualization(vis_past_positions.cpu())
+                    vis_future_positions_gt_pred_vis = transform_coords_for_visualization(vis_future_positions_gt.cpu())
+                    predicted_future_positions_vis = transform_coords_for_visualization(predicted_future_positions.cpu())
+                    
                     visualize_prediction(
-                        past_positions=vis_past_positions,
-                        future_positions_gt=vis_future_positions_gt,
-                        future_positions_pred=predicted_future_positions, # Use dynamically sliced prediction
-                        past_mask=vis_past_mask,
-                        future_mask_gt=vis_future_mask_gt,
+                        past_positions=vis_past_positions_pred_vis,
+                        future_positions_gt=vis_future_positions_gt_pred_vis,
+                        future_positions_pred=predicted_future_positions_vis, # Use dynamically sliced prediction
+                        past_mask=vis_past_mask.cpu() if vis_past_mask is not None else None,
+                        future_mask_gt=vis_future_mask_gt.cpu() if vis_future_mask_gt is not None else None,
                         title=f"Pred vs GT - {vis_title_base} (Epoch {epoch})",
                         save_path=pred_vs_gt_path,
                         segment_idx=segment_idx,
                         show_orientation=show_ori_arrows,
-                        past_orientations=vis_past_orientations,
-                        future_orientations_gt=vis_future_orientations_gt,
-                        future_orientations_pred=predicted_future_orientations
+                        past_orientations=vis_past_orientations.cpu(), # Orientations not transformed
+                        future_orientations_gt=vis_future_orientations_gt.cpu(), # Orientations not transformed
+                        future_orientations_pred=predicted_future_orientations.cpu() # Orientations not transformed
                     )
                     
                     visualized_count += 1

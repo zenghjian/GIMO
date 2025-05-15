@@ -146,6 +146,14 @@ vposer_v1_0
 test
 chkpoints*
 save*
-results
+# results
 *zip
-result*
+# result*
+
+wandb/
+eval_results/
+data/
+data_overfitting/
+data_small/
+similarity_results/
+results/

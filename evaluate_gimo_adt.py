@@ -22,6 +22,16 @@ from dataset.gimo_adt_trajectory_dataset import GimoAriaDigitalTwinTrajectoryDat
 from config.adt_config import ADTObjectMotionConfig
 from train_adt import gimo_collate_fn # Import the custom collate function
 from utils.visualization import visualize_trajectory, visualize_prediction, visualize_full_trajectory # Import visualization utils
+from utils.rerun_visualization import (
+    initialize_rerun,
+    downsample_point_cloud,
+    extract_trajectory_specific_point_cloud,
+    visualize_trajectory_rerun,
+    save_rerun_recording,
+    HAS_RERUN
+)
+import rerun as rr
+
 
 def setup_logger(output_dir):
     """Set up logger to both write to console and to file."""
@@ -118,6 +128,31 @@ def parse_args():
         help="Enable visualization of bounding boxes"
     )
     
+    # --- Rerun Visualization Options ---
+    parser.add_argument(
+        "--use_rerun",
+        action="store_true",
+        help="Enable Rerun visualization"
+    )
+    parser.add_argument(
+        "--pointcloud_downsample_factor",
+        type=int,
+        default=1,
+        help="Factor for downsampling point clouds in Rerun visualization"
+    )
+    parser.add_argument(
+        "--rerun_line_width",
+        type=float,
+        default=0.02,
+        help="Width of lines in Rerun visualization"
+    )
+    parser.add_argument(
+        "--rerun_point_size",
+        type=float,
+        default=0.03,
+        help="Size of points in Rerun visualization"
+    )
+    
     # --- Other Options ---
     parser.add_argument(
         "--seed",
@@ -151,6 +186,26 @@ def parse_args():
     )
 
     return parser.parse_args()
+
+def transform_coords_for_visualization(tensor_3d: torch.Tensor) -> torch.Tensor:
+    """Applies (x, y, z) -> (x, -z, y) transformation to a 3D tensor."""
+    if tensor_3d is None or tensor_3d.numel() == 0:
+        return tensor_3d
+    
+    # Ensure it's a tensor
+    if not isinstance(tensor_3d, torch.Tensor):
+        tensor_3d = torch.tensor(tensor_3d)
+
+    if tensor_3d.shape[-1] != 3:
+        # print(f"Warning: transform_coords_for_visualization expects last dim to be 3, got {tensor_3d.shape}. Skipping transformation.")
+        return tensor_3d
+
+    x = tensor_3d[..., 0]
+    y = tensor_3d[..., 1]
+    z = tensor_3d[..., 2]
+    
+    transformed_tensor = torch.stack((x, -z, y), dim=-1)
+    return transformed_tensor
 
 def load_model_and_config(checkpoint_path, device, logger):
     """
@@ -476,7 +531,6 @@ def evaluate(model, config, args, best_epoch, logger):
         collate_fn=eval_collate_func
     )
     logger.info(f"Test DataLoader ready with {len(test_dataset)} samples.")
-
     # --- Evaluation Loop ---
     total_l1 = 0.0
     total_rmse_ade = 0.0 # Accumulate RMSE/ADE (L2)
@@ -493,11 +547,19 @@ def evaluate(model, config, args, best_epoch, logger):
     visualized_count = 0
     skipped_visualizations = 0
     
-    # For visualization
+    # For Matplotlib visualization
     vis_output_dir = os.path.join(args.output_dir, "visualizations")
     if args.visualize:
         os.makedirs(vis_output_dir, exist_ok=True)
-        logger.info(f"Visualizations will be saved to {vis_output_dir}")
+        logger.info(f"Matplotlib visualizations will be saved to {vis_output_dir}")
+
+    # Base directory for per-sample Rerun .rrd files
+    # This will be created if Rerun is used.
+    per_sample_rrd_basedir = None
+    if args.use_rerun and HAS_RERUN:
+        per_sample_rrd_basedir = os.path.join(args.output_dir, "rerun_visualizations_per_sample")
+        os.makedirs(per_sample_rrd_basedir, exist_ok=True)
+        logger.info(f"Rerun per-sample .rrd files will be saved to: {per_sample_rrd_basedir}")
 
     with torch.no_grad():
         progress_bar = tqdm(eval_loader, desc="Evaluating")
@@ -734,22 +796,27 @@ def evaluate(model, config, args, best_epoch, logger):
                              
                              logger.info(f"Visualizing sample {i}: {vis_title_base}")
                              
+                             # --- Apply coordinate transformation for visualization ---
+                             gt_hist_denorm_vis = transform_coords_for_visualization(gt_hist_denorm.cpu())
+                             gt_future_denorm_vis = transform_coords_for_visualization(gt_future_denorm.cpu())
+                             pred_future_denorm_vis = transform_coords_for_visualization(pred_future_denorm.cpu())
+                             
                              # Standard prediction vs ground truth visualization
                              pred_vs_gt_path = os.path.join(vis_output_dir, f"{filename_base}_prediction_vs_gt.png")
                               
                              visualize_prediction(
-                                 past_positions=gt_hist_denorm.cpu(),
-                                 future_positions_gt=gt_future_denorm.cpu(),
-                                 future_positions_pred=pred_future_denorm.cpu(),
+                                 past_positions=gt_hist_denorm_vis,
+                                 future_positions_gt=gt_future_denorm_vis,
+                                 future_positions_pred=pred_future_denorm_vis,
                                  past_mask=hist_mask.cpu(),
                                  future_mask_gt=future_mask.cpu(), # Use the future mask
                                  title=f"Pred vs GT - {vis_title_base} (Eval)",
                                  save_path=pred_vs_gt_path,
                                  segment_idx=seg_idx,
                                  show_orientation=args.show_ori_arrows,
-                                 past_orientations=gt_hist_ori_denorm.cpu(),
-                                 future_orientations_gt=gt_future_ori_denorm.cpu(),
-                                 future_orientations_pred=pred_future_ori_denorm.cpu()
+                                 past_orientations=gt_hist_ori_denorm.cpu(), # Orientations not transformed for now
+                                 future_orientations_gt=gt_future_ori_denorm.cpu(), # Orientations not transformed for now
+                                 future_orientations_pred=pred_future_ori_denorm.cpu() # Orientations not transformed for now
                              )
                              
                              # Add full trajectory visualization with bounding boxes if requested
@@ -762,13 +829,13 @@ def evaluate(model, config, args, best_epoch, logger):
                                  full_traj_path = os.path.join(vis_output_dir, f"{filename_base}_full_trajectory_with_bbox.png")
                                  
                                  # Get the sample's bounding box corners
-                                 sample_bbox_corners = bbox_corners_batch[i, :actual_length].cpu()
+                                 sample_bbox_corners_cpu = bbox_corners_batch[i, :actual_length].cpu()
                                  
                                  # Denormalize bounding box corners if the data is normalized
                                  if sample_norm_params.get('is_normalized', False):
                                      # Reshape bbox corners for denormalization [T, 8, 3] -> [T*8, 3]
-                                     bbox_shape = sample_bbox_corners.shape
-                                     sample_bbox_corners_flat = sample_bbox_corners.reshape(-1, 3)
+                                     bbox_shape = sample_bbox_corners_cpu.shape
+                                     sample_bbox_corners_flat = sample_bbox_corners_cpu.reshape(-1, 3)
                                      
                                      # Denormalize
                                      sample_bbox_corners_flat_denorm = denormalize_trajectory(
@@ -777,18 +844,105 @@ def evaluate(model, config, args, best_epoch, logger):
                                      )
                                      
                                      # Reshape back to original shape
-                                     sample_bbox_corners = sample_bbox_corners_flat_denorm.reshape(bbox_shape)
+                                     sample_bbox_corners_cpu = sample_bbox_corners_flat_denorm.reshape(bbox_shape)
                                  
+                                 # Apply transformation for visualization
+                                 gt_full_denorm_vis = transform_coords_for_visualization(gt_full_denorm.cpu())
+                                 sample_point_cloud_vis = transform_coords_for_visualization(point_cloud_batch[i].cpu())
+                                 sample_bbox_corners_vis = transform_coords_for_visualization(sample_bbox_corners_cpu)
+
                                  # Visualize the full trajectory with bbox
                                  visualize_full_trajectory(
-                                     positions=gt_full_denorm,
+                                     positions=gt_full_denorm_vis,
                                      attention_mask=full_mask,
-                                     point_cloud=point_cloud_batch[i].cpu(),  # Use point cloud for this sample
-                                     bbox_corners_sequence=sample_bbox_corners,  # Add bounding box corners
+                                     point_cloud=sample_point_cloud_vis,  # Use point cloud for this sample
+                                     bbox_corners_sequence=sample_bbox_corners_vis,  # Add bounding box corners
                                      title=f"Full Trajectory - {vis_title_base} (Eval)",
                                      save_path=full_traj_path,
                                      segment_idx=seg_idx
                                  )
+                             
+                             # --- Rerun Visualization (per sample) ---
+                             if args.use_rerun and HAS_RERUN and per_sample_rrd_basedir:
+                                 try:
+                                     # --- Construct unique names and paths for this sample's Rerun recording ---
+                                     sample_recording_name = filename_base # e.g., "obj_seq_seg_batch"
+                                     logger.info(f"Attempting Rerun visualization for sample: {sample_recording_name}")
+
+                                     # Initialize Rerun for THIS SPECIFIC SAMPLE.
+                                     sample_rerun_initialized, returned_sample_rrd_path = initialize_rerun(
+                                         recording_name=sample_recording_name, 
+                                         spawn=False, # No viewer per sample
+                                         output_dir=per_sample_rrd_basedir 
+                                     )
+
+                                     if sample_rerun_initialized:
+                                         # --- Prepare point cloud for Rerun (moved here, was missing) ---
+                                         traj_point_cloud = None # Initialize to None
+                                         if point_cloud_batch is not None and point_cloud_batch.shape[0] > i:
+                                             sample_pc_for_rerun = point_cloud_batch[i].cpu()
+                                             if args.pointcloud_downsample_factor > 1:
+                                                 sample_pc_for_rerun = downsample_point_cloud(
+                                                     sample_pc_for_rerun, 
+                                                     args.pointcloud_downsample_factor
+                                                 )
+                                             traj_point_cloud = sample_pc_for_rerun
+                                         
+                                         # Check for trajectory-specific point cloud from the batch (if applicable)
+                                         if 'trajectory_specific_pointcloud' in batch and i < len(batch['trajectory_specific_pointcloud']):
+                                             traj_specific_pc_data = batch['trajectory_specific_pointcloud'][i]
+                                             if traj_specific_pc_data is not None and isinstance(traj_specific_pc_data, torch.Tensor) and traj_specific_pc_data.numel() > 0:
+                                                 processed_traj_specific_pc = traj_specific_pc_data.cpu()
+                                                 if args.pointcloud_downsample_factor > 1:
+                                                     processed_traj_specific_pc = downsample_point_cloud(
+                                                         processed_traj_specific_pc, 
+                                                         args.pointcloud_downsample_factor
+                                                     )
+                                                 traj_point_cloud = processed_traj_specific_pc # Override with more specific PC if available
+                                         # --- End of point cloud preparation ---
+
+                                         # Apply transformation for Rerun visualization
+                                         gt_hist_denorm_rerun_vis = transform_coords_for_visualization(gt_hist_denorm.cpu())
+                                         gt_future_denorm_rerun_vis = transform_coords_for_visualization(gt_future_denorm.cpu())
+                                         pred_future_denorm_rerun_vis = transform_coords_for_visualization(pred_future_denorm.cpu())
+                                         traj_point_cloud_rerun_vis = transform_coords_for_visualization(traj_point_cloud.cpu() if traj_point_cloud is not None else None)
+                                         
+                                         # Log data for this sample. 
+                                         visualize_trajectory_rerun(
+                                             past_positions=gt_hist_denorm_rerun_vis,
+                                             future_positions_gt=gt_future_denorm_rerun_vis,
+                                             future_positions_pred=pred_future_denorm_rerun_vis,
+                                             past_mask=hist_mask,
+                                             future_mask_gt=future_mask,
+                                             point_cloud=traj_point_cloud_rerun_vis, # Now defined and transformed
+                                             past_orientations=gt_hist_ori_denorm.cpu(), # Orientations not transformed
+                                             future_orientations_gt=gt_future_ori_denorm.cpu(), # Orientations not transformed
+                                             future_orientations_pred=pred_future_ori_denorm.cpu(), # Orientations not transformed
+                                             object_name=obj_name, 
+                                             sequence_name=sequence_name_extracted, 
+                                             segment_idx=seg_idx, 
+                                             line_width=args.rerun_line_width,
+                                             point_size=args.rerun_point_size
+                                         )
+
+                                         # Explicitly save if init fell back
+                                         if returned_sample_rrd_path: # This path is where it *should* be saved or was intended.
+                                             logger.info(f"Attempting to explicitly save/finalize Rerun recording for sample {sample_recording_name} to: {returned_sample_rrd_path}")
+                                             save_rerun_recording(output_path=returned_sample_rrd_path)
+                                         
+                                         # For now, we rely on rr.init() behavior. If data leaks between samples, consider rr.disconnect().
+                                         if hasattr(rr, 'disconnect') and callable(rr.disconnect):
+                                             try:
+                                                 rr.disconnect()
+                                                 logger.info(f"Disconnected Rerun session for sample {sample_recording_name}")
+                                             except Exception as disconnect_e:
+                                                 logger.warning(f"Error during Rerun disconnect for sample {sample_recording_name}: {disconnect_e}")
+
+                                     else:
+                                         logger.warning(f"Failed to initialize Rerun for sample: {sample_recording_name}. Skipping Rerun vis for this sample.")
+                                 except Exception as rerun_sample_e:
+                                     logger.warning(f"Warning: Error during Rerun visualization for sample {i} in batch {batch_idx} ({filename_base}): {rerun_sample_e}")
+                             
                              visualized_count += 1
                              
                          except Exception as vis_e:
@@ -979,6 +1133,29 @@ def main():
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
+    
+    # Log visualization settings
+    logger.info("\n=== VISUALIZATION SETTINGS ===")
+    logger.info(f"Matplotlib visualization: {'Enabled' if args.visualize else 'Disabled'}")
+    logger.info(f"Number of samples to visualize: {args.num_vis_samples}")
+    logger.info(f"Show orientation arrows: {'Enabled' if args.show_ori_arrows else 'Disabled'}")
+    logger.info(f"Visualize bounding boxes: {'Enabled' if args.visualize_bbox else 'Disabled'}")
+    
+    # Log Rerun visualization settings
+    logger.info("\n=== RERUN VISUALIZATION SETTINGS ===")
+    if args.use_rerun:
+        if HAS_RERUN:
+            logger.info("Rerun visualization for saving recordings: Enabled (viewer will not spawn)")
+            logger.info(f"Rerun output directory: {os.path.join(output_dir, 'rerun_visualization')}")
+            logger.info(f"Point cloud downsample factor: {args.pointcloud_downsample_factor}")
+            logger.info(f"Line width: {args.rerun_line_width}")
+            logger.info(f"Point size: {args.rerun_point_size}")
+        else:
+            logger.info("Rerun visualization: Requested but not available")
+            args.use_rerun = False  # Disable Rerun if not available
+    else:
+        logger.info("Rerun visualization: Disabled")
+    logger.info("=============================\n")
     
     # Log command line arguments
     logger.info("Command line arguments:")
