@@ -6,7 +6,7 @@ class ADTObjectMotionConfig(ArgumentParser):
 
         # === Input Data Configuration ===
         self.input_configs = self.add_argument_group('Input')
-        self.input_configs.add_argument('--batch_size', default=2, type=int, help='Batch size for training/evaluation')
+        self.input_configs.add_argument('--batch_size', default=1, type=int, help='Batch size for training/evaluation')
         self.input_configs.add_argument('--num_workers', default=4, type=int, help='Number of workers for data loading')
 
         # === Trajectory & Dataset Configuration ===
@@ -78,6 +78,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.train_configs.add_argument('--num_val_visualizations', type=int, default=500, help='Number of samples to visualize during validation')
         self.train_configs.add_argument('--load_model_dir', type=str, default=None, help='Path to load a pretrained model checkpoint')
         self.train_configs.add_argument('--load_optim_dir', type=str, default=None, help='Path to load optimizer state separately')
+        self.train_configs.add_argument('--timestep', type=int, default=0, help='Timestep for autoregressive prediction ')
 
         self.train_configs.add_argument('--epoch', type=int, default=200, help='Total training epochs')
         self.train_configs.add_argument('--lr', type=float, default=1e-4, help='Learning rate')

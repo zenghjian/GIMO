@@ -14,6 +14,7 @@ import time
 import logging
 from functools import partial # Import partial for binding args to collate_fn
 from torch.utils.data.dataloader import default_collate # Import default_collate
+import shutil # Import shutil
 
 # --- Imports from our project ---
 from model.gimo_adt_model import GIMO_ADT_Model
@@ -184,6 +185,12 @@ def parse_args():
         action="store_true",
         help="Show orientation arrows in visualizations"
     )
+    parser.add_argument(
+        "--num_top_worst_to_save",
+        type=int,
+        default=10,
+        help="Number of best and worst Rerun recordings and visualizations to save."
+    )
 
     return parser.parse_args()
 
@@ -302,10 +309,6 @@ def compute_metrics_for_sample(pred_future, gt_future, future_mask):
         l1_mean (torch.Tensor): Mean L1 distance (scalar)
         rmse_ade (torch.Tensor): Mean L2 distance (RMSE analog for ADE) (scalar)
         fde (torch.Tensor): Final Displacement Error (scalar)
-        l1_first_half (torch.Tensor): Mean L1 for the first half of the future trajectory
-        rmse_first_half (torch.Tensor): Mean RMSE for the first half of the future trajectory
-        l1_second_half (torch.Tensor): Mean L1 for the second half of the future trajectory
-        rmse_second_half (torch.Tensor): Mean RMSE for the second half of the future trajectory
     """
     # Ensure tensors are on the same device
     device = pred_future.device
@@ -324,9 +327,7 @@ def compute_metrics_for_sample(pred_future, gt_future, future_mask):
     num_valid_points = future_mask.sum()
     if num_valid_points == 0:
         # Return zeros or NaNs if no valid points to avoid division by zero
-        return (torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device),
-                torch.tensor(0.0, device=device), torch.tensor(0.0, device=device),
-                torch.tensor(0.0, device=device), torch.tensor(0.0, device=device))
+        return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
         
     num_valid_coords = num_valid_points * 3 # Total number of valid coordinate values
 
@@ -358,64 +359,10 @@ def compute_metrics_for_sample(pred_future, gt_future, future_mask):
     # Calculate FDE as the L2 distance between these final points
     fde = torch.norm(final_pred_point - final_gt_point, dim=-1)
 
-    # --- Metrics for Halves ---
-    l1_first_half = torch.tensor(0.0, device=device)
-    rmse_first_half = torch.tensor(0.0, device=device)
-    l1_second_half = torch.tensor(0.0, device=device)
-    rmse_second_half = torch.tensor(0.0, device=device)
+    return l1_mean, rmse_ade, fde
 
-    future_len = pred_future.shape[0] # This is the padded length
-    
-    # Find actual valid indices based on future_mask
-    valid_indices = torch.where(future_mask)[0]
-    if len(valid_indices) > 1: # Need at least 2 points for a split
-        actual_future_len = len(valid_indices)
-        mid_point_actual = actual_future_len // 2
-        
-        # Indices for the first half (actual valid indices)
-        first_half_indices_actual = valid_indices[:mid_point_actual]
-        # Indices for the second half (actual valid indices)
-        second_half_indices_actual = valid_indices[mid_point_actual:]
-
-        if len(first_half_indices_actual) > 0:
-            # Create masks for each half based on actual valid indices
-            first_half_mask = torch.zeros_like(future_mask, dtype=torch.bool)
-            first_half_mask[first_half_indices_actual] = True
-            first_half_mask_expanded = first_half_mask.unsqueeze(-1).expand_as(l1_diff)
-            num_valid_points_first_half = first_half_mask.sum()
-            num_valid_coords_first_half = num_valid_points_first_half * 3
-
-            if num_valid_points_first_half > 0:
-                # L1 for first half
-                masked_l1_diff_first_half = l1_diff * first_half_mask_expanded
-                sum_l1_diff_first_half = masked_l1_diff_first_half.sum()
-                l1_first_half = sum_l1_diff_first_half / num_valid_coords_first_half
-                # RMSE for first half
-                masked_l2_dist_first_half = l2_dist_per_step * first_half_mask
-                sum_l2_dist_first_half = masked_l2_dist_first_half.sum()
-                rmse_first_half = sum_l2_dist_first_half / num_valid_points_first_half
-
-        if len(second_half_indices_actual) > 0:
-            # Create masks for each half based on actual valid indices
-            second_half_mask = torch.zeros_like(future_mask, dtype=torch.bool)
-            second_half_mask[second_half_indices_actual] = True
-            second_half_mask_expanded = second_half_mask.unsqueeze(-1).expand_as(l1_diff)
-            num_valid_points_second_half = second_half_mask.sum()
-            num_valid_coords_second_half = num_valid_points_second_half * 3
-            
-            if num_valid_points_second_half > 0:
-                # L1 for second half
-                masked_l1_diff_second_half = l1_diff * second_half_mask_expanded
-                sum_l1_diff_second_half = masked_l1_diff_second_half.sum()
-                l1_second_half = sum_l1_diff_second_half / num_valid_coords_second_half
-                # RMSE for second half
-                masked_l2_dist_second_half = l2_dist_per_step * second_half_mask
-                sum_l2_dist_second_half = masked_l2_dist_second_half.sum()
-                rmse_second_half = sum_l2_dist_second_half / num_valid_points_second_half
-
-    return l1_mean, rmse_ade, fde, l1_first_half, rmse_first_half, l1_second_half, rmse_second_half
-
-def evaluate(model, config, args, best_epoch, logger):
+def evaluate(model, config, args, best_epoch, logger, 
+             best_rerun_dir, best_vis_dir, worst_rerun_dir, worst_vis_dir):
     """
     Run the evaluation loop.
     
@@ -425,6 +372,10 @@ def evaluate(model, config, args, best_epoch, logger):
         args: Command line arguments for evaluation.
         best_epoch (int): The epoch number the model checkpoint was saved at.
         logger: Logger instance for logging information.
+        best_rerun_dir: Directory to save best Rerun recordings
+        best_vis_dir: Directory to save best visualizations
+        worst_rerun_dir: Directory to save worst Rerun recordings
+        worst_vis_dir: Directory to save worst visualizations
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -535,13 +486,9 @@ def evaluate(model, config, args, best_epoch, logger):
     total_l1 = 0.0
     total_rmse_ade = 0.0 # Accumulate RMSE/ADE (L2)
     total_fde = 0.0
-    # Add accumulators for half-trajectory metrics
-    total_l1_first_half = 0.0
-    total_rmse_first_half = 0.0
-    total_l1_second_half = 0.0
-    total_rmse_second_half = 0.0
     num_batches = 0
     total_valid_samples = 0 # Count total valid samples across all batches
+    all_samples_metrics = [] # List to store metrics and paths for each sample
     
     # Track visualization statistics
     visualized_count = 0
@@ -603,16 +550,33 @@ def evaluate(model, config, args, best_epoch, logger):
                 if isinstance(object_categories, torch.Tensor):
                     object_categories = [cat.item() if isinstance(cat.item(), str) else str(cat.item()) for cat in object_categories]
 
-                # Prepare input trajectory for the model based on config
+                # --- Dynamically determine input history length for the batch (evaluation) ---
+                actual_lengths_batch = full_attention_mask.sum(dim=1).int() # Shape [B]
+
                 if config.use_first_frame_only:
-                    # Use only the first frame as input
-                    input_trajectory_batch = full_trajectory_batch[:, 0:1, :]
-                    bbox_corners_input_batch = bbox_corners_batch[:, 0:1, :, :]  # Also slice bbox corners
+                    hist_len_for_batch = 1 if torch.any(actual_lengths_batch > 0) else 0
+                    input_trajectory_batch = full_trajectory_batch[:, :hist_len_for_batch, :]
+                    if not config.no_bbox and bbox_corners_batch is not None:
+                        bbox_corners_input_batch = bbox_corners_batch[:, :hist_len_for_batch, :, :]
+                    else:
+                        bbox_corners_input_batch = None
                 else:
-                    # Use a fixed portion of the history as input
-                    fixed_history_length = int(np.floor(full_trajectory_batch.shape[1] * config.history_fraction))
-                    input_trajectory_batch = full_trajectory_batch[:, :fixed_history_length, :]
-                    bbox_corners_input_batch = bbox_corners_batch[:, :fixed_history_length, :, :]  # Also slice bbox corners
+                    min_val_tensor = torch.ones_like(actual_lengths_batch).float()
+                    individual_dynamic_hist_lengths = (actual_lengths_batch.float() * config.history_fraction).floor().long()
+                    individual_dynamic_hist_lengths = torch.max(min_val_tensor.long(), individual_dynamic_hist_lengths)
+                    individual_dynamic_hist_lengths = torch.min(individual_dynamic_hist_lengths, actual_lengths_batch)
+                    individual_dynamic_hist_lengths[actual_lengths_batch == 0] = 0
+                    
+                    hist_len_for_batch = torch.max(individual_dynamic_hist_lengths).item()
+                    # Ensure hist_len_for_batch does not exceed the padded sequence length
+                    hist_len_for_batch = min(hist_len_for_batch, full_trajectory_batch.shape[1])
+
+                    input_trajectory_batch = full_trajectory_batch[:, :hist_len_for_batch, :]
+                    if not config.no_bbox and bbox_corners_batch is not None:
+                        bbox_corners_input_batch = bbox_corners_batch[:, :hist_len_for_batch, :, :]
+                    else:
+                        bbox_corners_input_batch = None
+                # --- End dynamic input history length determination (evaluation) ---
 
                 logger.info(f"Input trajectory shape: {input_trajectory_batch.shape}, Full trajectory shape: {full_trajectory_batch.shape}")
                 
@@ -631,10 +595,6 @@ def evaluate(model, config, args, best_epoch, logger):
                 batch_l1 = 0.0
                 batch_rmse_ade = 0.0
                 batch_fde = 0.0
-                batch_l1_first_half = 0.0
-                batch_rmse_first_half = 0.0
-                batch_l1_second_half = 0.0
-                batch_rmse_second_half = 0.0
                 valid_samples_in_batch = 0
 
                 logger.info(f"Processing {full_trajectory_batch.shape[0]} samples in batch")
@@ -736,10 +696,8 @@ def evaluate(model, config, args, best_epoch, logger):
                         pred_future_ori_denorm = pred_future_ori
 
                     # Compute Metrics for this sample
-                    l1_mean, rmse_ade, fde, l1_first_half, rmse_first_half, l1_second_half, rmse_second_half = compute_metrics_for_sample(pred_future_denorm, gt_future_denorm, future_mask)
+                    l1_mean, rmse_ade, fde = compute_metrics_for_sample(pred_future_denorm, gt_future_denorm, future_mask)
                     logger.info(f"Sample {i}: L1={l1_mean.item():.4f}, RMSE={rmse_ade.item():.4f}, FDE={fde.item():.4f}")
-                    logger.info(f"  L1 First Half={l1_first_half.item():.4f}, RMSE First Half={rmse_first_half.item():.4f}")
-                    logger.info(f"  L1 Second Half={l1_second_half.item():.4f}, RMSE Second Half={rmse_second_half.item():.4f}")
                     
                     # For first_frame_only mode, also check reconstruction of the first frame
                     first_frame_rec_error = 0.0
@@ -757,12 +715,38 @@ def evaluate(model, config, args, best_epoch, logger):
                     batch_l1 += l1_mean.item()
                     batch_rmse_ade += rmse_ade.item()
                     batch_fde += fde.item()
-                    # Accumulate new metrics
-                    batch_l1_first_half += l1_first_half.item()
-                    batch_rmse_first_half += rmse_first_half.item()
-                    batch_l1_second_half += l1_second_half.item()
-                    batch_rmse_second_half += rmse_second_half.item()
                     valid_samples_in_batch += 1
+
+                    # --- Store sample metrics and paths for later sorting --- 
+                    # Ensure paths are captured correctly, especially for Rerun
+                    current_sample_rerun_path = None
+                    if args.use_rerun and HAS_RERUN and per_sample_rrd_basedir: # Check if Rerun was used for this sample
+                        # Construct the expected path if Rerun was initialized and saved
+                        # filename_base was defined earlier in the visualization section
+                        if 'filename_base' in locals():
+                            current_sample_rerun_path = os.path.join(per_sample_rrd_basedir, f"{filename_base}.rrd")
+                            if not os.path.exists(current_sample_rerun_path):
+                                # This check is crucial. If the file wasn't saved as expected, log it.
+                                logger.warning(f"Rerun file {current_sample_rerun_path} not found for sample {filename_base}. It will not be copied.")
+                                current_sample_rerun_path = None # Reset if not found
+                        else:
+                            logger.warning("filename_base not defined when trying to capture Rerun path.")
+                    
+                    current_sample_vis_path = None
+                    if args.visualize and 'pred_vs_gt_path' in locals() and os.path.exists(pred_vs_gt_path):
+                        current_sample_vis_path = pred_vs_gt_path
+                    elif args.visualize:
+                        logger.warning(f"Visualization path {pred_vs_gt_path if 'pred_vs_gt_path' in locals() else 'unknown'} not found or not generated.")
+
+                    all_samples_metrics.append({
+                        'l1': l1_mean.item(),
+                        'rmse': rmse_ade.item(),
+                        'fde': fde.item(),
+                        'vis_path': current_sample_vis_path, # Path to matplotlib vis
+                        'rerun_path': current_sample_rerun_path,  # Path to Rerun .rrd file
+                        'sample_name': filename_base if 'filename_base' in locals() else f"batch{batch_idx}_sample{i}"
+                    })
+                    # ----------------------------------------------------------
 
                     # --- Visualization ---
                     if args.visualize:
@@ -955,25 +939,13 @@ def evaluate(model, config, args, best_epoch, logger):
                     total_l1 += batch_l1 # batch_l1 is already sum of means for the batch
                     total_rmse_ade += batch_rmse_ade # Accumulate sum of sample RMSEs
                     total_fde += batch_fde # batch_fde is already sum of means for the batch
-                    # Accumulate new metrics sums
-                    total_l1_first_half += batch_l1_first_half
-                    total_rmse_first_half += batch_rmse_first_half
-                    total_l1_second_half += batch_l1_second_half
-                    total_rmse_second_half += batch_rmse_second_half
                     total_valid_samples += valid_samples_in_batch
                     num_batches += 1
                     batch_avg_l1 = batch_l1 / valid_samples_in_batch
                     batch_avg_rmse = batch_rmse_ade / valid_samples_in_batch
                     batch_avg_fde = batch_fde / valid_samples_in_batch
-                    # Log new batch average metrics
-                    batch_avg_l1_fh = batch_l1_first_half / valid_samples_in_batch
-                    batch_avg_rmse_fh = batch_rmse_first_half / valid_samples_in_batch
-                    batch_avg_l1_sh = batch_l1_second_half / valid_samples_in_batch
-                    batch_avg_rmse_sh = batch_rmse_second_half / valid_samples_in_batch
                     
                     logger.info(f"Batch {batch_idx} metrics: L1={batch_avg_l1:.4f}, RMSE={batch_avg_rmse:.4f}, FDE={batch_avg_fde:.4f}")
-                    logger.info(f"  Batch L1 FH={batch_avg_l1_fh:.4f}, RMSE FH={batch_avg_rmse_fh:.4f}")
-                    logger.info(f"  Batch L1 SH={batch_avg_l1_sh:.4f}, RMSE SH={batch_avg_rmse_sh:.4f}")
                     progress_bar.set_postfix({
                          'Batch L1': f"{batch_avg_l1:.4f}",
                          'Batch RMSE': f"{batch_avg_rmse:.4f}",
@@ -991,22 +963,12 @@ def evaluate(model, config, args, best_epoch, logger):
         mean_l1 = total_l1 / total_valid_samples
         mean_rmse = total_rmse_ade / total_valid_samples # This is the overall mean RMSE
         mean_fde = total_fde / total_valid_samples
-        # Calculate mean for new metrics
-        mean_l1_first_half = total_l1_first_half / total_valid_samples
-        mean_rmse_first_half = total_rmse_first_half / total_valid_samples
-        mean_l1_second_half = total_l1_second_half / total_valid_samples
-        mean_rmse_second_half = total_rmse_second_half / total_valid_samples
 
         logger.info(f"--- Evaluation Complete ---")
         logger.info(f" Model from Epoch: {best_epoch}") # Print the epoch
         logger.info(f" Mean L1 (MAE): {mean_l1:.4f}")
         logger.info(f" Mean RMSE: {mean_rmse:.4f}")
         logger.info(f" Mean FDE: {mean_fde:.4f}")
-        # Log new mean metrics
-        logger.info(f" Mean L1 First Half: {mean_l1_first_half:.4f}")
-        logger.info(f" Mean RMSE First Half: {mean_rmse_first_half:.4f}")
-        logger.info(f" Mean L1 Second Half: {mean_l1_second_half:.4f}")
-        logger.info(f" Mean RMSE Second Half: {mean_rmse_second_half:.4f}")
         
         # Log visualization statistics
         logger.info(f" Visualized {visualized_count} samples")
@@ -1022,11 +984,6 @@ def evaluate(model, config, args, best_epoch, logger):
         mean_l1 = float('inf')
         mean_rmse = float('inf')
         mean_fde = float('inf')
-        # Initialize new metrics to inf as well
-        mean_l1_first_half = float('inf')
-        mean_rmse_first_half = float('inf')
-        mean_l1_second_half = float('inf')
-        mean_rmse_second_half = float('inf')
 
     # --- Save Results ---
     results = {
@@ -1037,11 +994,6 @@ def evaluate(model, config, args, best_epoch, logger):
         'mean_l1': mean_l1,
         'mean_rmse': mean_rmse,
         'mean_fde': mean_fde,
-        # Add new metrics to results
-        'mean_l1_first_half': mean_l1_first_half,
-        'mean_rmse_first_half': mean_rmse_first_half,
-        'mean_l1_second_half': mean_l1_second_half,
-        'mean_rmse_second_half': mean_rmse_second_half,
         'first_frame_only_mode': config.use_first_frame_only, # Flag indicating special mode
         'num_test_samples_processed': total_valid_samples, # Report processed samples
         'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1054,55 +1006,52 @@ def evaluate(model, config, args, best_epoch, logger):
         json.dump(results, f, indent=4)
     logger.info(f"Evaluation results saved to {results_path}")
 
-    # Plot and save the bar chart for half-trajectory metrics
-    plot_trajectory_half_metrics(mean_l1_first_half, mean_l1_second_half, 
-                                 mean_rmse_first_half, mean_rmse_second_half, 
-                                 args.output_dir, logger)
+    # --- Sort and Save Best/Worst Reruns and Visualizations ---
+    if all_samples_metrics:
+        # Sort samples by L1 loss (ascending for best, descending for worst)
+        all_samples_metrics.sort(key=lambda x: x['l1'])
+        
+        num_to_save = args.num_top_worst_to_save
+        logger.info(f"Saving top/worst {num_to_save} Rerun recordings and visualizations...")
+
+        # Save best samples
+        logger.info(f"--- Saving {min(num_to_save, len(all_samples_metrics))} best samples ---")
+        for i in range(min(num_to_save, len(all_samples_metrics))):
+            sample_data = all_samples_metrics[i]
+            logger.info(f"Best sample {i+1}/{num_to_save} (L1: {sample_data['l1']:.4f}): {sample_data['sample_name']}")
+            if sample_data['vis_path'] and os.path.exists(sample_data['vis_path']):
+                try:
+                    shutil.copy(sample_data['vis_path'], best_vis_dir)
+                    logger.info(f"  Copied visualization to {best_vis_dir}")
+                except Exception as e:
+                    logger.error(f"  Error copying visualization {sample_data['vis_path']}: {e}")
+            if sample_data['rerun_path'] and os.path.exists(sample_data['rerun_path']):
+                try:
+                    shutil.copy(sample_data['rerun_path'], best_rerun_dir)
+                    logger.info(f"  Copied Rerun recording to {best_rerun_dir}")
+                except Exception as e:
+                    logger.error(f"  Error copying Rerun recording {sample_data['rerun_path']}: {e}")
+
+        # Save worst samples (from the end of the sorted list)
+        logger.info(f"--- Saving {min(num_to_save, len(all_samples_metrics))} worst samples ---")
+        for i in range(min(num_to_save, len(all_samples_metrics))):
+            sample_data = all_samples_metrics[-(i+1)] # Get from the end
+            logger.info(f"Worst sample {i+1}/{num_to_save} (L1: {sample_data['l1']:.4f}): {sample_data['sample_name']}")
+            if sample_data['vis_path'] and os.path.exists(sample_data['vis_path']):
+                try:
+                    shutil.copy(sample_data['vis_path'], worst_vis_dir)
+                    logger.info(f"  Copied visualization to {worst_vis_dir}")
+                except Exception as e:
+                    logger.error(f"  Error copying visualization {sample_data['vis_path']}: {e}")
+            if sample_data['rerun_path'] and os.path.exists(sample_data['rerun_path']):
+                try:
+                    shutil.copy(sample_data['rerun_path'], worst_rerun_dir)
+                    logger.info(f"  Copied Rerun recording to {worst_rerun_dir}")
+                except Exception as e:
+                    logger.error(f"  Error copying Rerun recording {sample_data['rerun_path']}: {e}")
+    # ------------------------------------------------------------
 
     return results
-
-def plot_trajectory_half_metrics(l1_fh, l1_sh, rmse_fh, rmse_sh, output_dir, logger):
-    """Generate and save a bar chart for L1 and RMSE of trajectory halves."""
-    labels = ['L1 Error', 'RMSE']
-    first_half_metrics = [l1_fh, rmse_fh]
-    second_half_metrics = [l1_sh, rmse_sh]
-
-    x = np.arange(len(labels))  # the label locations
-    width = 0.35  # the width of the bars
-
-    fig, ax = plt.subplots()
-    rects1 = ax.bar(x - width/2, first_half_metrics, width, label='First Half')
-    rects2 = ax.bar(x + width/2, second_half_metrics, width, label='Second Half')
-
-    # Add some text for labels, title and custom x-axis tick labels, etc.
-    ax.set_ylabel('Error Metric Value')
-    ax.set_title('Trajectory Prediction Error: First Half vs. Second Half')
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.legend()
-
-    def autolabel(rects):
-        """Attach a text label above each bar in *rects*, displaying its height."""
-        for rect in rects:
-            height = rect.get_height()
-            ax.annotate(f'{height:.3f}',
-                        xy=(rect.get_x() + rect.get_width() / 2, height),
-                        xytext=(0, 3),  # 3 points vertical offset
-                        textcoords="offset points",
-                        ha='center', va='bottom')
-
-    autolabel(rects1)
-    autolabel(rects2)
-
-    fig.tight_layout()
-
-    plot_path = os.path.join(output_dir, "trajectory_half_metrics_comparison.png")
-    try:
-        plt.savefig(plot_path)
-        logger.info(f"Trajectory half metrics comparison chart saved to {plot_path}")
-    except Exception as e:
-        logger.error(f"Error saving trajectory half metrics chart: {e}")
-    plt.close(fig) # Close the figure to free memory
 
 def main():
     """Main evaluation function."""
@@ -1120,6 +1069,18 @@ def main():
     
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
+    
+    # --- Create subdirectories for best/worst visualizations and Reruns ---
+    best_rerun_dir = os.path.join(output_dir, "best_rerun")
+    best_vis_dir = os.path.join(output_dir, "best_visualization")
+    worst_rerun_dir = os.path.join(output_dir, "worst_rerun")
+    worst_vis_dir = os.path.join(output_dir, "worst_visualization")
+    
+    os.makedirs(best_rerun_dir, exist_ok=True)
+    os.makedirs(best_vis_dir, exist_ok=True)
+    os.makedirs(worst_rerun_dir, exist_ok=True)
+    os.makedirs(worst_vis_dir, exist_ok=True)
+    # -----------------------------------------------------------------------
     
     # Setup logger
     logger = setup_logger(output_dir)
@@ -1224,7 +1185,8 @@ def main():
         return
 
     # Run evaluation
-    evaluate(model, config, args, best_epoch, logger)
+    evaluate(model, config, args, best_epoch, logger, 
+             best_rerun_dir, best_vis_dir, worst_rerun_dir, worst_vis_dir)
     logger.info("Evaluation completed.")
 
 if __name__ == "__main__":

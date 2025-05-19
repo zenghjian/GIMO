@@ -43,6 +43,26 @@ def log_metrics(epoch, title, metrics, logger_func):
     log_str += " | Components: " + " | ".join([f"{k}: {v:.4f}" for k, v in metrics.items() if k != 'total_loss'])
     logger_func(log_str)
 
+def transform_coords_for_visualization(tensor_3d: torch.Tensor) -> torch.Tensor:
+    """Applies (x, y, z) -> (x, -z, y) transformation to a 3D tensor."""
+    if tensor_3d is None or tensor_3d.numel() == 0:
+        return tensor_3d
+    
+    # Ensure it's a tensor
+    if not isinstance(tensor_3d, torch.Tensor):
+        tensor_3d = torch.tensor(tensor_3d)
+
+    if tensor_3d.shape[-1] != 3:
+        # print(f"Warning: transform_coords_for_visualization expects last dim to be 3, got {tensor_3d.shape}. Skipping transformation.")
+        return tensor_3d
+
+    x = tensor_3d[..., 0]
+    y = tensor_3d[..., 1]
+    z = tensor_3d[..., 2]
+    
+    transformed_tensor = torch.stack((x, -z, y), dim=-1)
+    return transformed_tensor
+
 def compute_metrics_for_sample(pred_future, gt_future, future_mask):
     """
     Compute L1 Mean, L2 Mean (for RMSE), and FDE for a single trajectory sample.
@@ -144,19 +164,46 @@ def validate(model, dataloader, device, config, epoch):
             try:
                 full_trajectory_batch = batch['full_poses'].float().to(device)
                 point_cloud_batch = batch['point_cloud'].float().to(device) # Get point cloud from collated batch
-                bbox_corners_batch = batch['bbox_corners'].float().to(device) # Get bbox_corners
+                # Only get bbox_corners if not using no_bbox
+                if not config.no_bbox:
+                    bbox_corners_batch = batch['bbox_corners'].float().to(device) # Get bbox_corners
+                else:
+                    bbox_corners_batch = None
+                
                 # Move mask to device for loss calc
                 batch['full_attention_mask'] = batch['full_attention_mask'].to(device)
                 
-                # Prepare input trajectory for the model based on config
-                if config.use_first_frame_only:
-                    input_trajectory_batch = full_trajectory_batch[:, 0:1, :]
-                    bbox_corners_input_batch = bbox_corners_batch[:, 0:1, :, :] 
-                else:
-                    fixed_history_length = int(np.floor(full_trajectory_batch.shape[1] * config.history_fraction))
-                    input_trajectory_batch = full_trajectory_batch[:, :fixed_history_length, :]
-                    bbox_corners_input_batch = bbox_corners_batch[:, :fixed_history_length, :, :]
+                # --- Dynamically determine input history length based on actual trajectory length ---
+                current_full_trajectory = full_trajectory_batch # Shape [1, config.trajectory_length, 6]
+                current_attention_mask = batch['full_attention_mask'] # Shape [1, config.trajectory_length]
                 
+                actual_length = current_attention_mask[0].sum().int().item()
+
+                if config.use_first_frame_only:
+                    # Ensure dynamic_input_hist_len is at least 0 and at most actual_length
+                    dynamic_input_hist_len = min(1, actual_length) if actual_length > 0 else 0
+                    input_trajectory_batch = current_full_trajectory[:, :dynamic_input_hist_len, :]
+                    if not config.no_bbox and bbox_corners_batch is not None:
+                        bbox_corners_input_batch = bbox_corners_batch[:, :dynamic_input_hist_len, :, :]
+                    else:
+                        bbox_corners_input_batch = None
+                else:
+                    # Calculate history length based on actual_length and history_fraction
+                    # Ensure it's at least 1 if actual_length > 0, and not more than actual_length
+                    if actual_length > 0:
+                        dynamic_input_hist_len = int(np.floor(actual_length * config.history_fraction))
+                        dynamic_input_hist_len = max(1, dynamic_input_hist_len) # Ensure at least 1 if possible
+                        dynamic_input_hist_len = min(dynamic_input_hist_len, actual_length) # Cap at actual_length
+                    else:
+                        dynamic_input_hist_len = 0 # No history if trajectory is empty
+                    
+                    input_trajectory_batch = current_full_trajectory[:, :dynamic_input_hist_len, :]
+                    if not config.no_bbox and bbox_corners_batch is not None:
+                        bbox_corners_input_batch = bbox_corners_batch[:, :dynamic_input_hist_len, :, :]
+                    else:
+                        bbox_corners_input_batch = None
+                # --- End dynamic input history length determination ---
+
                 # Get object category IDs if embedding is enabled
                 if not config.no_text_embedding:
                     object_category_ids = batch['object_category_id'].to(device)
@@ -319,18 +366,27 @@ def validate(model, dataloader, device, config, epoch):
                     
                     # Check if orientation visualization is enabled
                     show_ori_arrows = getattr(config, 'show_ori_arrows', False)
+                    viz_ori_scale = getattr(config, 'viz_ori_scale', 0.2) # Added from train_adt.py
 
                     # Only generate full trajectory and split visualizations on first validation
                     if is_first_validation:
                         # Full Trajectory Visualization - now with point cloud and orientation
                         full_traj_path = os.path.join(trajectory_vis_dir, f"{filename_base}_full_trajectory_with_scene.png")
-                        # 获取当前样本的边界框角点数据
-                        sample_bbox_corners = bbox_corners_batch[i].cpu()  # 提取当前样本的边界框并移到CPU
+                        # Get bbox corners for current sample if available
+                        sample_bbox_corners_cpu = None
+                        if not config.no_bbox and bbox_corners_batch is not None: # Check if bbox_corners_batch is not None
+                            sample_bbox_corners_cpu = bbox_corners_batch[i].cpu()  # Extract bbox corners for current sample
+                        
+                        # Apply transformations for visualization
+                        gt_full_positions_vis = transform_coords_for_visualization(gt_full_positions.cpu())
+                        sample_pointcloud_vis = transform_coords_for_visualization(sample_pointcloud.cpu())
+                        sample_bbox_corners_vis = transform_coords_for_visualization(sample_bbox_corners_cpu)
+
                         visualize_full_trajectory(
-                            positions=gt_full_positions,
-                            attention_mask=gt_full_mask,
-                            point_cloud=sample_pointcloud,  # Pass the point cloud
-                            bbox_corners_sequence=sample_bbox_corners,  # 添加边界框角点数据
+                            positions=gt_full_positions_vis,
+                            attention_mask=gt_full_mask.cpu() if gt_full_mask is not None else None,
+                            point_cloud=sample_pointcloud_vis,  # Pass the point cloud
+                            bbox_corners_sequence=sample_bbox_corners_vis,  # Add bbox corners data if available
                             title=f"Full GT - {vis_title_base}",
                             save_path=full_traj_path,
                             segment_idx=segment_idx
@@ -338,11 +394,13 @@ def validate(model, dataloader, device, config, epoch):
                         
                         # Split Trajectory Visualization (uses dynamically sliced data)
                         split_traj_path = os.path.join(trajectory_vis_dir, f"{filename_base}_trajectory_split.png")
+                        vis_past_positions_vis = transform_coords_for_visualization(vis_past_positions.cpu())
+                        vis_future_positions_gt_vis = transform_coords_for_visualization(vis_future_positions_gt.cpu())
                         visualize_trajectory(
-                            past_positions=vis_past_positions,
-                            future_positions=vis_future_positions_gt,
-                            past_mask=vis_past_mask,
-                            future_mask=vis_future_mask_gt,
+                            past_positions=vis_past_positions_vis,
+                            future_positions=vis_future_positions_gt_vis,
+                            past_mask=vis_past_mask.cpu() if vis_past_mask is not None else None,
+                            future_mask=vis_future_mask_gt.cpu() if vis_future_mask_gt is not None else None,
                             title=f"Split GT - {vis_title_base}",
                             save_path=split_traj_path,
                             segment_idx=segment_idx
@@ -350,19 +408,26 @@ def validate(model, dataloader, device, config, epoch):
                     
                     # Always generate the prediction vs ground truth visualization
                     pred_vs_gt_path = os.path.join(vis_output_dir, f"{filename_base}_prediction_vs_gt_epoch{epoch}.png")
+                    
+                    # Apply transformations for prediction visualization
+                    vis_past_positions_pred_vis = transform_coords_for_visualization(vis_past_positions.cpu())
+                    vis_future_positions_gt_pred_vis = transform_coords_for_visualization(vis_future_positions_gt.cpu())
+                    predicted_future_positions_vis = transform_coords_for_visualization(predicted_future_positions.cpu())
+                    
                     visualize_prediction(
-                        past_positions=vis_past_positions,
-                        future_positions_gt=vis_future_positions_gt,
-                        future_positions_pred=predicted_future_positions, # Use dynamically sliced prediction
-                        past_mask=vis_past_mask,
-                        future_mask_gt=vis_future_mask_gt, # Corrected argument name
+                        past_positions=vis_past_positions_pred_vis,
+                        future_positions_gt=vis_future_positions_gt_pred_vis,
+                        future_positions_pred=predicted_future_positions_vis, # Use dynamically sliced prediction
+                        past_mask=vis_past_mask.cpu() if vis_past_mask is not None else None,
+                        future_mask_gt=vis_future_mask_gt.cpu() if vis_future_mask_gt is not None else None, # Corrected argument name
                         title=f"Pred vs GT - {vis_title_base} (Epoch {epoch})",
                         save_path=pred_vs_gt_path,
                         segment_idx=segment_idx,
                         show_orientation=show_ori_arrows,
-                        past_orientations=vis_past_orientations,
-                        future_orientations_gt=vis_future_orientations_gt,
-                        future_orientations_pred=predicted_future_orientations
+                        past_orientations=vis_past_orientations.cpu(), # Orientations not transformed
+                        future_orientations_gt=vis_future_orientations_gt.cpu(), # Orientations not transformed
+                        future_orientations_pred=predicted_future_orientations.cpu(), # Orientations not transformed
+                        # viz_ori_scale=viz_ori_scale # Added from train_adt.py, but need to check if visualize_prediction supports it
                     )
                     
                     visualized_count += 1
@@ -643,7 +708,29 @@ def main():
 
     # --- Extract the first sample --- 
     logger("Extracting the first trajectory sample for overfitting...")
-    first_sample = original_train_dataset[0]
+    first_sample = None
+    target_object_name_part = "coffeecanistersmall" # Lowercase for case-insensitive search
+
+    if len(original_train_dataset) > 0:
+        for i in range(len(original_train_dataset)):
+            sample = original_train_dataset[i]
+            object_name = sample.get('object_name', "")
+            if target_object_name_part in object_name.lower():
+                first_sample = sample
+                logger(f"Found sample containing '{target_object_name_part}' for overfitting: Object '{object_name}' at index {i}.")
+                break # Stop after finding the first match
+
+        if first_sample is None:
+            logger(f"Warning: No sample with '{target_object_name_part}' in object_name found. Using the first available sample for overfitting.")
+            first_sample = original_train_dataset[0]
+    else:
+        logger("Error: Original training dataset is empty. Cannot select a sample for overfitting.")
+        return
+
+    if first_sample is None: # Should only be reached if dataset was empty and logic above failed
+        logger("Error: Could not select any sample for overfitting. Critical issue in sample selection.")
+        return
+
     # Log details about the selected sample
     first_sample_name = first_sample.get('object_name', 'Unknown Object')
     first_sample_seq_raw = first_sample.get('sequence', 'Unknown_Sequence') # Get raw sequence path/name
@@ -672,7 +759,16 @@ def main():
 
     # --- Model Initialization --- 
     logger("Initializing model...")
-    model = GIMO_ADT_Model(config).to(device)
+    if config.timestep == 0:
+        logger("Using GIMO_ADT_Model (non-autoregressive).")
+        model = GIMO_ADT_Model(config).to(device)
+    elif config.timestep == 1:
+        logger("Using GIMO_ADT_Autoregressive_Model.")
+        from model.gimo_adt_autoregressive_model import GIMO_ADT_Autoregressive_Model # Import here
+        model = GIMO_ADT_Autoregressive_Model(config).to(device)
+    else:
+        logger(f"Error: Invalid timestep configuration: {config.timestep}. Must be 0 or 1.")
+        raise ValueError(f"Invalid timestep configuration: {config.timestep}")
     
     # --- Log Model Architecture ---
     total_params = sum(p.numel() for p in model.parameters())
@@ -682,41 +778,52 @@ def main():
     logger(f"Total Parameters: {total_params:,}")
     logger(f"Trainable Parameters: {trainable_params:,}")
     logger(f"Text Embedding Enabled: {not getattr(config, 'no_text_embedding', False)}")
+    logger(f"Bounding Box Processing Enabled: {not getattr(config, 'no_bbox', False)}")
     logger(f"Overfitting Mode: True")
     
-    # Log model components
-    components = {
-        'Motion Linear': (model.motion_linear, []), 
-        'Scene Encoder': (model.scene_encoder, ['hparams']), 
-        'FP Layer': (model.fp_layer, []),
-        'BBox PointNet': (model.bbox_pointnet, ['conv1']), 
-        'Motion BBox Encoder': (model.motion_bbox_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
-        'Embedding Layer (Fusion 2)': (model.embedding_layer, ['in_features', 'out_features']),
-        'Output Encoder': (model.output_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
-        'Output Layer': (model.outputlayer, ['in_features', 'out_features'])
-    }
+    # # Log model components
+    # components = {
+    #     'Motion Linear': (model.motion_linear, []), 
+    #     'Scene Encoder': (model.scene_encoder, ['hparams']), 
+    # }
     
-    # Add text embedding components if enabled
-    if not getattr(config, 'no_text_embedding', False): # Check if text embedding is enabled
-        if hasattr(model, 'category_embedding'): # Ensure the attribute exists
-            components.update({
-                'Category Embedding': (model.category_embedding, ['num_embeddings', 'embedding_dim'])
-            })
+    # # Add bounding box related components if enabled
+    # if not getattr(config, 'no_bbox', False):
+    #     components.update({
+    #         'FP Layer': (model.fp_layer, []),
+    #         'BBox PointNet': (model.bbox_pointnet, ['conv1']), 
+    #     })
     
-    # Log each component's structure and parameters
-    for name, (component, attrs) in components.items():
-        params = sum(p.numel() for p in component.parameters())
-        logger(f"\n{name}:")
-        logger(f"  Parameters: {params:,}")
-        try:
-            # Try to log attributes if available
-            for attr in attrs:
-                if hasattr(component, attr):
-                    logger(f"  {attr}: {getattr(component, attr)}")
-        except:
-            pass
+    # components.update({
+    #     'Motion BBox Encoder': (model.motion_bbox_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
+    #     'Embedding Layer (Fusion 2)': (model.embedding_layer, ['in_features', 'out_features']),
+    #     'Output Encoder': (model.output_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
+    #     'Output Layer': (model.outputlayer, ['in_features', 'out_features'])
+    # })
     
-    # Log sample information for overfitting
+    # # Add text embedding components if enabled
+    # # Check if text embedding is enabled and the attribute exists
+    # if not getattr(config, 'no_text_embedding', False) and hasattr(model, 'category_embedding'):
+    #     components.update({
+    #         'Category Embedding': (model.category_embedding, ['num_embeddings', 'embedding_dim'])
+    #     })
+    
+    # # Log each component's structure and parameters
+    # for name, (component, attrs) in components.items():
+    #     if component is None: # Add a check for None components
+    #         logger(f"\n{name}: Not used/defined in this configuration.")
+    #         continue
+    #     params = sum(p.numel() for p in component.parameters())
+    #     logger(f"\n{name}:")
+    #     logger(f"  Parameters: {params:,}")
+    #     try:
+    #         # Try to log attributes if available
+    #         for attr in attrs:
+    #             if hasattr(component, attr):
+    #                 logger(f"  {attr}: {getattr(component, attr)}")
+    #     except:
+    #         pass
+    
     logger(f"\nOverfitting on sample:")
     logger(f"  Object: {first_sample_name}")
     logger(f"  Sequence: {first_sample_seq_name}")
@@ -733,6 +840,11 @@ def main():
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=config.gamma)
     logger(f"Optimizer: Adam with lr={config.lr}, weight_decay={config.weight_decay}")
     logger(f"Scheduler: ExponentialLR with gamma={config.gamma}")
+
+    # --- Create directory for mask visualizations ---
+    mask_check_dir = os.path.join(config.save_path, "mask_check")
+    os.makedirs(mask_check_dir, exist_ok=True)
+    logger(f"Mask visualizations will be saved to: {mask_check_dir}")
 
     # --- Load Checkpoint (If specified) --- 
     start_epoch = 1
@@ -776,23 +888,62 @@ def main():
         # Loop runs only once
         for batch_idx, batch in enumerate(train_loader):
             try:
-                full_trajectory_batch = batch['full_poses'].float().to(device)
-                point_cloud_batch = batch['point_cloud'].float().to(device)
-                bbox_corners_batch = batch['bbox_corners'].float().to(device) # Get bbox_corners
-                batch['full_attention_mask'] = batch['full_attention_mask'].to(device)
-                
-                # Prepare input trajectory for the model based on config
-                if config.use_first_frame_only:
-                    input_trajectory_batch = full_trajectory_batch[:, 0:1, :]
-                    bbox_corners_input_batch = bbox_corners_batch[:, 0:1, :, :] 
+                full_trajectory_batch = batch['full_poses'].float().to(device) # Shape [1, config.trajectory_length, 6]
+                print(f"full_trajectory_batch shape: {full_trajectory_batch.shape}")
+                point_cloud_batch = batch['point_cloud'].float().to(device) # Shape [1, config.num_sample_points, 3]
+                print(f"point_cloud_batch shape: {point_cloud_batch.shape}")
+                # Only get bbox_corners if not using no_bbox
+                if not config.no_bbox:
+                    bbox_corners_batch = batch['bbox_corners'].float().to(device) # Get bbox_corners
+                    if bbox_corners_batch is not None: print(f"bbox_corners_batch shape: {bbox_corners_batch.shape}")
                 else:
-                    fixed_history_length = int(np.floor(full_trajectory_batch.shape[1] * config.history_fraction))
-                    input_trajectory_batch = full_trajectory_batch[:, :fixed_history_length, :]
-                    bbox_corners_input_batch = bbox_corners_batch[:, :fixed_history_length, :, :]
+                    bbox_corners_batch = None
                 
+                batch['full_attention_mask'] = batch['full_attention_mask'].to(device) # Shape [1, config.trajectory_length]
+                print(f"batch['full_attention_mask'] shape: {batch['full_attention_mask'].shape}")
+
+                # --- Dynamically determine input history length based on actual trajectory length ---
+                current_full_trajectory = full_trajectory_batch # Shape [1, config.trajectory_length, 6]
+                print(f"current_full_trajectory shape: {current_full_trajectory.shape}")
+                current_attention_mask = batch['full_attention_mask'] # Shape [1, config.trajectory_length]
+                print(f"current_attention_mask shape: {current_attention_mask.shape}")
+
+                actual_length = current_attention_mask[0].sum().int().item() # Shape [1]
+                print(f"actual_length: {actual_length}")
+
+                if config.use_first_frame_only:
+                    # Ensure dynamic_input_hist_len is at least 0 and at most actual_length
+                    dynamic_input_hist_len = min(1, actual_length) if actual_length > 0 else 0
+                    input_trajectory_batch = current_full_trajectory[:, :dynamic_input_hist_len, :]
+                    if not config.no_bbox and bbox_corners_batch is not None:
+                        bbox_corners_input_batch = bbox_corners_batch[:, :dynamic_input_hist_len, :, :]
+                    else:
+                        bbox_corners_input_batch = None
+                else:
+                    # Calculate history length based on actual_length and history_fraction
+                    # Ensure it's at least 1 if actual_length > 0, and not more than actual_length
+                    if actual_length > 0:
+                        dynamic_input_hist_len = int(np.floor(actual_length * config.history_fraction)) # 91 * 0.3 = 27
+                        dynamic_input_hist_len = max(1, dynamic_input_hist_len) # Ensure at least 1 if possible
+                        dynamic_input_hist_len = min(dynamic_input_hist_len, actual_length) # Cap at actual_length
+                    else:
+                        dynamic_input_hist_len = 0 # No history if trajectory is empty
+
+                    input_trajectory_batch = current_full_trajectory[:, :dynamic_input_hist_len, :] 
+                    if not config.no_bbox and bbox_corners_batch is not None:
+                        bbox_corners_input_batch = bbox_corners_batch[:, :dynamic_input_hist_len, :, :]
+                    else:
+                        bbox_corners_input_batch = None
+                
+                print(f"dynamic_input_hist_len: {dynamic_input_hist_len}")
+                print(f"input_trajectory_batch shape: {input_trajectory_batch.shape}")
+                if bbox_corners_input_batch is not None: print(f"bbox_corners_input_batch shape: {bbox_corners_input_batch.shape}")
+                 # --- End dynamic input history length determination ---
+
                 # Get object category IDs if embedding is enabled
                 if not config.no_text_embedding:
                     object_category_ids = batch['object_category_id'].to(device)
+                    if object_category_ids is not None: print(f"object_category_ids shape: {object_category_ids.shape}")
                 else:
                     object_category_ids = None
 
@@ -801,7 +952,22 @@ def main():
 
             # Forward pass with input trajectory, point cloud, bbox corners, and category IDs
             predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids)
-            total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
+            if predicted_full_trajectory is not None: print(f"predicted_full_trajectory shape: {predicted_full_trajectory.shape}")
+
+            # --- Compute Loss with Visualization for the first epoch ---
+            if epoch == start_epoch:
+                sample_name_for_vis = f"{first_sample_name.replace(' ', '_')}_{first_sample_seq_name.replace('.json', '')}"
+                total_loss, loss_dict = model.compute_loss(
+                    predicted_full_trajectory, 
+                    batch, 
+                    epoch=epoch, 
+                    batch_idx=batch_idx, # This will be 0 for overfitting train_loader
+                    vis_save_dir=mask_check_dir, 
+                    sample_name_for_vis=sample_name_for_vis
+                )
+            else:
+                total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
+            # -----------------------------------------------------------
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -840,7 +1006,7 @@ def main():
                                 traj_images = [img for img in os.listdir(trajectory_vis_dir) 
                                              if img.endswith('.png')]
                                 
-                                if traj_images:
+                                if traj_images: # Simplified: log all trajectory images for the single sample
                                     wandb.log({"trajectory_visualizations": [wandb.Image(os.path.join(trajectory_vis_dir, img)) 
                                                                            for img in sorted(traj_images)]}, step=epoch)
                             except Exception as e:
@@ -854,7 +1020,7 @@ def main():
                             pred_images = [img for img in os.listdir(vis_output_dir) 
                                           if img.endswith('.png') and 'prediction_vs_gt' in img]
                             
-                            if pred_images:
+                            if pred_images: # Simplified: log all prediction images for the single sample
                                 wandb.log({"prediction_visualizations": [wandb.Image(os.path.join(vis_output_dir, img)) 
                                                                        for img in sorted(pred_images)]}, step=epoch)
                         except Exception as e:

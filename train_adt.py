@@ -17,6 +17,7 @@ from mpl_toolkits.mplot3d import Axes3D
 from config.adt_config import ADTObjectMotionConfig
 from dataset.gimo_multi_sequence_dataset import GIMOMultiSequenceDataset
 from model.gimo_adt_model import GIMO_ADT_Model
+from model.gimo_adt_autoregressive_model import GIMO_ADT_Autoregressive_Model
 from torch.utils.data import DataLoader
 from utils.visualization import visualize_trajectory, visualize_prediction, visualize_full_trajectory # Import visualization utils
 
@@ -171,22 +172,35 @@ def validate(model, dataloader, device, config, epoch):
                 
                 # Move mask to device for loss calc
                 batch['full_attention_mask'] = batch['full_attention_mask'].to(device)
-                
-                # Prepare input trajectory for the model based on config
+                current_attention_mask_batch = batch['full_attention_mask'] # Shape [B, config.trajectory_length]
+
+                # --- Dynamically determine input history length for the batch (validation) ---
+                actual_lengths_batch = current_attention_mask_batch.sum(dim=1).int() # Shape [B]
+
                 if config.use_first_frame_only:
-                    input_trajectory_batch = full_trajectory_batch[:, 0:1, :]
-                    if not config.no_bbox:
-                        bbox_corners_input_batch = bbox_corners_batch[:, 0:1, :, :] 
+                    hist_len_for_batch = 1 if torch.any(actual_lengths_batch > 0) else 0
+                    input_trajectory_batch = full_trajectory_batch[:, :hist_len_for_batch, :]
+                    if not config.no_bbox and bbox_corners_batch is not None:
+                        bbox_corners_input_batch = bbox_corners_batch[:, :hist_len_for_batch, :, :]
                     else:
                         bbox_corners_input_batch = None
                 else:
-                    fixed_history_length = int(np.floor(full_trajectory_batch.shape[1] * config.history_fraction))
-                    input_trajectory_batch = full_trajectory_batch[:, :fixed_history_length, :]
-                    if not config.no_bbox:
-                        bbox_corners_input_batch = bbox_corners_batch[:, :fixed_history_length, :, :]
+                    min_val_tensor = torch.ones_like(actual_lengths_batch).float()
+                    individual_dynamic_hist_lengths = (actual_lengths_batch.float() * config.history_fraction).floor().long()
+                    individual_dynamic_hist_lengths = torch.max(min_val_tensor.long(), individual_dynamic_hist_lengths)
+                    individual_dynamic_hist_lengths = torch.min(individual_dynamic_hist_lengths, actual_lengths_batch)
+                    individual_dynamic_hist_lengths[actual_lengths_batch == 0] = 0
+                    
+                    hist_len_for_batch = torch.max(individual_dynamic_hist_lengths).item()
+                    hist_len_for_batch = min(hist_len_for_batch, full_trajectory_batch.shape[1])
+
+                    input_trajectory_batch = full_trajectory_batch[:, :hist_len_for_batch, :]
+                    if not config.no_bbox and bbox_corners_batch is not None:
+                        bbox_corners_input_batch = bbox_corners_batch[:, :hist_len_for_batch, :, :]
                     else:
                         bbox_corners_input_batch = None
-                
+                # --- End dynamic input history length determination (validation) ---
+
                 # Get object category IDs if embedding is enabled
                 if not config.no_text_embedding:
                     object_category_ids = batch['object_category_id'].to(device)
@@ -474,17 +488,17 @@ def gimo_collate_fn(batch, dataset, num_sample_points):
             # Fallback to getting from dataset if not included in the item
             dataset_idx = item.get('dataset_idx', 0)
             point_cloud = dataset.get_scene_pointcloud(dataset_idx)
-            
-            if point_cloud is None:
-                print(f"Warning: Failed to get point cloud for dataset_idx {dataset_idx} in batch. Using zeros.")
-                # Create a dummy point cloud if loading fails
-                point_cloud = torch.zeros((num_sample_points, 3), dtype=torch.float32)
-            elif isinstance(point_cloud, np.ndarray):
-                point_cloud = torch.from_numpy(point_cloud).float()
-            
-            if i == 0:  # Only print for first item to avoid log spam
-                print(f"Using full scene point cloud with {point_cloud.shape[0]} points")
         
+        if point_cloud is None:
+            print(f"Warning: Failed to get point cloud for dataset_idx {dataset_idx} in batch. Using zeros.")
+            # Create a dummy point cloud if loading fails
+            point_cloud = torch.zeros((num_sample_points, 3), dtype=torch.float32)
+        elif isinstance(point_cloud, np.ndarray):
+            point_cloud = torch.from_numpy(point_cloud).float()
+        
+        if i == 0:  # Only print for first item to avoid log spam
+            print(f"Using full scene point cloud with {point_cloud.shape[0]} points")
+    
         # Sample the point cloud to ensure consistent size
         if point_cloud.shape[0] >= num_sample_points:
             # Randomly sample points without replacement
@@ -704,7 +718,15 @@ def main():
 
     # --- Model Initialization ---
     logger("Initializing model...")
-    model = GIMO_ADT_Model(config).to(device)
+    if config.timestep == 0:
+        logger("Using GIMO_ADT_Model (non-autoregressive).")
+        model = GIMO_ADT_Model(config).to(device)
+    elif config.timestep == 1:
+        logger("Using GIMO_ADT_Autoregressive_Model.")
+        model = GIMO_ADT_Autoregressive_Model(config).to(device)
+    else:
+        logger(f"Error: Invalid timestep configuration: {config.timestep}. Must be 0 or 1.")
+        raise ValueError(f"Invalid timestep configuration: {config.timestep}")
     
     # --- Log Model Architecture ---
     total_params = sum(p.numel() for p in model.parameters())
@@ -716,44 +738,44 @@ def main():
     logger(f"Text Embedding Enabled: {not getattr(config, 'no_text_embedding', False)}")
     logger(f"Bounding Box Processing Enabled: {not getattr(config, 'no_bbox', False)}")
     
-    # Log model components
-    components = {
-        'Motion Linear': (model.motion_linear, []), # Add relevant attributes if any
-        'Scene Encoder': (model.scene_encoder, ['hparams']), # PointNet2SemSegSSGShape uses hparams
-    }
+    # # Log model components
+    # components = {
+    #     'Motion Linear': (model.motion_linear, []), # Add relevant attributes if any
+    #     'Scene Encoder': (model.scene_encoder, ['hparams']), # PointNet2SemSegSSGShape uses hparams
+    # }
     
-    # Add bounding box related components if enabled
-    if not getattr(config, 'no_bbox', False):
-        components.update({
-            'FP Layer': (model.fp_layer, []),
-            'BBox PointNet': (model.bbox_pointnet, ['conv1']), # Example attribute
-        })
+    # # Add bounding box related components if enabled
+    # if not getattr(config, 'no_bbox', False):
+    #     components.update({
+    #         'FP Layer': (model.fp_layer, []),
+    #         'BBox PointNet': (model.bbox_pointnet, ['conv1']), # Example attribute
+    #     })
     
-    components.update({
-        'Motion BBox Encoder': (model.motion_bbox_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
-        'Embedding Layer (Fusion 2)': (model.embedding_layer, ['in_features', 'out_features']),
-        'Output Encoder': (model.output_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
-        'Output Layer': (model.outputlayer, ['in_features', 'out_features'])
-    })
+    # components.update({
+    #     'Motion BBox Encoder': (model.motion_bbox_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
+    #     'Embedding Layer (Fusion 2)': (model.embedding_layer, ['in_features', 'out_features']),
+    #     'Output Encoder': (model.output_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
+    #     'Output Layer': (model.outputlayer, ['in_features', 'out_features'])
+    # })
     
-    # Add text embedding components if enabled
-    if model.use_text_embedding: # Corrected condition
-        components.update({
-            'Category Embedding': (model.category_embedding, ['num_embeddings', 'embedding_dim'])
-        })
+    # # Add text embedding components if enabled
+    # if model.use_text_embedding: # Corrected condition
+    #     components.update({
+    #         'Category Embedding': (model.category_embedding, ['num_embeddings', 'embedding_dim'])
+    #     })
     
-    # Log each component's structure and parameters
-    for name, (component, attrs) in components.items():
-        params = sum(p.numel() for p in component.parameters())
-        logger(f"\n{name}:")
-        logger(f"  Parameters: {params:,}")
-        try:
-            # Try to log attributes if available
-            for attr in attrs:
-                if hasattr(component, attr):
-                    logger(f"  {attr}: {getattr(component, attr)}")
-        except:
-            pass
+    # # Log each component's structure and parameters
+    # for name, (component, attrs) in components.items():
+    #     params = sum(p.numel() for p in component.parameters())
+    #     logger(f"\n{name}:")
+    #     logger(f"  Parameters: {params:,}")
+    #     try:
+    #         # Try to log attributes if available
+    #         for attr in attrs:
+    #             if hasattr(component, attr):
+    #                 logger(f"  {attr}: {getattr(component, attr)}")
+    #     except:
+    #         pass
     
     logger("=== END MODEL ARCHITECTURE ===\n")
     
@@ -821,22 +843,42 @@ def main():
                 
                 # Move mask to device for loss calc
                 batch['full_attention_mask'] = batch['full_attention_mask'].to(device)
-                
-                # Prepare input trajectory for the model based on config
+                current_attention_mask_batch = batch['full_attention_mask'] # Shape [B, config.trajectory_length]
+
+                # --- Dynamically determine input history length for the batch ---
+                actual_lengths_batch = current_attention_mask_batch.sum(dim=1).int() # Shape [B]
+
                 if config.use_first_frame_only:
-                    input_trajectory_batch = full_trajectory_batch[:, 0:1, :]
-                    if not config.no_bbox:
-                        bbox_corners_input_batch = bbox_corners_batch[:, 0:1, :, :] 
+                    # If any sample has actual_length > 0, hist_len is 1, else 0.
+                    # Effectively, if the batch is not entirely empty trajectories.
+                    hist_len_for_batch = 1 if torch.any(actual_lengths_batch > 0) else 0
+                    input_trajectory_batch = full_trajectory_batch[:, :hist_len_for_batch, :] 
+                    if not config.no_bbox and bbox_corners_batch is not None:
+                        bbox_corners_input_batch = bbox_corners_batch[:, :hist_len_for_batch, :, :]
                     else:
                         bbox_corners_input_batch = None
                 else:
-                    fixed_history_length = int(np.floor(full_trajectory_batch.shape[1] * config.history_fraction))
-                    input_trajectory_batch = full_trajectory_batch[:, :fixed_history_length, :]
-                    if not config.no_bbox:
-                        bbox_corners_input_batch = bbox_corners_batch[:, :fixed_history_length, :, :]
+                    # Calculate individual dynamic history lengths
+                    # Ensure min history is 1 if actual_length > 0, and capped by actual_length
+                    min_val_tensor = torch.ones_like(actual_lengths_batch).float() # For max(1, ...)
+                    individual_dynamic_hist_lengths = (actual_lengths_batch.float() * config.history_fraction).floor().long()
+                    individual_dynamic_hist_lengths = torch.max(min_val_tensor.long(), individual_dynamic_hist_lengths)
+                    individual_dynamic_hist_lengths = torch.min(individual_dynamic_hist_lengths, actual_lengths_batch) 
+                    # Ensure 0 if actual_length is 0
+                    individual_dynamic_hist_lengths[actual_lengths_batch == 0] = 0
+
+                    # Use the max dynamic history length in the current batch
+                    # Clamp this to be at most full_trajectory_batch.shape[1] (i.e. config.trajectory_length)
+                    hist_len_for_batch = torch.max(individual_dynamic_hist_lengths).item()
+                    hist_len_for_batch = min(hist_len_for_batch, full_trajectory_batch.shape[1])
+                    
+                    input_trajectory_batch = full_trajectory_batch[:, :hist_len_for_batch, :]
+                    if not config.no_bbox and bbox_corners_batch is not None:
+                        bbox_corners_input_batch = bbox_corners_batch[:, :hist_len_for_batch, :, :]
                     else:
                         bbox_corners_input_batch = None
-                
+                # --- End dynamic input history length determination ---
+
                 # Get object category IDs if embedding is enabled
                 if not config.no_text_embedding:
                     object_category_ids = batch['object_category_id'].to(device)

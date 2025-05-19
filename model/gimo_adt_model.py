@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import os # Added for path manipulation
+import matplotlib.pyplot as plt # Added for visualization
 
 # Actual GIMO components
 from .pointnet_plus2 import PointNet2SemSegSSGShape, PointNet, MyFPModule
@@ -74,21 +76,20 @@ class GIMO_ADT_Model(nn.Module):
         # Final Embedded Layer (second fusion)
         # Prepare input dims for embedding layer
         # This layer will now potentially receive category embeddings as well
-        embed_input_dim = config.motion_latent_dim + config.scene_feats_dim
+        embed_dim = config.motion_latent_dim + config.scene_feats_dim
         if not config.no_text_embedding:
-            embed_input_dim += config.category_embed_dim
+            embed_dim += config.category_embed_dim
         
-        embed_output_dim = config.embedding_hidden_dim
-        self.embedding_layer = nn.Linear(embed_input_dim, embed_output_dim)
-            
-        # Determine output layer input dimension
-        # The output_encoder's input is embed_output_dim.
-        # The outputlayer's input is output_latent_dim from output_encoder.
-        output_input_dim = config.output_latent_dim # Changed: No longer adds category_embed_dim here
+        self.embedding_layer = PositionwiseFeedForward(
+            d_in=embed_dim, 
+            d_hid=embed_dim, 
+            dropout=config.dropout
+        )
+        
         
         # --- Output components ---
         self.output_encoder = PerceiveEncoder(
-            n_input_channels=embed_output_dim,
+            n_input_channels=embed_dim,
             n_latent=self.sequence_length,  # Required parameter for number of latent tokens
             n_latent_channels=config.output_latent_dim,
             n_self_att_heads=config.output_n_heads,
@@ -97,7 +98,7 @@ class GIMO_ADT_Model(nn.Module):
         )
         
         # Final output layer (predicts full motion trajectory)
-        self.outputlayer = nn.Linear(output_input_dim, config.object_motion_dim)
+        self.outputlayer = nn.Linear(config.output_latent_dim, config.object_motion_dim)
     
     def forward(self, input_trajectory, point_cloud, bounding_box_corners=None, object_category_ids=None):
         """
@@ -114,7 +115,6 @@ class GIMO_ADT_Model(nn.Module):
         """
         batch_size = input_trajectory.shape[0]
         input_length = input_trajectory.shape[1]  # length of input trajectory
-        sequence_length = self.sequence_length  # full output sequence length, get from model attribute
         
         # --- Check if object_category_ids is provided when needed ---
         if not self.config.no_text_embedding and object_category_ids is None:
@@ -124,18 +124,18 @@ class GIMO_ADT_Model(nn.Module):
         if self.use_bbox and bounding_box_corners is None:
             raise ValueError("bounding_box_corners is required when no_bbox=False")
             
-        # Task 3.2.1: Process Input Trajectory
+        # Process Input Trajectory
         # Input trajectory to motion features [B, T, motion_hidden_dim]
         f_m = self.motion_linear(input_trajectory)
         
-        # Task 3.2.2: Process Point Cloud
+        # Process Point Cloud
         # Process the scene point cloud to get per-point features and global features
         # PointNet2SemSegSSGShape expects point_cloud to be [B, N, 6] where the last 3 dimensions are duplicated
         # Convert [B, N, 3] to [B, N, 6] by duplicating the XYZ values
         point_cloud_6d = torch.cat([point_cloud, point_cloud], dim=2)  # [B, N, 6]
         scene_feats_per_point, scene_global_feats = self.scene_encoder(point_cloud_6d)
         
-        # Task 3.2.3: Process Bounding Box (if enabled)
+        # Process Bounding Box (if enabled)
         if self.use_bbox and bounding_box_corners is not None:
             num_bbox_corners = bounding_box_corners.shape[2]  # should be 8
             
@@ -166,7 +166,6 @@ class GIMO_ADT_Model(nn.Module):
             # Output: f_s_b [B, T, scene_feats_dim]
             f_s_b = f_s_b_per_ts.reshape(batch_size, input_length, self.config.scene_feats_dim)
             
-            # Task 3.2.4: Fusion 1 (Motion f_m + BBox Scene Features f_s_b)
             # f_m is [B, T, motion_hidden_dim]
             # f_s_b is [B, T, scene_feats_dim]
             fused_motion_bbox_input = torch.cat([f_m, f_s_b], dim=2) # [B, T, motion_hidden_dim + scene_feats_dim]
@@ -183,7 +182,6 @@ class GIMO_ADT_Model(nn.Module):
             category_embeddings = self.category_embedding(object_category_ids) # [B, category_embed_dim]
             category_embeddings_expanded = category_embeddings.unsqueeze(1).repeat(1, self.sequence_length, 1) # [B, sequence_length, category_embed_dim]
 
-        # Task 3.2.5: Fusion 2 (Global Scene + Output of Fusion 1 + Optional Category Embedding)
         # scene_global_feats is [B, scene_feats_dim]
         # encoded_motion_bbox is [B, sequence_length, motion_latent_dim]
         scene_global_feats_expanded = scene_global_feats.unsqueeze(1).repeat(1, self.sequence_length, 1) # [B, sequence_length, scene_feats_dim]
@@ -195,34 +193,28 @@ class GIMO_ADT_Model(nn.Module):
 
         if category_embeddings_expanded is not None:
             features_to_fuse.append(category_embeddings_expanded)
-            
-        final_fused_input = torch.cat(features_to_fuse, dim=2)
-        # Expected shape of final_fused_input: 
-        # [B, sequence_length, scene_feats_dim + motion_latent_dim (+ category_embed_dim if used)]
         
-        # Pass through embedding layer
-        # embedding_output is [B, sequence_length, embedding_hidden_dim]
-        embedding_output = self.embedding_layer(final_fused_input)
+        # Concatenate all features along the last dimension
+        # [B, sequence_length, scene_feats_dim + motion_latent_dim + category_embed_dim]
+        final_fused_input = torch.cat(features_to_fuse, dim=2)
+
+
+        cross_modal_embedding = self.embedding_layer(final_fused_input) # Output: [B, sequence_length, embed_input_dim]
+
         
         # Process with output encoder
         # output_features is [B, sequence_length, output_latent_dim]
-        output_features = self.output_encoder(embedding_output)
-        
-        # The output_features from output_encoder is now the direct input to the final output layer
-        final_input_to_outputlayer = output_features
-        
-        # Task 3.2.6: Final Output Layer
-        # Predict full motion trajectory
-        all_predictions = self.outputlayer(final_input_to_outputlayer)
+        cross_modal_embedding = self.output_encoder(cross_modal_embedding)
+        all_predictions = self.outputlayer(cross_modal_embedding)
 
         return all_predictions
 
-    def compute_loss(self, predictions, batch):
+    def compute_loss(self, predictions, batch, epoch=None, batch_idx=None, vis_save_dir=None, sample_name_for_vis=None):
         """
-        Computes the loss for the predicted trajectories using L1 norm, 
+        Computes the loss for the predicted trajectories using L1 norm,
         incorporating dynamic history/future split based on attention mask.
         Losses are simplified to translation (position) and orientation components.
-        
+
         Now predictions tensor always has shape [B, sequence_length, motion_dim]
         regardless of config.use_first_frame_only setting.
 
@@ -231,6 +223,11 @@ class GIMO_ADT_Model(nn.Module):
             batch: The batch dictionary from the DataLoader, containing ground truth.
                    Expected keys: 'full_poses' [B, sequence_length, motion_dim]
                                   'full_attention_mask' [B, sequence_length]
+            epoch (optional): Current epoch number, for visualization.
+            batch_idx (optional): Current batch index, for visualization.
+            vis_save_dir (optional): Directory to save visualizations.
+            sample_name_for_vis (optional): Sample name for visualization filename.
+
 
         Returns:
             torch.Tensor: The computed total loss value (scalar).
@@ -240,19 +237,19 @@ class GIMO_ADT_Model(nn.Module):
         gt_full_mask = batch['full_attention_mask'].to(predictions.device) # Shape [B, seq_len]
         batch_size = gt_full_poses.shape[0]
         device = predictions.device
-        
+
         # Split poses into positions and orientations for separate loss calculation
         position_dim = 3  # Assuming first 3 dimensions are x, y, z
-        
+
         # Extract ground truth positions and orientations
         gt_full_positions = gt_full_poses[..., :position_dim]
         gt_full_orientations = gt_full_poses[..., position_dim:]
-        
+
         # Extract predicted positions and orientations
         pred_positions = predictions[..., :position_dim]
         pred_orientations = predictions[..., position_dim:]
-        
-        # --- Calculate Dynamic Split Lengths --- 
+
+        # --- Calculate Dynamic Split Lengths ---
         actual_lengths = torch.sum(gt_full_mask, dim=1) # [B]
         # Ensure history length is at least 1 and doesn't exceed actual length, and handle dtypes
         # In use_first_frame_only mode, history length is effectively 1
@@ -265,12 +262,12 @@ class GIMO_ADT_Model(nn.Module):
             min_val_tensor = torch.tensor(1, device=device)
             dynamic_history_lengths = torch.floor(actual_lengths * self.history_fraction).long().clamp(min=min_val_tensor, max=actual_lengths.long())
         # ---------------------------------------
-        
+
         # Create masks for history and future based on dynamic lengths
         indices = torch.arange(self.sequence_length, device=device).unsqueeze(0) # [1, seq_len]
         dynamic_history_mask = (indices < dynamic_history_lengths.unsqueeze(1)).float() # [B, seq_len]
         dynamic_future_mask = (indices >= dynamic_history_lengths.unsqueeze(1)) * gt_full_mask # [B, seq_len]
-        
+
         # For loss calculation, use complete sequences since predictions now always includes all frames
         gt_future_positions = gt_full_positions
         gt_future_orientations = gt_full_orientations
@@ -403,5 +400,60 @@ class GIMO_ADT_Model(nn.Module):
             'dest_trans_loss': weighted_dest_trans_loss,
             'dest_ori_loss': weighted_dest_ori_loss
         }
-            
+
+        # --- Visualization Logic ---
+        if vis_save_dir and sample_name_for_vis and epoch is not None and batch_idx is not None:
+            try:
+                # Ensure only visualizing for the first item in the batch (if batch_size > 1, though for overfitting it's 1)
+                if batch_size > 0:
+                    os.makedirs(vis_save_dir, exist_ok=True)
+                    
+                    # Prepare data for visualization (first sample in batch)
+                    gt_poses_vis = gt_full_poses[0, :, :position_dim].norm(dim=-1).cpu().numpy() # L2 norm of position
+                    gt_mask_vis = gt_full_mask[0].cpu().numpy()
+                    hist_mask_vis = dynamic_history_mask[0].cpu().numpy()
+                    future_mask_vis = dynamic_future_mask[0].cpu().numpy()
+                    hist_len_vis = dynamic_history_lengths[0].item()
+
+                    timesteps = np.arange(self.sequence_length)
+
+                    fig, axs = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+                    fig.suptitle(f'Mask Visualization - {sample_name_for_vis}\\nEpoch {epoch}, Batch {batch_idx}, Hist Len: {hist_len_vis}', fontsize=10)
+
+                    # Plot GT Full Pose (L2 norm of position)
+                    axs[0].bar(timesteps, gt_poses_vis, color='blue', alpha=0.7)
+                    axs[0].set_title('GT Full Pose (Position L2 Norm)', fontsize=8)
+                    axs[0].set_ylabel('L2 Norm', fontsize=8)
+                    
+                    # Plot GT Full Mask
+                    axs[1].bar(timesteps, gt_mask_vis, color='green', alpha=0.7)
+                    axs[1].set_title('GT Full Mask', fontsize=8)
+                    axs[1].set_ylabel('Mask Value', fontsize=8)
+                    axs[1].set_yticks([0, 1])
+
+                    # Plot Dynamic History Mask
+                    axs[2].bar(timesteps, hist_mask_vis, color='red', alpha=0.7)
+                    axs[2].set_title(f'Dynamic History Mask (Length: {hist_len_vis})', fontsize=8)
+                    axs[2].set_ylabel('Mask Value', fontsize=8)
+                    axs[2].set_yticks([0, 1])
+
+                    # Plot Dynamic Future Mask
+                    axs[3].bar(timesteps, future_mask_vis, color='purple', alpha=0.7)
+                    axs[3].set_title('Dynamic Future Mask', fontsize=8)
+                    axs[3].set_ylabel('Mask Value', fontsize=8)
+                    axs[3].set_yticks([0, 1])
+                    
+                    plt.xlabel('Timestep', fontsize=8)
+                    plt.tight_layout(rect=[0, 0, 1, 0.96]) # Adjust layout to make space for suptitle
+                    
+                    save_filename = f"{sample_name_for_vis}_epoch{epoch}_batch{batch_idx}_model_masks.png"
+                    save_path = os.path.join(vis_save_dir, save_filename)
+                    plt.savefig(save_path)
+                    plt.close(fig)
+                    # print(f"Saved mask visualization to {save_path}") # Optional: for debugging
+            except Exception as e:
+                print(f"Error during mask visualization in GIMO_ADT_Model: {e}")
+                # import traceback
+                # traceback.print_exc() # For more detailed error logging if needed
+
         return total_loss, loss_dict 

@@ -7,3 +7,4 @@ einops
 scipy
 projectaria_tools
 rerun-sdk
+wandb
