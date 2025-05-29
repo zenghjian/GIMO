@@ -105,13 +105,13 @@ class GIMO_ADT_Model(nn.Module):
         Forward pass of the GIMO ADT model with 3D bounding box integration.
         
         Args:
-            input_trajectory: [batch_size, input_length, 6] - history trajectory (positions and orientations)
+            input_trajectory: [batch_size, input_length, 9] - history trajectory (positions and 6D rotations)
             point_cloud: [batch_size, num_points, 3] - scene point cloud
             bounding_box_corners: [batch_size, input_length, 8, 3] - 3D bbox corners for each input timestep (optional if no_bbox=True)
             object_category_ids: [batch_size] - category IDs for objects (optional if no_text_embedding=True)
             
         Returns:
-            torch.Tensor: Predicted full trajectory [batch_size, sequence_length, 6]
+            torch.Tensor: Predicted full trajectory [batch_size, sequence_length, 9]
         """
         batch_size = input_trajectory.shape[0]
         input_length = input_trajectory.shape[1]  # length of input trajectory
@@ -133,7 +133,8 @@ class GIMO_ADT_Model(nn.Module):
         # PointNet2SemSegSSGShape expects point_cloud to be [B, N, 6] where the last 3 dimensions are duplicated
         # Convert [B, N, 3] to [B, N, 6] by duplicating the XYZ values
         point_cloud_6d = torch.cat([point_cloud, point_cloud], dim=2)  # [B, N, 6]
-        scene_feats_per_point, scene_global_feats = self.scene_encoder(point_cloud_6d)
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float32):
+            scene_feats_per_point, scene_global_feats = self.scene_encoder(point_cloud_6d)
         
         # Process Bounding Box (if enabled)
         if self.use_bbox and bounding_box_corners is not None:
@@ -238,16 +239,17 @@ class GIMO_ADT_Model(nn.Module):
         batch_size = gt_full_poses.shape[0]
         device = predictions.device
 
-        # Split poses into positions and orientations for separate loss calculation
-        position_dim = 3  # Assuming first 3 dimensions are x, y, z
+        # Split poses into positions and rotations for separate loss calculation
+        position_dim = 3  
+        rotation_dim = 6  
 
-        # Extract ground truth positions and orientations
+        # Extract ground truth positions and rotations
         gt_full_positions = gt_full_poses[..., :position_dim]
-        gt_full_orientations = gt_full_poses[..., position_dim:]
+        gt_full_rotations = gt_full_poses[..., position_dim:position_dim+rotation_dim]
 
-        # Extract predicted positions and orientations
+        # Extract predicted positions and rotations
         pred_positions = predictions[..., :position_dim]
-        pred_orientations = predictions[..., position_dim:]
+        pred_rotations = predictions[..., position_dim:position_dim+rotation_dim]
 
         # --- Calculate Dynamic Split Lengths ---
         actual_lengths = torch.sum(gt_full_mask, dim=1) # [B]
@@ -270,9 +272,9 @@ class GIMO_ADT_Model(nn.Module):
 
         # For loss calculation, use complete sequences since predictions now always includes all frames
         gt_future_positions = gt_full_positions
-        gt_future_orientations = gt_full_orientations
+        gt_future_rotations = gt_full_rotations
         pred_future_positions = pred_positions
-        pred_future_orientations = pred_orientations
+        pred_future_rotations = pred_rotations
         
         # For use_first_frame_only mode, we still only want to compute future loss on frames after the first
         if self.config.use_first_frame_only:
@@ -297,7 +299,7 @@ class GIMO_ADT_Model(nn.Module):
         mean_trans_loss = torch.sum(mean_loss_trans_per_seq) / torch.sum(valid_trans_mask) if torch.sum(valid_trans_mask) > 0 else torch.tensor(0.0, device=device)
         
         # --- Calculate Orientation Loss --- 
-        loss_ori_per_coord = F.l1_loss(pred_future_orientations, gt_future_orientations, reduction='none') # [B, relevant_len, 3]
+        loss_ori_per_coord = F.l1_loss(pred_future_rotations, gt_future_rotations, reduction='none') # [B, relevant_len, 6]
         loss_ori_per_point = torch.sum(loss_ori_per_coord, dim=-1) # [B, relevant_len]
         masked_loss_ori = loss_ori_per_point * dynamic_future_mask_for_loss # Apply mask [B, relevant_len]
         
@@ -313,11 +315,11 @@ class GIMO_ADT_Model(nn.Module):
             hist_mask = (hist_indices < dynamic_history_lengths.unsqueeze(1)) * gt_full_mask  # [B, seq_len]
             
             # Extract predictions and ground truth for history segment only
-            hist_gt_poses = gt_full_poses  # [B, seq_len, 6]
-            hist_pred_poses = predictions  # [B, seq_len, 6]
+            hist_gt_poses = gt_full_poses  # [B, seq_len, 9]
+            hist_pred_poses = predictions  # [B, seq_len, 9]
             
-            # Calculate reconstruction loss for full poses (positions + orientations)
-            loss_rec_per_coord = F.l1_loss(hist_pred_poses, hist_gt_poses, reduction='none')  # [B, seq_len, 6]
+            # Calculate reconstruction loss for full poses (positions + rotations)
+            loss_rec_per_coord = F.l1_loss(hist_pred_poses, hist_gt_poses, reduction='none')  # [B, seq_len, 9]
             loss_rec_per_point = torch.sum(loss_rec_per_coord, dim=-1)  # [B, seq_len]
             masked_loss_rec = loss_rec_per_point * hist_mask  # Apply mask [B, seq_len]
             
@@ -330,14 +332,14 @@ class GIMO_ADT_Model(nn.Module):
         elif self.config.use_first_frame_only:
             # For first_frame_only mode, calculate reconstruction loss just for the first frame
             # Now predictions includes the first frame (predictions[:, 0, :])
-            first_frame_gt = gt_full_poses[:, 0, :]  # [B, 6]
-            first_frame_pred = predictions[:, 0, :]  # [B, 6]
+            first_frame_gt = gt_full_poses[:, 0, :]  # [B, 9]
+            first_frame_pred = predictions[:, 0, :]  # [B, 9]
             
             # Create a mask for valid first frames
             first_frame_mask = gt_full_mask[:, 0]  # [B]
             
             # Calculate reconstruction loss for first frame
-            first_frame_loss = F.l1_loss(first_frame_pred, first_frame_gt, reduction='none')  # [B, 6]
+            first_frame_loss = F.l1_loss(first_frame_pred, first_frame_gt, reduction='none')  # [B, 9]
             first_frame_loss_per_batch = torch.sum(first_frame_loss, dim=1)  # [B]
             
             # Apply mask and average
@@ -368,17 +370,17 @@ class GIMO_ADT_Model(nn.Module):
         batch_indices = torch.arange(batch_size, device=device)
         
         # Extract the last valid GT and predicted positions
-        last_gt_poses = gt_full_poses[batch_indices, last_valid_indices]  # [B, 6]
+        last_gt_poses = gt_full_poses[batch_indices, last_valid_indices]  # [B, 9]
         
         # Predictions now always include the full sequence with same indexing as GT
-        last_pred_poses = predictions[batch_indices, last_valid_indices]  # [B, 6]
+        last_pred_poses = predictions[batch_indices, last_valid_indices]  # [B, 9]
         
-        # Calculate destination loss for both positions and orientations
-        dest_loss_per_coord = F.l1_loss(last_pred_poses, last_gt_poses, reduction='none')  # [B, 6]
+        # Calculate destination loss for both positions and rotations
+        dest_loss_per_coord = F.l1_loss(last_pred_poses, last_gt_poses, reduction='none')  # [B, 9]
         
-        # Split into position and orientation components
+        # Split into position and rotation components
         dest_trans_loss_per_seq = torch.sum(dest_loss_per_coord[:, :position_dim], dim=1)  # [B]
-        dest_ori_loss_per_seq = torch.sum(dest_loss_per_coord[:, position_dim:], dim=1)  # [B]
+        dest_ori_loss_per_seq = torch.sum(dest_loss_per_coord[:, position_dim:position_dim+rotation_dim], dim=1)  # [B]
         
         # Apply mask to handle invalid sequences
         valid_dest_mask = last_valid_indices >= 0 # Check if index is valid (>=0)

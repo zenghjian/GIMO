@@ -19,8 +19,8 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.traj_dataset_configs.add_argument('--trajectory_length', default=200, type=int, help='Total length of trajectory segments extracted (before split)')
         self.traj_dataset_configs.add_argument('--history_fraction', default=0.3, type=float, help='Fraction of trajectory_length to use for history (e.g., 0.6 for 3/5 ratio)')
         self.traj_dataset_configs.add_argument('--object_position_dim', default=3, type=int, help='Dimension of object position (x, y, z)')
-        self.traj_dataset_configs.add_argument('--object_orientation_dim', default=3, type=int, help='Dimension of object orientation (roll, pitch, yaw)')
-        self.traj_dataset_configs.add_argument('--object_motion_dim', default=6, type=int, help='Total dimension of object motion (positions + orientations)')
+        self.traj_dataset_configs.add_argument('--object_rotation_dim', default=6, type=int, help='Dimension of object rotation (6D representation)')
+        self.traj_dataset_configs.add_argument('--object_motion_dim', default=9, type=int, help='Total dimension of object motion (positions + rotations)')
         self.traj_dataset_configs.add_argument('--point_cloud_dim', default=3, type=int, help='Dimension of input point cloud points (e.g., 3 for XYZ)')
         self.traj_dataset_configs.add_argument('--skip_frames', default=5, type=int, help='Frames to skip when extracting trajectory points from dataset')
         self.traj_dataset_configs.add_argument('--use_displacements', default=False, action='store_true', help='Use relative displacements instead of absolute positions')
@@ -36,7 +36,6 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.traj_dataset_configs.add_argument('--motion_velocity_threshold', default=0.05, type=float, help='Threshold in m/s for detecting active motion')
         self.traj_dataset_configs.add_argument('--min_segment_frames', default=5, type=int, help='Minimum number of frames for a valid motion segment')
         self.traj_dataset_configs.add_argument('--max_stationary_frames', default=3, type=int, help='Maximum consecutive stationary frames allowed in a motion segment')
-        self.traj_dataset_configs.add_argument('--normalize_data', default=False, action='store_true', help='Enable normalization of trajectory data using scene bounds')
         self.traj_dataset_configs.add_argument('--global_cache_dir', type=str, default=None, help='Path to a shared global directory for trajectory cache (overrides cache within save_path)')
         self.traj_dataset_configs.add_argument('--force_use_cache', action='store_true', default=False, help='Force using available cache files even if parameters don\'t match')
 
@@ -72,9 +71,9 @@ class ADTObjectMotionConfig(ArgumentParser):
         # === Training Configuration ===
         self.train_configs = self.add_argument_group('Training')
         self.train_configs.add_argument('--save_path', type=str, default='chkpoints_adt/', help='Directory to save checkpoints')
-        self.train_configs.add_argument('--save_fre', type=int, default=50, help='Checkpoint saving frequency (epochs)')
+        self.train_configs.add_argument('--save_fre', type=int, default=10, help='Checkpoint saving frequency (epochs)')
         # self.train_configs.add_argument('--vis_fre', type=int, default=1000) # Maybe redefine for trajectory viz
-        self.train_configs.add_argument('--val_fre', type=int, default=50, help='Validation frequency (epochs)')
+        self.train_configs.add_argument('--val_fre', type=int, default=1, help='Validation frequency (epochs)')
         self.train_configs.add_argument('--num_val_visualizations', type=int, default=500, help='Number of samples to visualize during validation')
         self.train_configs.add_argument('--load_model_dir', type=str, default=None, help='Path to load a pretrained model checkpoint')
         self.train_configs.add_argument('--load_optim_dir', type=str, default=None, help='Path to load optimizer state separately')
@@ -84,6 +83,9 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.train_configs.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
         self.train_configs.add_argument('--weight_decay', type=float, default=5e-4, help='Weight decay for optimizer')
         self.train_configs.add_argument('--gamma', type=float, default=0.99, help='Learning rate decay factor')
+        self.train_configs.add_argument('--adam_beta1', type=float, default=0.9, help='AdamW optimizer beta1 parameter')
+        self.train_configs.add_argument('--adam_beta2', type=float, default=0.999, help='AdamW optimizer beta2 parameter')
+        self.train_configs.add_argument('--adam_eps', type=float, default=1e-8, help='AdamW optimizer epsilon parameter')
         
         # Loss weights for position and orientation components
         self.train_configs.add_argument('--lambda_trans', type=float, default=1.0, help='Weight for translation/position loss')
@@ -104,18 +106,19 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.viz_configs = self.add_argument_group('Visualization')
         self.viz_configs.add_argument('--viz_ori_scale', type=float, default=0.2, help='Scale factor for orientation arrows in visualization')
         self.viz_configs.add_argument('--show_ori_arrows', action='store_true', default=False, help='Show orientation arrows in visualization')
+        self.viz_configs.add_argument('--visualize_train_trajectories_on_start', action='store_true', default=False, help='Generate and save visualizations for a subset of the training data at the beginning of training.')
 
     def get_configs(self):
         # Basic validation
         args = self.parse_args()
         
         # Ensure object_motion_dim matches position_dim + orientation_dim
-        if args.object_motion_dim != args.object_position_dim + args.object_orientation_dim:
+        if args.object_motion_dim != args.object_position_dim + args.object_rotation_dim:
             print(f"Warning: object_motion_dim ({args.object_motion_dim}) does not match "
                   f"object_position_dim ({args.object_position_dim}) + "
-                  f"object_orientation_dim ({args.object_orientation_dim}). "
-                  f"Setting object_motion_dim = position_dim + orientation_dim.")
-            args.object_motion_dim = args.object_position_dim + args.object_orientation_dim
+                  f"object_rotation_dim ({args.object_rotation_dim}). "
+                  f"Setting object_motion_dim = position_dim + rotation_dim.")
+            args.object_motion_dim = args.object_position_dim + args.object_rotation_dim
             
         return args
 

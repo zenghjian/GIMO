@@ -243,7 +243,7 @@ def validate(model, dataloader, device, config, epoch):
                     history_length = int(np.floor(actual_length * config.history_fraction))
                     history_length = max(1, min(history_length, actual_length - 1))
                 
-                # Extract position components (first 3 dimensions)
+                # Extract position component (first 3 dimensions) for metrics
                 position_dim = config.object_position_dim
                 gt_positions = gt_full_poses[:, :position_dim]
                 
@@ -309,21 +309,21 @@ def validate(model, dataloader, device, config, epoch):
                             history_length_for_vis = int(np.floor(actual_length * config.history_fraction))
                             history_length_for_vis = max(1, min(history_length_for_vis, actual_length)) # Ensure valid length
 
-                    # Extract position and orientation components
+                    # Extract position and rotation components
                     position_dim = 3  # First 3 dimensions are position
                     
                     gt_full_positions = gt_full_poses[:, :position_dim]
-                    gt_full_orientations = gt_full_poses[:, position_dim:]
+                    gt_full_rotations = gt_full_poses[:, position_dim:]
                     
                     pred_full_positions = pred_full_trajectory[:, :position_dim]
-                    pred_full_orientations = pred_full_trajectory[:, position_dim:]
+                    pred_full_rotations = pred_full_trajectory[:, position_dim:]
 
                     # Slice GT based on the calculated history length for visualization
                     vis_past_positions = gt_full_positions[:history_length_for_vis]
                     vis_future_positions_gt = gt_full_positions[history_length_for_vis:actual_length] # Slice up to actual length
                     
-                    vis_past_orientations = gt_full_orientations[:history_length_for_vis]
-                    vis_future_orientations_gt = gt_full_orientations[history_length_for_vis:actual_length]
+                    vis_past_rotations = gt_full_rotations[:history_length_for_vis]
+                    vis_future_rotations_gt = gt_full_rotations[history_length_for_vis:actual_length]
 
                     vis_past_mask = gt_full_mask[:history_length_for_vis] if gt_full_mask is not None else None
                     vis_future_mask_gt = gt_full_mask[history_length_for_vis:actual_length] if gt_full_mask is not None else None
@@ -334,14 +334,14 @@ def validate(model, dataloader, device, config, epoch):
                         # For visualization, we only care about the future portion (frames 1 onwards)
                         valid_future_len = actual_length - history_length_for_vis
                         predicted_future_positions = pred_full_positions[history_length_for_vis:history_length_for_vis+valid_future_len]
-                        predicted_future_orientations = pred_full_orientations[history_length_for_vis:history_length_for_vis+valid_future_len]
+                        predicted_future_rotations = pred_full_rotations[history_length_for_vis:history_length_for_vis+valid_future_len]
                     else:
                         # Standard case: model output is full trajectory
                         pred_past_positions = pred_full_positions[:history_length_for_vis]
                         predicted_future_positions = pred_full_positions[history_length_for_vis:actual_length]
                         
-                        pred_past_orientations = pred_full_orientations[:history_length_for_vis]
-                        predicted_future_orientations = pred_full_orientations[history_length_for_vis:actual_length]
+                        pred_past_rotations = pred_full_rotations[:history_length_for_vis]
+                        predicted_future_rotations = pred_full_rotations[history_length_for_vis:actual_length]
                     # ----------------------------------------------------
 
                     obj_name = batch['object_name'][i] if 'object_name' in batch else f"unknown_{i}"
@@ -368,13 +368,13 @@ def validate(model, dataloader, device, config, epoch):
                     vis_title_base = f"{title_obj_name} ({title_seq_name}, {title_seg_id}, {title_batch_id})"
                     # --- MODIFICATION END ---
                     
-                    # Check if orientation visualization is enabled
+                    # Check if rotation visualization is enabled
                     show_ori_arrows = getattr(config, 'show_ori_arrows', False)
                     viz_ori_scale = getattr(config, 'viz_ori_scale', 0.2)
                     
                     # Only generate full trajectory and split visualizations on first validation
                     if is_first_validation:
-                        # Full Trajectory Visualization - now with point cloud and orientation
+                        # Full Trajectory Visualization - now with point cloud and rotation
                         full_traj_path = os.path.join(trajectory_vis_dir, f"{filename_base}_full_trajectory_with_scene.png")
                         # Get bbox corners for current sample if available
                         sample_bbox_corners_cpu = None
@@ -427,10 +427,10 @@ def validate(model, dataloader, device, config, epoch):
                         title=f"Pred vs GT - {vis_title_base} (Epoch {epoch})",
                         save_path=pred_vs_gt_path,
                         segment_idx=segment_idx,
-                        show_orientation=show_ori_arrows,
-                        past_orientations=vis_past_orientations.cpu(), # Orientations not transformed
-                        future_orientations_gt=vis_future_orientations_gt.cpu(), # Orientations not transformed
-                        future_orientations_pred=predicted_future_orientations.cpu() # Orientations not transformed
+                        show_rotations=show_ori_arrows,
+                        past_rotations=vis_past_rotations.cpu(),
+                        future_rotations_gt=vis_future_rotations_gt.cpu(),
+                        future_rotations_pred=predicted_future_rotations.cpu()
                     )
                     
                     visualized_count += 1
@@ -532,6 +532,129 @@ def gimo_collate_fn(batch, dataset, num_sample_points):
     
     return collated_batch
 # ---------------------------
+
+def visualize_initial_train_data(train_loader, device, config, logger):
+    if not config.visualize_train_trajectories_on_start:
+        return
+
+    logger("--- Visualizing Initial Training Data ---")
+    
+    vis_output_dir = os.path.join(config.save_path, "train_trajectory_visualizations")
+    os.makedirs(vis_output_dir, exist_ok=True)
+    logger(f"Training data visualizations will be saved to: {vis_output_dir}")
+
+    visualized_count = 0
+    vis_limit = config.num_val_visualizations # Reuse validation visualization limit for now
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(train_loader):
+            if visualized_count >= vis_limit:
+                break
+
+            try:
+                point_cloud_batch = batch['point_cloud'].float().to(device)
+                if not config.no_bbox:
+                    bbox_corners_batch = batch['bbox_corners'].float().to(device)
+                else:
+                    bbox_corners_batch = None
+            except KeyError as e:
+                logger(f"Error: Missing key {e} in training batch {batch_idx} for visualization. Skipping batch.")
+                continue
+            except Exception as e:
+                logger(f"Error processing training batch {batch_idx} for visualization: {e}. Skipping batch.")
+                continue
+
+            batch_size = batch['full_poses'].shape[0]
+            samples_to_vis_in_batch = min(batch_size, vis_limit - visualized_count)
+
+            for i in range(samples_to_vis_in_batch):
+                if visualized_count >= vis_limit:
+                    break
+
+                gt_full_poses = batch['full_poses'][i]
+                gt_full_mask = batch.get('full_attention_mask')[i] if batch.get('full_attention_mask') is not None else None
+                sample_pointcloud = point_cloud_batch[i].cpu()
+                
+                sample_bbox_corners_cpu = None
+                if not config.no_bbox and 'bbox_corners' in batch and bbox_corners_batch is not None:
+                    sample_bbox_corners_cpu = bbox_corners_batch[i].cpu()
+
+
+                actual_length = gt_full_poses.shape[0]
+                if gt_full_mask is not None:
+                    actual_length = torch.sum(gt_full_mask).int().item()
+                
+                if actual_length == 0:
+                    logger(f"Skipping visualization for sample {i} in batch {batch_idx} due to zero actual length.")
+                    continue
+
+                history_length_for_vis = int(np.floor(actual_length * config.history_fraction))
+                history_length_for_vis = max(1, min(history_length_for_vis, actual_length))
+
+
+                position_dim = config.object_position_dim
+                gt_full_positions = gt_full_poses[:, :position_dim]
+                
+                vis_past_positions = gt_full_positions[:history_length_for_vis]
+                vis_future_positions_gt = gt_full_positions[history_length_for_vis:actual_length]
+                
+                vis_past_mask = gt_full_mask[:history_length_for_vis] if gt_full_mask is not None else None
+                vis_future_mask_gt = gt_full_mask[history_length_for_vis:actual_length] if gt_full_mask is not None else None
+
+                obj_name = batch['object_name'][i] if 'object_name' in batch else f"unknown_train_{i}"
+                segment_idx = batch['segment_idx'][i].item() if 'segment_idx' in batch and batch['segment_idx'][i].item() != -1 else None
+                current_sequence_path = batch['sequence_path'][i]
+                sequence_name_extracted = os.path.splitext(os.path.basename(current_sequence_path))[0]
+
+                fn_obj_name = obj_name
+                fn_seq_name = f"seq_{sequence_name_extracted}"
+                fn_seg_id = f"seg{segment_idx}" if segment_idx is not None else "segNA"
+                fn_batch_id = f"batch{batch_idx}_sample{i}" # Ensure unique filename for each sample
+
+                filename_base = f"{fn_obj_name}_{fn_seq_name}_{fn_seg_id}_{fn_batch_id}"
+
+                title_obj_name = obj_name
+                title_seq_name = f"Seq: {sequence_name_extracted}"
+                title_seg_id = f"Seg: {segment_idx if segment_idx is not None else 'NA'}"
+                title_batch_id = f"Batch: {batch_idx}, Sample: {i}"
+                vis_title_base = f"TRAIN - {title_obj_name} ({title_seq_name}, {title_seg_id}, {title_batch_id})"
+
+                # Full Trajectory Visualization
+                full_traj_path = os.path.join(vis_output_dir, f"{filename_base}_full_trajectory_with_scene.png")
+                
+                gt_full_positions_vis = transform_coords_for_visualization(gt_full_positions.cpu())
+                sample_pointcloud_vis = transform_coords_for_visualization(sample_pointcloud.cpu())
+                sample_bbox_corners_vis = transform_coords_for_visualization(sample_bbox_corners_cpu)
+
+                visualize_full_trajectory(
+                    positions=gt_full_positions_vis,
+                    attention_mask=gt_full_mask.cpu() if gt_full_mask is not None else None,
+                    point_cloud=sample_pointcloud_vis,
+                    bbox_corners_sequence=sample_bbox_corners_vis,
+                    title=f"Full GT - {vis_title_base}",
+                    save_path=full_traj_path,
+                    segment_idx=segment_idx
+                )
+                
+                # Split Trajectory Visualization
+                split_traj_path = os.path.join(vis_output_dir, f"{filename_base}_trajectory_split.png")
+                vis_past_positions_vis = transform_coords_for_visualization(vis_past_positions.cpu())
+                vis_future_positions_gt_vis = transform_coords_for_visualization(vis_future_positions_gt.cpu())
+                visualize_trajectory(
+                    past_positions=vis_past_positions_vis,
+                    future_positions=vis_future_positions_gt_vis,
+                    past_mask=vis_past_mask.cpu() if vis_past_mask is not None else None,
+                    future_mask=vis_future_mask_gt.cpu() if vis_future_mask_gt is not None else None,
+                    title=f"Split GT - {vis_title_base}",
+                    save_path=split_traj_path,
+                    segment_idx=segment_idx
+                )
+                visualized_count += 1
+            
+            if visualized_count >= vis_limit: # Check after inner loop as well
+                break
+    logger(f"--- Finished visualizing {visualized_count} initial training samples ---")
+
 
 def main():
     # --- Configuration ---
@@ -714,6 +837,9 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers, drop_last=True, collate_fn=val_collate_func)
     logger(f"Train Dataset size: {len(train_dataset)}, Val Dataset size: {len(val_dataset)}, DataLoaders ready with custom collate_fn.") # Updated log
 
+    # --- Visualize Initial Training Data (if configured) ---
+    if config.visualize_train_trajectories_on_start:
+        visualize_initial_train_data(train_loader, device, config, logger)
     # ---------------------------------------------------------------------
 
     # --- Model Initialization ---
@@ -784,9 +910,9 @@ def main():
 
     # --- Optimizer and Scheduler ---
     logger("Setting up optimizer and scheduler...")
-    optimizer = optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    optimizer = optim.AdamW(model.parameters(), lr=config.lr, betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_eps, weight_decay=config.weight_decay)
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=config.gamma)
-    logger(f"Optimizer: Adam with lr={config.lr}, weight_decay={config.weight_decay}")
+    logger(f"Optimizer: AdamW with lr={config.lr}, beta1={config.adam_beta1}, beta2={config.adam_beta2}, eps={config.adam_eps}, weight_decay={config.weight_decay}")
     logger(f"Scheduler: ExponentialLR with gamma={config.gamma}")
 
     # --- Load Checkpoint (If specified) ---

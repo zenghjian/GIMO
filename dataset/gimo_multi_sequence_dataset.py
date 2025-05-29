@@ -60,7 +60,6 @@ class GIMOMultiSequenceDataset(Dataset):
         use_displacements: bool = False,
         use_cache: bool = True,
         cache_dir: Optional[str] = None,
-        normalize_data: bool = True,
         trajectory_pointcloud_radius: float = 0.5,  # Added parameter for trajectory filtering
     ):
         """
@@ -82,7 +81,6 @@ class GIMOMultiSequenceDataset(Dataset):
             use_displacements: Whether to use displacements instead of absolute positions (if config not provided)
             use_cache: Whether to use caching (if config not provided)
             cache_dir: Directory for caching trajectory data (if config not provided)
-            normalize_data: Whether to normalize data using scene bounds (if config not provided)
             trajectory_pointcloud_radius: Radius around trajectory to collect points (meters)
         """
         self.sequence_paths = sequence_paths
@@ -98,7 +96,6 @@ class GIMOMultiSequenceDataset(Dataset):
             self.min_motion_percentile = getattr(config, 'min_motion_percentile', min_motion_percentile)
             self.use_displacements = getattr(config, 'use_displacements', use_displacements)
             self.use_cache = getattr(config, 'use_cache', use_cache)
-            self.normalize_data = getattr(config, 'normalize_data', normalize_data)
             self.trajectory_pointcloud_radius = getattr(config, 'trajectory_pointcloud_radius', trajectory_pointcloud_radius)
             self.force_use_cache = getattr(config, 'force_use_cache', False) # Get force_use_cache from config
             # For cache_dir, don't use config directly - it will be set below from save_path if provided
@@ -112,7 +109,6 @@ class GIMOMultiSequenceDataset(Dataset):
             self.min_motion_percentile = min_motion_percentile
             self.use_displacements = use_displacements
             self.use_cache = use_cache
-            self.normalize_data = normalize_data
             self.trajectory_pointcloud_radius = trajectory_pointcloud_radius
         
         # These parameters don't typically come from config
@@ -235,7 +231,6 @@ class GIMOMultiSequenceDataset(Dataset):
                     motion_velocity_threshold=getattr(self, 'motion_velocity_threshold', 0.05),
                     min_segment_frames=getattr(self, 'min_segment_frames', 5),
                     max_stationary_frames=getattr(self, 'max_stationary_frames', 3),
-                    normalize_data=self.normalize_data,
                     trajectory_pointcloud_radius=self.trajectory_pointcloud_radius,
                     force_use_cache=self.force_use_cache  # Pass force_use_cache parameter
                 )
@@ -310,44 +305,44 @@ class GIMOMultiSequenceDataset(Dataset):
         # -------------------------------------
         
         # --- Perform Past/Future Split Here --- 
-        # Check if we have poses (6D) or positions (3D) - handle both for backward compatibility
+        # Check if we have poses (9D) or positions (3D) - handle both for backward compatibility
         if 'poses' in sample:
             # Rename to full_ versions and remove original keys
             sample['full_poses'] = sample.pop('poses')
             sample['full_attention_mask'] = sample.pop('attention_mask')
             
-            # Make sure positions/orientations are also available
+            # Make sure positions/rotations are also available
             if 'positions' not in sample:
                 sample['full_positions'] = sample['full_poses'][:, :3]  # Extract positions
             else:
                 sample['full_positions'] = sample.pop('positions')  # Rename positions
                 
-            if 'orientations' not in sample:
-                sample['full_orientations'] = sample['full_poses'][:, 3:]  # Extract orientations
+            if 'rotations' not in sample:
+                sample['full_rotations'] = sample['full_poses'][:, 3:]  # Extract 6D rotations
             else:
-                sample['full_orientations'] = sample.pop('orientations')  # Rename orientations
+                sample['full_rotations'] = sample.pop('rotations')  # Rename rotations
                 
         elif 'positions' in sample and 'attention_mask' in sample:
             # Legacy case - only positions available
             sample['full_positions'] = sample.pop('positions')
             sample['full_attention_mask'] = sample.pop('attention_mask')
             
-            # Create empty orientation tensor with zeros (fall back, should not happen with updated dataset)
-            sample['full_orientations'] = torch.zeros_like(sample['full_positions'])
+            # Create empty rotation tensor with zeros (fall back, should not happen with updated dataset)
+            sample['full_rotations'] = torch.zeros_like(sample['full_positions']).repeat(1, 2)  # [N, 3] -> [N, 6]
             
             # Create combined poses tensor
-            sample['full_poses'] = torch.cat([sample['full_positions'], sample['full_orientations']], dim=1)
-            print(f"Warning: Created placeholder orientations for sample without orientation data")
+            sample['full_poses'] = torch.cat([sample['full_positions'], sample['full_rotations']], dim=1)
+            print(f"Warning: Created placeholder rotations for sample without rotation data")
         else:
             print(f"Warning: Could not find 'poses' or 'positions' in sample from {sequence_path}")
             # Assign placeholder tensors if data is missing to ensure consistent keys
             dummy_pos = torch.zeros((self.trajectory_length, 3), dtype=torch.float)
-            dummy_ori = torch.zeros((self.trajectory_length, 3), dtype=torch.float)
-            dummy_poses = torch.zeros((self.trajectory_length, 6), dtype=torch.float)
+            dummy_rot = torch.zeros((self.trajectory_length, 6), dtype=torch.float)
+            dummy_poses = torch.zeros((self.trajectory_length, 9), dtype=torch.float)
             dummy_mask = torch.zeros(self.trajectory_length, dtype=torch.float)
             
             sample['full_positions'] = dummy_pos
-            sample['full_orientations'] = dummy_ori
+            sample['full_rotations'] = dummy_rot
             sample['full_poses'] = dummy_poses
             sample['full_attention_mask'] = dummy_mask
         # -------------------------------------

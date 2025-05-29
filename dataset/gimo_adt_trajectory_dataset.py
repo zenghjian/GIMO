@@ -14,6 +14,9 @@ import time
 from scipy.spatial import cKDTree  # Add import for efficient nearest neighbor search
 from scipy.spatial.transform import Rotation as R
 
+# Import geometry utilities
+from utils.geometry_utils import rotation_matrix_to_6d, rotation_6d_to_matrix
+
 class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
     """Dataset for loading trajectories from Aria Digital Twin sequences."""
 
@@ -37,7 +40,6 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         motion_velocity_threshold: float = 0.05,  # Threshold in m/s for detecting active motion
         min_segment_frames: int = 5,  # Minimum number of frames for a valid motion segment
         max_stationary_frames: int = 3,   # Maximum consecutive stationary frames allowed in a motion segment
-        normalize_data: bool = True,      # Whether to normalize data using scene bounds
         trajectory_pointcloud_radius: float = 0.5,  # Radius around trajectory to collect points (meters)
         force_use_cache: bool = False,    # Force use any compatible cache file, ignoring parameter mismatches
     ):
@@ -63,7 +65,6 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             motion_velocity_threshold: Threshold in m/s for detecting active motion (if config not provided)
             min_segment_frames: Minimum number of frames for a valid motion segment (if config not provided)
             max_stationary_frames: Maximum consecutive stationary frames allowed in a motion segment (if config not provided)
-            normalize_data: Whether to normalize data using scene bounds (if config not provided)
             trajectory_pointcloud_radius: Radius around trajectory to collect points (meters)
             force_use_cache: Force use any compatible cache file, ignoring parameter mismatches
         """
@@ -89,7 +90,6 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             self.motion_velocity_threshold = getattr(config, 'motion_velocity_threshold', motion_velocity_threshold)
             self.min_segment_frames = getattr(config, 'min_segment_frames', min_segment_frames)
             self.max_stationary_frames = getattr(config, 'max_stationary_frames', max_stationary_frames)
-            self.normalize_data = getattr(config, 'normalize_data', normalize_data) # Get normalize_data from config
             self.trajectory_pointcloud_radius = getattr(config, 'trajectory_pointcloud_radius', trajectory_pointcloud_radius)
             self.force_use_cache = getattr(config, 'force_use_cache', force_use_cache) # Get force_use_cache from config
             # For cache_dir, don't use config directly - it might be set based on save_path
@@ -106,12 +106,11 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             self.motion_velocity_threshold = motion_velocity_threshold
             self.min_segment_frames = min_segment_frames
             self.max_stationary_frames = max_stationary_frames
-            self.normalize_data = normalize_data # Use passed parameter if no config
             self.trajectory_pointcloud_radius = trajectory_pointcloud_radius
             self.force_use_cache = force_use_cache # Use passed parameter if no config
         
-        # Force load_pointcloud to True when normalize_data is True for maximum precision
-        self.load_pointcloud = self.load_pointcloud or self.normalize_data
+
+        self.load_pointcloud = self.load_pointcloud
 
         # These parameters don't typically come from config
         self.max_objects = max_objects
@@ -136,20 +135,10 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         # -----------------------------------------------------------------------
 
         print(f"Loading ADT sequence from: {sequence_path}")
-        print(f"Data Normalization: {'Enabled' if self.normalize_data else 'Disabled'}")
-        
-        # Initialize scene bounds - these will be calculated if normalize_data=True and pointcloud is loaded
-        self.scene_min = np.zeros(3, dtype=np.float32)
-        self.scene_max = np.ones(3, dtype=np.float32)
-        self.scene_scale = np.ones(3, dtype=np.float32)
-        if not self.normalize_data:
-            print("Data normalization disabled, using identity transformation")
         
         # Check for cached data first
         if self.use_cache and self._load_from_cache():
             print(f"Loaded cached trajectories for {sequence_path}")
-            # Bounds should be loaded from cache, print them
-            print(f"  Using cached Scene bounds: min={self.scene_min}, max={self.scene_max}, scale={self.scene_scale}")
             return
             
         # Create data provider
@@ -163,15 +152,9 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                 
             self.adt_provider = AriaDigitalTwinDataProvider(data_paths)
             
-            # Load pointcloud if requested (or if needed for normalization)
+            # Load pointcloud if requested
             if self.load_pointcloud:
-                self._load_pointcloud() # This will calculate bounds if normalize_data is True
-            elif self.normalize_data:
-                 print("Warning: Normalization enabled, but pointcloud loading is disabled. Attempting to load pointcloud anyway for bounds calculation.")
-                 self._load_pointcloud()
-                 if self.pointcloud is None:
-                     print("Warning: Failed to load pointcloud for normalization. Using default bounds.")
-                     self._set_default_scene_bounds()
+                self._load_pointcloud()
             
             # Extract trajectories
             start_time = time.time()
@@ -222,9 +205,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             if isinstance(trajectory_positions, torch.Tensor):
                 trajectory_positions = trajectory_positions.detach().cpu().numpy()
                 
-            # If normalized, denormalize trajectory positions for consistent distance calculation
-            if self.normalize_data:
-                trajectory_positions = self.denormalize_position(trajectory_positions)
+
                 
             # Build KD-tree on trajectory points
             trajectory_tree = cKDTree(trajectory_positions)
@@ -279,14 +260,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                     valid_indices = np.where(np.array(mask) > 0.5)[0]
                     valid_positions = positions_tensor[valid_indices]
                 
-                # If normalized, denormalize positions for accurate distance calculation
-                if self.normalize_data and isinstance(valid_positions, torch.Tensor):
-                    # Convert to numpy, denormalize, then back to tensor if needed
-                    positions_np = valid_positions.detach().cpu().numpy()
-                    positions_np = self.denormalize_position(positions_np)
-                    valid_positions = positions_np
-                elif self.normalize_data:
-                    valid_positions = self.denormalize_position(valid_positions)
+
                 
                 # Filter the pointcloud
                 filtered_pc = self._filter_points_by_trajectory(valid_positions)
@@ -335,7 +309,6 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             'min_motion_threshold': self.min_motion_threshold,
             'min_motion_percentile': self.min_motion_percentile,
             'pointcloud_subsample': self.pointcloud_subsample,
-            'normalize_data': self.normalize_data, # Add normalize_data to cache key
             'trajectory_pointcloud_radius': self.trajectory_pointcloud_radius, # Add new parameter to cache key
             'include_bbox_corners': True # New parameter for bbox corners
         }
@@ -363,10 +336,6 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             cache_data = {
                 'trajectories': self.trajectories,
                 'pointcloud': self.pointcloud,
-                # Add normalization parameters to cache
-                'scene_min': self.scene_min,
-                'scene_max': self.scene_max,
-                'scene_scale': self.scene_scale,
                 'params': {
                     'sequence_name': sequence_name,  # Store sequence name, not full path
                     'trajectory_length': self.trajectory_length,
@@ -380,7 +349,6 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                     'min_motion_threshold': self.min_motion_threshold,
                     'min_motion_percentile': self.min_motion_percentile,
                     'pointcloud_subsample': self.pointcloud_subsample,
-                    'normalize_data': self.normalize_data, # Save normalize_data state
                     'trajectory_pointcloud_radius': self.trajectory_pointcloud_radius, # Save new parameter
                     'include_bbox_corners': True # Save new parameter state
                 }
@@ -450,7 +418,6 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                 'min_motion_threshold': self.min_motion_threshold,
                 'min_motion_percentile': self.min_motion_percentile,
                 'pointcloud_subsample': self.pointcloud_subsample,
-                'normalize_data': self.normalize_data,
                 'trajectory_pointcloud_radius': self.trajectory_pointcloud_radius,
                 'include_bbox_corners': True # Current setting for bbox corners
             }
@@ -464,7 +431,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             # Check other critical parameters (skip if force_use_cache is enabled)
             if not self.force_use_cache:
                 critical_params = ['trajectory_length', 'skip_frames', 'use_displacements', 
-                                'normalize_data', 'motion_velocity_threshold',
+                                   'motion_velocity_threshold',
                                 'include_bbox_corners'] # Add new param to critical check
                 
                 for param in critical_params:
@@ -479,12 +446,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             # Load data
             self.trajectories = cache_data['trajectories']
             self.pointcloud = cache_data['pointcloud']
-            # Load normalization parameters from cache, with fallback for older caches
-            self.scene_min = cache_data.get('scene_min', np.zeros(3, dtype=np.float32))
-            self.scene_max = cache_data.get('scene_max', np.ones(3, dtype=np.float32))
-            self.scene_scale = cache_data.get('scene_scale', np.ones(3, dtype=np.float32))
-            # Ensure normalize_data flag is set correctly based on cache
-            self.normalize_data = stored_params.get('normalize_data', True)
+
             # Bbox corners are already part of self.trajectories, no separate loading needed here
             # if they were saved correctly. The check for 'include_bbox_corners' ensures compatibility.
             
@@ -502,6 +464,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             return
 
         try:
+            # Import projectaria_tool
             import projectaria_tools.core.mps as aria_mps
             from projectaria_tools.core.mps.utils import filter_points_from_confidence
             
@@ -564,99 +527,10 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             # Store the pointcloud
             self.pointcloud = points
             print(f"Pointcloud loaded with {len(self.pointcloud)} points")
-
-            # Calculate scene bounds for normalization only if normalize_data is True
-            if self.normalize_data:
-                if len(self.pointcloud) > 0:
-                    # Calculate bounds from point cloud
-                    self.scene_min = np.min(self.pointcloud, axis=0) 
-                    self.scene_max = np.max(self.pointcloud, axis=0)
-
-                    # Add padding to avoid points exactly at boundaries
-                    padding = (self.scene_max - self.scene_min) * 0.05  # 5% padding
-                    self.scene_min -= padding
-                    self.scene_max += padding
-
-                    # Calculate scale for normalization to [-1, 1] range
-                    self.scene_scale = self.scene_max - self.scene_min
-                    # Prevent division by zero for flat dimensions
-                    self.scene_scale[self.scene_scale < 1e-6] = 1.0
-
-                    print(f"Scene bounds calculated: min={self.scene_min}, max={self.scene_max}")
-                    print(f"Scene scale: {self.scene_scale}")
-                else:
-                    print("Warning: Point cloud is empty, using default scene bounds")
-                    self._set_default_scene_bounds()
-            # If not normalizing, bounds remain identity matrix initialized in __init__
-            
         except Exception as e:
             print(f"Error loading MPS point cloud: {e}")
             traceback.print_exc()
-            self._set_default_scene_bounds() # Set default bounds on error
-    
-    def _set_default_scene_bounds(self):
-        """Set default scene bounds if point cloud loading fails or normalization is enabled without a point cloud."""
-        if self.normalize_data:
-             print("Warning: Using default scene bounds [-10, 10] for normalization.")
-             self.scene_min = np.array([-10.0, -10.0, -10.0], dtype=np.float32)
-             self.scene_max = np.array([10.0, 10.0, 10.0], dtype=np.float32)
-             self.scene_scale = self.scene_max - self.scene_min
-        else:
-             # Keep identity bounds if not normalizing
-             self.scene_min = np.zeros(3, dtype=np.float32)
-             self.scene_max = np.ones(3, dtype=np.float32)
-             self.scene_scale = np.ones(3, dtype=np.float32)
-
-    def normalize_position(self, position):
-        """Normalize position from world space to [-1, 1] range using scene bounds."""
-        if not self.normalize_data:
-            return np.asarray(position, dtype=np.float32)  # Return original if not normalizing
-        
-        position_array = np.asarray(position, dtype=np.float32)
-        # Convert from world space to [0, 1] range
-        normalized = (position_array - self.scene_min) / self.scene_scale
-        # Convert from [0, 1] to [-1, 1] range
-        normalized = normalized * 2.0 - 1.0
-        return normalized
-
-    def denormalize_position(self, normalized_position):
-        """Denormalize position from [-1, 1] range back to world space using scene bounds."""
-        if not self.normalize_data:
-            return np.asarray(normalized_position, dtype=np.float32)  # Return as is if not normalized
-        
-        normalized_array = np.asarray(normalized_position, dtype=np.float32)
-        # Convert from [-1, 1] to [0, 1] range
-        denormalized = (normalized_array + 1.0) / 2.0
-        # Convert from [0, 1] range to world space
-        denormalized = denormalized * self.scene_scale + self.scene_min
-        return denormalized
-
-    # Included for consistency, though not used directly in GIMO dataset currently
-    def normalize_size(self, size):
-        """Normalize size/dimension using scene scale."""
-        if not self.normalize_data:
-            return np.asarray(size, dtype=np.float32)  # Return original if not normalizing
-        
-        size_array = np.asarray(size, dtype=np.float32)
-        # Normalize size based on scene scale - result will be in [0, 1] range approximately
-        normalized = size_array / self.scene_scale
-        # Scale to [-1, 1] range for consistency with positions
-        normalized = normalized * 2.0
-        return normalized
-
-    # Included for consistency, though not used directly in GIMO dataset currently
-    def denormalize_size(self, normalized_size):
-        """Denormalize size from normalized range back to world space."""
-        if not self.normalize_data:
-            return np.asarray(normalized_size, dtype=np.float32)  # Return as is if not normalized
-        
-        normalized_array = np.asarray(normalized_size, dtype=np.float32)
-        # Scale back from [-1, 1] range-friendly format
-        denormalized = normalized_array / 2.0
-        # Convert back to world space scale
-        denormalized = denormalized * self.scene_scale
-        return denormalized
-    
+            
     def _calculate_trajectory_motion(self, positions, timestamps=None):
         """
         Calculate the total motion/displacement of a trajectory.
@@ -919,41 +793,28 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         # Extract positions (first 3 elements of each pose) for motion metrics
         positions = [pose[:3] for pose in poses]
         
-        # Calculate trajectory motion metrics (using original positions before normalization)
+
         total_path_length, direct_displacement, max_displacement, avg_velocity = self._calculate_trajectory_motion(positions, tracked_timestamps)
         
-        # Convert to numpy array and ensure consistent 2D shape [N, 6]
+        # Convert to numpy array and ensure consistent 2D shape [N, 9]
         poses_array = np.array(poses)
         if poses_array.ndim > 2:
-            poses_array = poses_array.reshape(-1, 6)  # Reshape to [N, 6] for [x,y,z,roll,pitch,yaw]
+            poses_array = poses_array.reshape(-1, 9)  # Reshape to [N, 9] for [x,y,z,r6d_1,r6d_2,r6d_3,r6d_4,r6d_5,r6d_6]
         
-        # Split positions and orientations for separate normalization
-        positions_array = poses_array[:, :3]  # [N, 3] positions
-        orientations_array = poses_array[:, 3:6]  # [N, 3] orientations
-        
-        # Normalize positions if normalize_data is True, leave orientations as radians
-        if self.normalize_data:
-            positions_array = self.normalize_position(positions_array)
-
-        # Recombine normalized positions with orientations
-        normalized_poses_array = np.concatenate([positions_array, orientations_array], axis=1)  # [N, 6]
-
-        # Convert normalized (or original) poses to tensor
-        poses_tensor = torch.tensor(normalized_poses_array, dtype=torch.float32)
+        poses_tensor = torch.tensor(poses_array, dtype=torch.float32)
         real_length = min(len(poses_tensor), self.trajectory_length)
         
-        # Modified displacement calculation (applied on normalized positions if enabled)
         if self.use_displacements and real_length > 1:
             # Create a new tensor to store the modified poses with displacements for positions
             modified_tensor = torch.zeros_like(poses_tensor)
             
-            # Keep the first pose as absolute coordinates and angles
+            # Keep the first pose as absolute coordinates and rotations
             modified_tensor[0] = poses_tensor[0]
             
             # Calculate displacements for positions (first 3 elements) after the first
             modified_tensor[1:real_length, :3] = poses_tensor[1:real_length, :3] - poses_tensor[:real_length-1, :3]
             
-            # Keep absolute angles (last 3 elements) for all poses
+            # Keep absolute rotations (last 6 elements) for all poses
             modified_tensor[1:real_length, 3:] = poses_tensor[1:real_length, 3:]
             
             # Replace poses with this new representation
@@ -970,16 +831,15 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         
         # Pad the poses tensor if needed
         if len(poses_tensor) < self.trajectory_length:
-            # Make sure padding has the same shape [M, 6]
-            # Pad with zeros in the normalized space if normalizing, otherwise world space zeros
-            padding = torch.zeros(self.trajectory_length - len(poses_tensor), 6, dtype=torch.float32)
+            # Make sure padding has the same shape [M, 9]
+            padding = torch.zeros(self.trajectory_length - len(poses_tensor), 9, dtype=torch.float32)
             poses_tensor = torch.cat([poses_tensor, padding], dim=0)
         else:
             poses_tensor = poses_tensor[:self.trajectory_length]
         
         # Create trajectory data dict
         trajectory_data = {
-            'poses': poses_tensor,  # Now contains [x, y, z, roll, pitch, yaw]
+            'poses': poses_tensor,  # Now contains [x, y, z, r6d_1, r6d_2, r6d_3, r6d_4, r6d_5, r6d_6]
             'attention_mask': attention_mask,
         }
         
@@ -987,14 +847,6 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         if bbox_corners_sequence is not None and len(bbox_corners_sequence) > 0:
             # Convert list of [8,3] arrays to a single numpy array [N, 8, 3]
             bbox_corners_array = np.array(bbox_corners_sequence, dtype=np.float32)
-            
-            # Normalize bbox corners if normalize_data is True
-            if self.normalize_data:
-                # Reshape for normalization: [N*8, 3]
-                original_shape = bbox_corners_array.shape
-                bbox_corners_flat = bbox_corners_array.reshape(-1, 3)
-                normalized_corners_flat = self.normalize_position(bbox_corners_flat)
-                bbox_corners_array = normalized_corners_flat.reshape(original_shape)
 
             bbox_corners_tensor = torch.tensor(bbox_corners_array, dtype=torch.float32)
             
@@ -1027,13 +879,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             'segment_duration_s': float((tracked_timestamps[-1] - tracked_timestamps[0]) / 1e9) if len(tracked_timestamps) > 1 else 0.0,
             'original_length': len(poses),  # Store the length of the active segment
             'start_timestamp_ns': int(tracked_timestamps[0]) if tracked_timestamps else None,  # Store segment start timestamp
-            # Store normalization parameters for denormalization later
-            'normalization': {
-                'is_normalized': self.normalize_data,
-                'scene_min': self.scene_min.tolist(),
-                'scene_max': self.scene_max.tolist(),
-                'scene_scale': self.scene_scale.tolist()
-            }
+
         }
         
         # Add segment index if provided
@@ -1125,11 +971,11 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                     # Extract rotation matrix from transform_scene_object
                     rotation_matrix = bbox.transform_scene_object.rotation().to_matrix()
                     
-                    # Convert rotation matrix to Euler angles
-                    roll, pitch, yaw = self._rotation_matrix_to_euler_angles(rotation_matrix)
+                    # Convert rotation matrix to 6D representation instead of Euler angles
+                    rotation_6d = rotation_matrix_to_6d(rotation_matrix)
                     
-                    # Create combined pose [x, y, z, roll, pitch, yaw]
-                    pose = pos + [roll, pitch, yaw]
+                    # Create combined pose [x, y, z, r6d_1, r6d_2, r6d_3, r6d_4, r6d_5, r6d_6]
+                    pose = pos + rotation_6d.tolist()
                     
                     # Store the combined pose and timestamp
                     poses.append(pose)
@@ -1291,44 +1137,6 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         # Return all active segments in their original chronological order
         return active_segments
     
-    def _rotation_matrix_to_euler_angles(self, rotation_matrix):
-        """
-        Convert a rotation matrix to Euler angles (roll, pitch, yaw) in radians.
-        
-        Args:
-            rotation_matrix: 3x3 rotation matrix
-            
-        Returns:
-            tuple: (roll, pitch, yaw) in radians
-        """
-        import numpy as np
-        import math
-        
-        # Extract individual elements from the rotation matrix
-        r11, r12, r13 = rotation_matrix[0]
-        r21, r22, r23 = rotation_matrix[1]
-        r31, r32, r33 = rotation_matrix[2]
-        
-        # Check for gimbal lock (when pitch is +/- 90 degrees)
-        if abs(r31) > 0.9999:
-            # Gimbal lock case
-            yaw = 0.0  # Can be set to any value, typically 0
-            if r31 < 0:
-                # pitch is -90 degrees
-                pitch = -math.pi/2
-                roll = math.atan2(r12, r22)
-            else:
-                # pitch is +90 degrees
-                pitch = math.pi/2
-                roll = math.atan2(-r12, -r22)
-        else:
-            # Standard case
-            pitch = -math.asin(r31)
-            roll = math.atan2(r32/math.cos(pitch), r33/math.cos(pitch))
-            yaw = math.atan2(r21/math.cos(pitch), r11/math.cos(pitch))
-        
-        return roll, pitch, yaw
-    
     def get_scene_pointcloud(self):
         """
         Return the scene pointcloud if available.
@@ -1361,7 +1169,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         
         # Create the result with minimal metadata and split trajectories
         result = {
-            'poses': trajectory_data['poses'],  # [N, 6] tensor with [x,y,z,roll,pitch,yaw]
+            'poses': trajectory_data['poses'],  # [N, 9] tensor with [x,y,z,r6d_1,r6d_2,r6d_3,r6d_4,r6d_5,r6d_6]
             'attention_mask': trajectory_data['attention_mask'],
             'object_type': metadata['prototype_name'],
             'object_name': metadata['name'],
@@ -1376,24 +1184,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         if 'trajectory_specific_pointcloud' in item:
             result['trajectory_specific_pointcloud'] = item['trajectory_specific_pointcloud']
         
-        # Add normalization parameters to the sample
-        if 'normalization' in metadata:
-             # Convert normalization numpy arrays to tensors for collation
-             norm_info = metadata['normalization']
-             result['normalization'] = {
-                 'is_normalized': norm_info['is_normalized'],
-                 'scene_min': torch.tensor(norm_info.get('scene_min', [0.0, 0.0, 0.0]), dtype=torch.float32),
-                 'scene_max': torch.tensor(norm_info.get('scene_max', [1.0, 1.0, 1.0]), dtype=torch.float32),
-                 'scene_scale': torch.tensor(norm_info.get('scene_scale', [1.0, 1.0, 1.0]), dtype=torch.float32)
-             }
-        else:
-             # Include default normalization parameters if not found in metadata
-             result['normalization'] = {
-                 'is_normalized': self.normalize_data,
-                 'scene_min': torch.tensor(self.scene_min, dtype=torch.float32),
-                 'scene_max': torch.tensor(self.scene_max, dtype=torch.float32),
-                 'scene_scale': torch.tensor(self.scene_scale, dtype=torch.float32)
-             }
+
 
         # Add segment index if available in metadata
         if 'segment_idx' in metadata:

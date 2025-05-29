@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from venv import logger
 import torch
 import torch.optim as optim
 import os
@@ -161,57 +162,53 @@ def validate(model, dataloader, device, config, epoch):
     with torch.no_grad():
         # Since batch size is 1, no need for progress bar usually
         for batch_idx, batch in enumerate(dataloader):
-            try:
-                full_trajectory_batch = batch['full_poses'].float().to(device)
-                point_cloud_batch = batch['point_cloud'].float().to(device) # Get point cloud from collated batch
-                # Only get bbox_corners if not using no_bbox
-                if not config.no_bbox:
-                    bbox_corners_batch = batch['bbox_corners'].float().to(device) # Get bbox_corners
-                else:
-                    bbox_corners_batch = None
-                
-                # Move mask to device for loss calc
-                batch['full_attention_mask'] = batch['full_attention_mask'].to(device)
-                
-                # --- Dynamically determine input history length based on actual trajectory length ---
-                current_full_trajectory = full_trajectory_batch # Shape [1, config.trajectory_length, 6]
-                current_attention_mask = batch['full_attention_mask'] # Shape [1, config.trajectory_length]
-                
-                actual_length = current_attention_mask[0].sum().int().item()
+            full_trajectory_batch = batch['full_poses'].float().to(device)
+            point_cloud_batch = batch['point_cloud'].float().to(device) # Get point cloud from collated batch
+            # Only get bbox_corners if not using no_bbox
+            if not config.no_bbox:
+                bbox_corners_batch = batch['bbox_corners'].float().to(device) # Get bbox_corners
+            else:
+                bbox_corners_batch = None
+            
+            # Move mask to device for loss calc
+            batch['full_attention_mask'] = batch['full_attention_mask'].to(device)
+            
+            # --- Dynamically determine input history length based on actual trajectory length ---
+            current_full_trajectory = full_trajectory_batch # Shape [1, config.trajectory_length, 6]
+            current_attention_mask = batch['full_attention_mask'] # Shape [1, config.trajectory_length]
+            
+            actual_length = current_attention_mask[0].sum().int().item()
 
-                if config.use_first_frame_only:
-                    # Ensure dynamic_input_hist_len is at least 0 and at most actual_length
-                    dynamic_input_hist_len = min(1, actual_length) if actual_length > 0 else 0
-                    input_trajectory_batch = current_full_trajectory[:, :dynamic_input_hist_len, :]
-                    if not config.no_bbox and bbox_corners_batch is not None:
-                        bbox_corners_input_batch = bbox_corners_batch[:, :dynamic_input_hist_len, :, :]
-                    else:
-                        bbox_corners_input_batch = None
+            if config.use_first_frame_only:
+                # Ensure dynamic_input_hist_len is at least 0 and at most actual_length
+                dynamic_input_hist_len = min(1, actual_length) if actual_length > 0 else 0
+                input_trajectory_batch = current_full_trajectory[:, :dynamic_input_hist_len, :]
+                if not config.no_bbox and bbox_corners_batch is not None:
+                    bbox_corners_input_batch = bbox_corners_batch[:, :dynamic_input_hist_len, :, :]
                 else:
-                    # Calculate history length based on actual_length and history_fraction
-                    # Ensure it's at least 1 if actual_length > 0, and not more than actual_length
-                    if actual_length > 0:
-                        dynamic_input_hist_len = int(np.floor(actual_length * config.history_fraction))
-                        dynamic_input_hist_len = max(1, dynamic_input_hist_len) # Ensure at least 1 if possible
-                        dynamic_input_hist_len = min(dynamic_input_hist_len, actual_length) # Cap at actual_length
-                    else:
-                        dynamic_input_hist_len = 0 # No history if trajectory is empty
-                    
-                    input_trajectory_batch = current_full_trajectory[:, :dynamic_input_hist_len, :]
-                    if not config.no_bbox and bbox_corners_batch is not None:
-                        bbox_corners_input_batch = bbox_corners_batch[:, :dynamic_input_hist_len, :, :]
-                    else:
-                        bbox_corners_input_batch = None
-                # --- End dynamic input history length determination ---
-
-                # Get object category IDs if embedding is enabled
-                if not config.no_text_embedding:
-                    object_category_ids = batch['object_category_id'].to(device)
+                    bbox_corners_input_batch = None
+            else:
+                # Calculate history length based on actual_length and history_fraction
+                # Ensure it's at least 1 if actual_length > 0, and not more than actual_length
+                if actual_length > 0:
+                    dynamic_input_hist_len = int(np.floor(actual_length * config.history_fraction))
+                    dynamic_input_hist_len = max(1, dynamic_input_hist_len) # Ensure at least 1 if possible
+                    dynamic_input_hist_len = min(dynamic_input_hist_len, actual_length) # Cap at actual_length
                 else:
-                    object_category_ids = None
+                    dynamic_input_hist_len = 0 # No history if trajectory is empty
+                
+                input_trajectory_batch = current_full_trajectory[:, :dynamic_input_hist_len, :]
+                if not config.no_bbox and bbox_corners_batch is not None:
+                    bbox_corners_input_batch = bbox_corners_batch[:, :dynamic_input_hist_len, :, :]
+                else:
+                    bbox_corners_input_batch = None
+            # --- End dynamic input history length determination ---
 
-            except KeyError as e: logger(f"Error: Missing key {e} in batch {batch_idx}. Skipping."); continue
-            except Exception as e: logger(f"Error processing batch {batch_idx}: {e}. Skipping."); continue
+            # Get object category IDs if embedding is enabled
+            if not config.no_text_embedding:
+                object_category_ids = batch['object_category_id'].to(device)
+            else:
+                object_category_ids = None
 
             # Forward pass with input trajectory, point cloud, bbox corners, and category IDs
             predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids)
@@ -287,10 +284,10 @@ def validate(model, dataloader, device, config, epoch):
                         
                     # Get data for the current sample (the only sample)
                     gt_full_positions = gt_full_poses_batch[i, :, :3]
-                    gt_full_orientations = gt_full_poses_batch[i, :, 3:]
+                    gt_full_rotations = gt_full_poses_batch[i, :, 3:]
                     gt_full_mask = gt_full_mask_batch[i] if gt_full_mask_batch is not None else None
                     pred_full_positions = pred_full_trajectory_batch[i, :, :3]
-                    pred_full_orientations = pred_full_trajectory_batch[i, :, 3:]
+                    pred_full_rotations = pred_full_trajectory_batch[i, :, 3:]
                     sample_pointcloud = point_cloud_batch[i].cpu()  # Get point cloud for this sample
                     
                     # --- Dynamic Split Calculation for Visualization ---
@@ -314,8 +311,8 @@ def validate(model, dataloader, device, config, epoch):
                     vis_past_positions = gt_full_positions[:history_length_for_vis]
                     vis_future_positions_gt = gt_full_positions[history_length_for_vis:actual_length] # Slice up to actual length
                     
-                    vis_past_orientations = gt_full_orientations[:history_length_for_vis]
-                    vis_future_orientations_gt = gt_full_orientations[history_length_for_vis:actual_length]
+                    vis_past_rotations = gt_full_rotations[:history_length_for_vis]
+                    vis_future_rotations_gt = gt_full_rotations[history_length_for_vis:actual_length]
 
                     vis_past_mask = gt_full_mask[:history_length_for_vis] if gt_full_mask is not None else None
                     vis_future_mask_gt = gt_full_mask[history_length_for_vis:actual_length] if gt_full_mask is not None else None
@@ -324,14 +321,14 @@ def validate(model, dataloader, device, config, epoch):
                     if config.use_first_frame_only:
                         valid_future_len = actual_length - history_length_for_vis
                         predicted_future_positions = pred_full_positions[:valid_future_len] 
-                        predicted_future_orientations = pred_full_orientations[:valid_future_len]
+                        predicted_future_rotations = pred_full_rotations[:valid_future_len]
                     else:
                         # Standard case: model output is full trajectory
                         pred_past_positions = pred_full_positions[:history_length_for_vis]
                         predicted_future_positions = pred_full_positions[history_length_for_vis:actual_length]
                         
-                        pred_past_orientations = pred_full_orientations[:history_length_for_vis]
-                        predicted_future_orientations = pred_full_orientations[history_length_for_vis:actual_length]
+                        pred_past_rotations = pred_full_rotations[:history_length_for_vis]
+                        predicted_future_rotations = pred_full_rotations[history_length_for_vis:actual_length]
                     # ----------------------------------------------------
 
                     obj_name = batch['object_name'][i] if 'object_name' in batch else f"unknown_{i}"
@@ -423,10 +420,10 @@ def validate(model, dataloader, device, config, epoch):
                         title=f"Pred vs GT - {vis_title_base} (Epoch {epoch})",
                         save_path=pred_vs_gt_path,
                         segment_idx=segment_idx,
-                        show_orientation=show_ori_arrows,
-                        past_orientations=vis_past_orientations.cpu(), # Orientations not transformed
-                        future_orientations_gt=vis_future_orientations_gt.cpu(), # Orientations not transformed
-                        future_orientations_pred=predicted_future_orientations.cpu(), # Orientations not transformed
+                        show_rotations=show_ori_arrows,
+                        past_rotations=vis_past_rotations.cpu(),
+                        future_rotations_gt=vis_future_rotations_gt.cpu(),
+                        future_rotations_pred=predicted_future_rotations.cpu(),
                         # viz_ori_scale=viz_ori_scale # Added from train_adt.py, but need to check if visualize_prediction supports it
                     )
                     
@@ -836,9 +833,9 @@ def main():
 
     # --- Optimizer and Scheduler --- 
     logger("Setting up optimizer and scheduler...")
-    optimizer = optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    optimizer = optim.AdamW(model.parameters(), lr=config.lr, betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_eps, weight_decay=config.weight_decay)
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=config.gamma)
-    logger(f"Optimizer: Adam with lr={config.lr}, weight_decay={config.weight_decay}")
+    logger(f"Optimizer: AdamW with lr={config.lr}, beta1={config.adam_beta1}, beta2={config.adam_beta2}, eps={config.adam_eps}, weight_decay={config.weight_decay}")
     logger(f"Scheduler: ExponentialLR with gamma={config.gamma}")
 
     # --- Create directory for mask visualizations ---
@@ -900,7 +897,7 @@ def main():
                     bbox_corners_batch = None
                 
                 batch['full_attention_mask'] = batch['full_attention_mask'].to(device) # Shape [1, config.trajectory_length]
-                print(f"batch['full_attention_mask'] shape: {batch['full_attention_mask'].shape}")
+                print(f"actual_length: {batch['full_attention_mask'][0].sum().int().item()}")
 
                 # --- Dynamically determine input history length based on actual trajectory length ---
                 current_full_trajectory = full_trajectory_batch # Shape [1, config.trajectory_length, 6]
