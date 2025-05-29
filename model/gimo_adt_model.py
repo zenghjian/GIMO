@@ -240,8 +240,8 @@ class GIMO_ADT_Model(nn.Module):
         device = predictions.device
 
         # Split poses into positions and rotations for separate loss calculation
-        position_dim = 3  
-        rotation_dim = 6  
+        position_dim = 3  # Assuming first 3 dimensions are x, y, z
+        rotation_dim = 6  # 6D rotation representation
 
         # Extract ground truth positions and rotations
         gt_full_positions = gt_full_poses[..., :position_dim]

@@ -60,6 +60,7 @@ class GIMOMultiSequenceDataset(Dataset):
         use_displacements: bool = False,
         use_cache: bool = True,
         cache_dir: Optional[str] = None,
+        normalize_data: bool = True,
         trajectory_pointcloud_radius: float = 0.5,  # Added parameter for trajectory filtering
     ):
         """
@@ -81,6 +82,7 @@ class GIMOMultiSequenceDataset(Dataset):
             use_displacements: Whether to use displacements instead of absolute positions (if config not provided)
             use_cache: Whether to use caching (if config not provided)
             cache_dir: Directory for caching trajectory data (if config not provided)
+            normalize_data: Whether to normalize data using scene bounds (if config not provided)
             trajectory_pointcloud_radius: Radius around trajectory to collect points (meters)
         """
         self.sequence_paths = sequence_paths
@@ -96,6 +98,7 @@ class GIMOMultiSequenceDataset(Dataset):
             self.min_motion_percentile = getattr(config, 'min_motion_percentile', min_motion_percentile)
             self.use_displacements = getattr(config, 'use_displacements', use_displacements)
             self.use_cache = getattr(config, 'use_cache', use_cache)
+            self.normalize_data = getattr(config, 'normalize_data', normalize_data)
             self.trajectory_pointcloud_radius = getattr(config, 'trajectory_pointcloud_radius', trajectory_pointcloud_radius)
             self.force_use_cache = getattr(config, 'force_use_cache', False) # Get force_use_cache from config
             # For cache_dir, don't use config directly - it will be set below from save_path if provided
@@ -109,6 +112,7 @@ class GIMOMultiSequenceDataset(Dataset):
             self.min_motion_percentile = min_motion_percentile
             self.use_displacements = use_displacements
             self.use_cache = use_cache
+            self.normalize_data = normalize_data
             self.trajectory_pointcloud_radius = trajectory_pointcloud_radius
         
         # These parameters don't typically come from config
@@ -231,6 +235,7 @@ class GIMOMultiSequenceDataset(Dataset):
                     motion_velocity_threshold=getattr(self, 'motion_velocity_threshold', 0.05),
                     min_segment_frames=getattr(self, 'min_segment_frames', 5),
                     max_stationary_frames=getattr(self, 'max_stationary_frames', 3),
+                    normalize_data=self.normalize_data,
                     trajectory_pointcloud_radius=self.trajectory_pointcloud_radius,
                     force_use_cache=self.force_use_cache  # Pass force_use_cache parameter
                 )

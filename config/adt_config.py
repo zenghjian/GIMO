@@ -36,6 +36,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.traj_dataset_configs.add_argument('--motion_velocity_threshold', default=0.05, type=float, help='Threshold in m/s for detecting active motion')
         self.traj_dataset_configs.add_argument('--min_segment_frames', default=5, type=int, help='Minimum number of frames for a valid motion segment')
         self.traj_dataset_configs.add_argument('--max_stationary_frames', default=3, type=int, help='Maximum consecutive stationary frames allowed in a motion segment')
+        self.traj_dataset_configs.add_argument('--normalize_data', default=False, action='store_true', help='Enable normalization of trajectory data using scene bounds')
         self.traj_dataset_configs.add_argument('--global_cache_dir', type=str, default=None, help='Path to a shared global directory for trajectory cache (overrides cache within save_path)')
         self.traj_dataset_configs.add_argument('--force_use_cache', action='store_true', default=False, help='Force using available cache files even if parameters don\'t match')
 
