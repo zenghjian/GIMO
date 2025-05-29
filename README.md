@@ -1,3 +1,6 @@
+# GIMO ADT Evaluation Implementation Progress
+
+
 ```bash
 python train_adt_overfitting.py \
     --adt_dataroot <path_to_adt_data> \
@@ -22,13 +25,20 @@ Key Parameters (`config/adt_config.py`):
 
 *   `--sample_points`: Default: `50000`. Target number of points per point cloud sample in a batch. If a source point cloud has fewer points, points are sampled *with replacement* to reach this number. If more, points are randomly sampled *without replacement*.
 
-*   `--no_text_embedding`: Default: `False`. If `True`, disable the use of object category text embeddings in the model.
+*   `--no_text_embedding`: Default: `False`. If `True`, disable the use of object category text embeddings as conditioning.
+
+*  `--no_bbox`: Default: `False`. If `True`, disable the use of bounding boxes as conditioning.
 
 *   `--lambda_trans`: Default: `1.0`. Weight for the translation (position) component of the loss.
 
 *   `--lambda_ori`: Default: `1.0`. Weight for the orientation component of the loss.
 
 *   `--lambda_rec`: Default: `1.0`. Weight for the reconstruction loss (applied to the history part when not using `--use_first_frame_only`).
+
+*   `--enable_orientation_analysis`: Default: `False`. If `True`, DEBUGGING: enable orientation analysis before training.
+
+*   `--enable_gradient_tracking`: Default: `False`. If `True`, DEBUGGING: enable gradient tracking during training.
+
 
 Example command for overfitting:
 

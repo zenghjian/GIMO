@@ -92,6 +92,13 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.train_configs.add_argument('--lambda_trans', type=float, default=1.0, help='Weight for translation/position loss')
         self.train_configs.add_argument('--lambda_ori', type=float, default=1.0, help='Weight for orientation loss')
         self.train_configs.add_argument('--lambda_rec', type=float, default=1.0, help='Weight for reconstruction loss')
+        
+        # Gradient tracking and debugging parameters
+        self.train_configs.add_argument('--enable_gradient_tracking', action='store_true', default=False, help='Enable gradient tracking during training')
+        self.train_configs.add_argument('--gradient_log_freq', type=int, default=10, help='Frequency of gradient logging (batches)')
+        self.train_configs.add_argument('--gradient_plot_freq', type=int, default=None, help='Frequency of gradient plotting (epochs, defaults to val_fre)')
+        self.train_configs.add_argument('--enable_orientation_analysis', action='store_true', default=False, help='Enable orientation distribution analysis before training')
+        self.train_configs.add_argument('--orientation_analysis_samples', type=int, default=500, help='Number of samples for orientation analysis')
 
         # === Wandb Configuration ===
         self.wandb_configs = self.add_argument_group('WandB')

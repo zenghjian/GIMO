@@ -25,7 +25,10 @@ from utils.visualization import visualize_trajectory, visualize_prediction, visu
 from utils.metrics_utils import (
     transform_coords_for_visualization,
     compute_metrics_for_sample,
-    gimo_collate_fn
+    gimo_collate_fn,
+    plot_orientation_distribution,
+    plot_gradient_magnitudes,
+    GradientTracker
 )
 
 # --- Import ADT Sequence Utilities ---
@@ -680,6 +683,47 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers, drop_last=True, collate_fn=val_collate_func)
     logger(f"Train Dataset size: {len(train_dataset)}, Val Dataset size: {len(val_dataset)}, DataLoaders ready with custom collate_fn.") # Updated log
 
+    # --- Gradient Tracking Setup ---
+    gradient_tracker = GradientTracker() if config.enable_gradient_tracking else None
+    gradient_log_freq = config.gradient_log_freq if config.enable_gradient_tracking else None
+    gradient_plot_freq = config.gradient_plot_freq if config.gradient_plot_freq is not None else config.val_fre
+    
+    # --- Analyze Orientation Distributions (First part of debugging) ---
+    if config.enable_orientation_analysis:
+        print("\n=== ORIENTATION DISTRIBUTION ANALYSIS ===")
+        orientation_analysis_dir = os.path.join(config.save_path, "orientation_analysis")
+        os.makedirs(orientation_analysis_dir, exist_ok=True)
+        
+        try:
+            orientation_dist_path = os.path.join(orientation_analysis_dir, "orientation_distribution_comparison.png")
+            orientation_stats = plot_orientation_distribution(
+                train_loader=train_loader,
+                val_loader=val_loader,
+                num_bins=36,  # 10-degree bins
+                output_path=orientation_dist_path,
+                max_samples_per_loader=config.orientation_analysis_samples,
+                wandb_run=wandb if config.wandb_mode != 'disabled' else None
+            )
+            
+            # Save orientation statistics to file
+            stats_save_path = os.path.join(orientation_analysis_dir, "orientation_statistics.json")
+            with open(stats_save_path, 'w') as f:
+                # Convert numpy values to regular Python types for JSON serialization
+                json_stats = {}
+                for key, value in orientation_stats.items():
+                    if isinstance(value, dict):
+                        json_stats[key] = {k: float(v) for k, v in value.items()}
+                    else:
+                        json_stats[key] = float(value) if hasattr(value, 'item') else value
+                json.dump(json_stats, f, indent=2)
+            logger(f"Orientation statistics saved to: {stats_save_path}")
+            
+        except Exception as e:
+            logger(f"Warning: Could not analyze orientation distributions: {e}")
+        print("=== END ORIENTATION DISTRIBUTION ANALYSIS ===\n")
+    else:
+        logger("Orientation distribution analysis disabled. Use --enable_orientation_analysis to enable.")
+
     # --- Visualize Initial Training Data (if configured) ---
     if config.visualize_train_trajectories_on_start:
         visualize_initial_train_data(train_loader, device, config, logger)
@@ -866,6 +910,11 @@ def main():
             # 3. Backward pass and optimization
             optimizer.zero_grad()
             total_loss.backward()
+            
+            # --- Gradient Tracking (Second part of debugging) ---
+            if gradient_tracker is not None and batch_idx % gradient_log_freq == 0:
+                gradient_tracker.log_gradients(model, loss_dict)
+            
             # Optional: Gradient clipping
             # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -976,7 +1025,49 @@ def main():
                 if config.wandb_mode != 'disabled':
                      wandb.save(best_model_path) # Save best model to wandb
 
-        # --- Periodic Checkpoint Saving --- 
+        # --- Gradient Analysis and Visualization ---
+        if epoch % gradient_plot_freq == 0 and gradient_tracker is not None and len(gradient_tracker.get_logs()) > 0:
+            logger("=== GRADIENT ANALYSIS ===")
+            try:
+                gradient_analysis_dir = os.path.join(config.save_path, "gradient_analysis")
+                os.makedirs(gradient_analysis_dir, exist_ok=True)
+                
+                # Save gradient logs
+                gradient_log_path = os.path.join(gradient_analysis_dir, f"gradient_logs_epoch_{epoch}.pth")
+                gradient_tracker.save_logs(gradient_log_path)
+                
+                # Generate gradient magnitude plots
+                gradient_plot_path = os.path.join(gradient_analysis_dir, f"gradient_magnitudes_epoch_{epoch}.png")
+                gradient_stats = plot_gradient_magnitudes(
+                    gradient_logs=gradient_tracker.get_logs(),
+                    output_path=gradient_plot_path,
+                    window_size=20,  # Smooth over 20 iterations
+                    show_losses=True,
+                    wandb_run=wandb if config.wandb_mode != 'disabled' else None,
+                    step=epoch
+                )
+                
+                # Save gradient statistics
+                gradient_stats_path = os.path.join(gradient_analysis_dir, f"gradient_statistics_epoch_{epoch}.json")
+                with open(gradient_stats_path, 'w') as f:
+                    json.dump(gradient_stats, f, indent=2)
+                
+                # Log to WandB if enabled
+                if config.wandb_mode != 'disabled':
+                    try:
+                        wandb.log({"gradient_analysis": wandb.Image(gradient_plot_path)}, step=epoch)
+                        # Log key gradient statistics
+                        for component, stats in gradient_stats.items():
+                            wandb.log({f"grad_stats/{component}_mean": stats['mean']}, step=epoch)
+                            wandb.log({f"grad_stats/{component}_final": stats['final']}, step=epoch)
+                    except Exception as e:
+                        logger(f"Warning: Failed to log gradient analysis to WandB: {e}")
+                
+                logger(f"Gradient analysis completed for epoch {epoch}")
+            except Exception as e:
+                logger(f"Warning: Could not perform gradient analysis: {e}")
+
+        # --- Periodic Checkpoint Saving ---
         if epoch % config.save_fre == 0:
             ckpt_path = os.path.join(config.save_path, f'ckpt_epoch_{epoch}.pth')
             logger(f"Saving periodic checkpoint to {ckpt_path}...")
@@ -994,6 +1085,44 @@ def main():
         # logger(f"LR scheduler step taken. New LR: {scheduler.get_last_lr()[0]:.6f}")
 
     logger("\n--- Training Finished ---")
+    
+    # --- Final Gradient Analysis ---
+    if gradient_tracker is not None and len(gradient_tracker.get_logs()) > 0:
+        logger("=== FINAL GRADIENT ANALYSIS ===")
+        try:
+            gradient_analysis_dir = os.path.join(config.save_path, "gradient_analysis")
+            os.makedirs(gradient_analysis_dir, exist_ok=True)
+            
+            # Save final gradient logs
+            final_gradient_log_path = os.path.join(gradient_analysis_dir, "final_gradient_logs.pth")
+            gradient_tracker.save_logs(final_gradient_log_path)
+            
+            # Generate final gradient magnitude plots
+            final_gradient_plot_path = os.path.join(gradient_analysis_dir, "final_gradient_magnitudes.png")
+            final_gradient_stats = plot_gradient_magnitudes(
+                gradient_logs=gradient_tracker.get_logs(),
+                output_path=final_gradient_plot_path,
+                window_size=20,
+                show_losses=True,
+                wandb_run=wandb if config.wandb_mode != 'disabled' else None,
+                step=num_epochs
+            )
+            
+            # Save final gradient statistics
+            final_gradient_stats_path = os.path.join(gradient_analysis_dir, "final_gradient_statistics.json")
+            with open(final_gradient_stats_path, 'w') as f:
+                json.dump(final_gradient_stats, f, indent=2)
+            
+            logger("Final gradient analysis completed")
+            
+            # Log final gradient statistics summary
+            logger("\n=== GRADIENT ANALYSIS SUMMARY ===")
+            for component, stats in final_gradient_stats.items():
+                logger(f"{component}: Mean={stats['mean']:.6f}, Final={stats['final']:.6f}, Trend={stats['trend']}")
+            
+        except Exception as e:
+            logger(f"Warning: Could not perform final gradient analysis: {e}")
+    
     # Save final model
     final_model_path = os.path.join(config.save_path, 'final_model.pth')
     logger(f"Saving final model to {final_model_path}")

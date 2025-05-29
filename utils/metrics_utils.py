@@ -7,6 +7,19 @@ import torch
 import numpy as np
 from torch.utils.data.dataloader import default_collate
 from functools import partial
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict
+import os
+from tqdm import tqdm
+
+# Import geometry utilities for rotation conversion
+try:
+    from utils.geometry_utils import convert_rotation_to_euler
+    HAS_GEOMETRY_UTILS = True
+except ImportError:
+    print("Warning: geometry_utils not found. Will use fallback rotation conversion.")
+    HAS_GEOMETRY_UTILS = False
 
 
 def transform_coords_for_visualization(tensor_3d: torch.Tensor) -> torch.Tensor:
@@ -36,6 +49,760 @@ def transform_coords_for_visualization(tensor_3d: torch.Tensor) -> torch.Tensor:
     
     transformed_tensor = torch.stack((x, -z, y), dim=-1)
     return transformed_tensor
+
+
+def convert_6d_to_euler_fallback(r6d_rotations):
+    """
+    Fallback function to convert 6D rotation to Euler angles when geometry_utils is not available.
+    
+    Args:
+        r6d_rotations: [N, 6] tensor of 6D rotation representations
+        
+    Returns:
+        ndarray: [N, 3] Euler angles (roll, pitch, yaw) in radians
+    """
+    if isinstance(r6d_rotations, torch.Tensor):
+        r6d_rotations = r6d_rotations.detach().cpu().numpy()
+    
+    euler_angles = []
+    for i in range(r6d_rotations.shape[0]):
+        r6d = r6d_rotations[i]
+        
+        # Extract first two columns
+        x = r6d[:3]
+        y = r6d[3:]
+        
+        # Normalize and orthogonalize using Gram-Schmidt
+        x = x / (np.linalg.norm(x) + 1e-8)
+        y = y - np.dot(x, y) * x
+        y = y / (np.linalg.norm(y) + 1e-8)
+        z = np.cross(x, y)
+        
+        # Create rotation matrix
+        R_matrix = np.column_stack([x, y, z])
+        
+        # Convert to Euler angles (ZYX convention)
+        sy = np.sqrt(R_matrix[0, 0] * R_matrix[0, 0] + R_matrix[1, 0] * R_matrix[1, 0])
+        singular = sy < 1e-6
+        
+        if not singular:
+            roll = np.arctan2(R_matrix[2, 1], R_matrix[2, 2])
+            pitch = np.arctan2(-R_matrix[2, 0], sy)
+            yaw = np.arctan2(R_matrix[1, 0], R_matrix[0, 0])
+        else:
+            roll = np.arctan2(-R_matrix[1, 2], R_matrix[1, 1])
+            pitch = np.arctan2(-R_matrix[2, 0], sy)
+            yaw = 0
+        
+        euler_angles.append([roll, pitch, yaw])
+    
+    return np.array(euler_angles)
+
+
+def extract_orientations_from_loader(dataloader, max_samples=None, position_dim=3):
+    """
+    Extract all orientation data from a dataloader.
+    
+    Args:
+        dataloader: PyTorch DataLoader containing trajectory data
+        max_samples: Maximum number of samples to process (None for all)
+        position_dim: Number of position dimensions (default: 3)
+        
+    Returns:
+        numpy.ndarray: Array of Euler angles [N, 3] in radians
+    """
+    all_orientations = []
+    sample_count = 0
+    
+    print(f"Extracting orientations from dataloader with {len(dataloader)} batches...")
+    
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc="Extracting orientations")):
+        try:
+            # Get full poses from batch
+            full_poses = batch['full_poses']  # [B, seq_len, 9]
+            attention_mask = batch.get('full_attention_mask', None)  # [B, seq_len]
+            
+            batch_size, seq_len, total_dim = full_poses.shape
+            rotation_dim = total_dim - position_dim
+            
+            # Extract rotation components (6D representation)
+            rotations = full_poses[:, :, position_dim:position_dim + rotation_dim]  # [B, seq_len, 6]
+            
+            # Process each sample in the batch
+            for i in range(batch_size):
+                sample_rotations = rotations[i]  # [seq_len, 6]
+                
+                # Apply attention mask if available
+                if attention_mask is not None:
+                    mask = attention_mask[i]  # [seq_len]
+                    valid_indices = torch.where(mask > 0)[0]
+                    if len(valid_indices) > 0:
+                        sample_rotations = sample_rotations[valid_indices]  # [valid_len, 6]
+                
+                # Convert 6D rotations to Euler angles
+                if sample_rotations.shape[0] > 0:
+                    if HAS_GEOMETRY_UTILS:
+                        euler_angles = convert_rotation_to_euler(sample_rotations)
+                    else:
+                        euler_angles = convert_6d_to_euler_fallback(sample_rotations)
+                    
+                    if euler_angles is not None:
+                        all_orientations.append(euler_angles)
+                
+                sample_count += 1
+                if max_samples is not None and sample_count >= max_samples:
+                    break
+            
+            if max_samples is not None and sample_count >= max_samples:
+                break
+                
+        except Exception as e:
+            print(f"Error processing batch {batch_idx}: {e}")
+            continue
+    
+    if all_orientations:
+        # Concatenate all orientations
+        all_orientations = np.concatenate(all_orientations, axis=0)
+        print(f"Extracted {all_orientations.shape[0]} orientation samples")
+        return all_orientations
+    else:
+        print("No valid orientations found!")
+        return np.array([])
+
+
+def plot_orientation_distribution(train_loader, val_loader, num_bins=36, output_path=None, max_samples_per_loader=1000, wandb_run=None):
+    """
+    Visualize and compare orientation angle distributions between training and validation sets.
+    
+    Args:
+        train_loader: Training data loader
+        val_loader: Validation data loader
+        num_bins: Number of bins for histogram (default: 36, i.e., 10-degree bins for 360 degrees)
+        output_path: Path to save the plot (optional)
+        max_samples_per_loader: Maximum samples to extract from each loader
+        wandb_run: WandB run object for logging (optional)
+        
+    Returns:
+        dict: Statistics about the distributions
+    """
+    print("=== Analyzing Orientation Distributions ===")
+    
+    # Extract orientations from both loaders
+    print("Extracting training orientations...")
+    train_orientations = extract_orientations_from_loader(train_loader, max_samples=max_samples_per_loader)
+    
+    print("Extracting validation orientations...")
+    val_orientations = extract_orientations_from_loader(val_loader, max_samples=max_samples_per_loader)
+    
+    if len(train_orientations) == 0 or len(val_orientations) == 0:
+        print("Error: No valid orientations found in one or both datasets!")
+        return {}
+    
+    # Convert from radians to degrees for better interpretability
+    train_orientations_deg = np.rad2deg(train_orientations)
+    val_orientations_deg = np.rad2deg(val_orientations)
+    
+    # Create figure with subplots for each angle component
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig.suptitle('Orientation Distribution Comparison: Training vs Validation', fontsize=16)
+    
+    angle_names = ['Roll', 'Pitch', 'Yaw']
+    colors = ['blue', 'red']
+    labels = ['Training', 'Validation']
+    
+    stats = {}
+    
+    # Plot distribution for each angle component
+    for angle_idx in range(3):
+        # Top row: Individual histograms
+        ax_individual = axes[0, angle_idx]
+        
+        train_angles = train_orientations_deg[:, angle_idx]
+        val_angles = val_orientations_deg[:, angle_idx]
+        
+        # Calculate appropriate bins that cover both datasets
+        all_angles = np.concatenate([train_angles, val_angles])
+        bins = np.linspace(-180, 180, num_bins + 1)
+        
+        # Plot histograms with transparency
+        ax_individual.hist(train_angles, bins=bins, alpha=0.7, color=colors[0], 
+                          label=f'{labels[0]} (n={len(train_angles)})', density=True)
+        ax_individual.hist(val_angles, bins=bins, alpha=0.7, color=colors[1], 
+                          label=f'{labels[1]} (n={len(val_angles)})', density=True)
+        
+        ax_individual.set_xlabel(f'{angle_names[angle_idx]} Angle (degrees)')
+        ax_individual.set_ylabel('Density')
+        ax_individual.set_title(f'{angle_names[angle_idx]} Distribution')
+        ax_individual.legend()
+        ax_individual.grid(True, alpha=0.3)
+        
+        # Calculate statistics
+        stats[f'{angle_names[angle_idx].lower()}_train'] = {
+            'mean': np.mean(train_angles),
+            'std': np.std(train_angles),
+            'median': np.median(train_angles),
+            'min': np.min(train_angles),
+            'max': np.max(train_angles)
+        }
+        
+        stats[f'{angle_names[angle_idx].lower()}_val'] = {
+            'mean': np.mean(val_angles),
+            'std': np.std(val_angles),
+            'median': np.median(val_angles),
+            'min': np.min(val_angles),
+            'max': np.max(val_angles)
+        }
+        
+        # Bottom row: Box plots for direct comparison
+        ax_box = axes[1, angle_idx]
+        data_to_plot = [train_angles, val_angles]
+        box_plot = ax_box.boxplot(data_to_plot, labels=labels, patch_artist=True)
+        
+        # Color the boxes
+        for patch, color in zip(box_plot['boxes'], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+        
+        ax_box.set_ylabel(f'{angle_names[angle_idx]} Angle (degrees)')
+        ax_box.set_title(f'{angle_names[angle_idx]} Box Plot Comparison')
+        ax_box.grid(True, alpha=0.3)
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    
+    # Save plot if path provided
+    if output_path:
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Orientation distribution plot saved to: {output_path}")
+    
+    # --- WandB Integration ---
+    if wandb_run is not None:
+        try:
+            import wandb
+            
+            # 1. Log the main comparison plot
+            wandb_run.log({"orientation_analysis/distribution_comparison": wandb.Image(fig)})
+            
+            # 2. Log individual angle statistics
+            for angle_name in ['roll', 'pitch', 'yaw']:
+                train_stats = stats[f'{angle_name}_train']
+                val_stats = stats[f'{angle_name}_val']
+                
+                # Log mean and std for each angle
+                wandb_run.log({
+                    f"orientation_stats/{angle_name}/train_mean": train_stats['mean'],
+                    f"orientation_stats/{angle_name}/train_std": train_stats['std'],
+                    f"orientation_stats/{angle_name}/val_mean": val_stats['mean'],
+                    f"orientation_stats/{angle_name}/val_std": val_stats['std'],
+                    f"orientation_stats/{angle_name}/mean_diff": abs(train_stats['mean'] - val_stats['mean']),
+                    f"orientation_stats/{angle_name}/std_diff": abs(train_stats['std'] - val_stats['std'])
+                })
+            
+            # 3. Create and log summary table
+            angle_comparison_data = []
+            for angle_name in ['roll', 'pitch', 'yaw']:
+                train_stats = stats[f'{angle_name}_train']
+                val_stats = stats[f'{angle_name}_val']
+                mean_diff = abs(train_stats['mean'] - val_stats['mean'])
+                std_diff = abs(train_stats['std'] - val_stats['std'])
+                
+                angle_comparison_data.append([
+                    angle_name.upper(),
+                    f"{train_stats['mean']:.2f}°",
+                    f"{val_stats['mean']:.2f}°", 
+                    f"{mean_diff:.2f}°",
+                    f"{train_stats['std']:.2f}°",
+                    f"{val_stats['std']:.2f}°",
+                    f"{std_diff:.2f}°",
+                    "⚠️" if mean_diff > 10.0 or std_diff > 5.0 else "✅"
+                ])
+            
+            table = wandb.Table(
+                columns=["Angle", "Train Mean", "Val Mean", "Mean Diff", "Train Std", "Val Std", "Std Diff", "Status"],
+                data=angle_comparison_data
+            )
+            wandb_run.log({"orientation_analysis/statistics_table": table})
+            
+            # 4. Create individual histograms for better WandB visualization
+            for angle_idx, angle_name in enumerate(['roll', 'pitch', 'yaw']):
+                train_angles = train_orientations_deg[:, angle_idx]
+                val_angles = val_orientations_deg[:, angle_idx]
+                
+                # Create individual histogram plot
+                fig_individual, ax = plt.subplots(1, 1, figsize=(10, 6))
+                
+                # Calculate bins
+                bins = np.linspace(-180, 180, num_bins + 1)
+                
+                # Plot histograms
+                ax.hist(train_angles, bins=bins, alpha=0.7, color='blue', 
+                       label=f'Training (n={len(train_angles)})', density=True)
+                ax.hist(val_angles, bins=bins, alpha=0.7, color='red', 
+                       label=f'Validation (n={len(val_angles)})', density=True)
+                
+                ax.set_xlabel(f'{angle_name.title()} Angle (degrees)')
+                ax.set_ylabel('Density')
+                ax.set_title(f'{angle_name.title()} Angle Distribution: Training vs Validation')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                
+                # Log individual plot
+                wandb_run.log({f"orientation_analysis/{angle_name}_distribution": wandb.Image(fig_individual)})
+                plt.close(fig_individual)
+            
+            # 5. Log diagnostic information
+            significant_diffs = []
+            for angle in ['roll', 'pitch', 'yaw']:
+                train_mean = stats[f'{angle}_train']['mean']
+                val_mean = stats[f'{angle}_val']['mean']
+                train_std = stats[f'{angle}_train']['std']
+                val_std = stats[f'{angle}_val']['std']
+                
+                mean_diff = abs(train_mean - val_mean)
+                std_diff = abs(train_std - val_std)
+                
+                if mean_diff > 10.0:
+                    significant_diffs.append(f"{angle.upper()}: Large mean difference ({mean_diff:.1f}°)")
+                
+                if std_diff > 5.0:
+                    significant_diffs.append(f"{angle.upper()}: Large std difference ({std_diff:.1f}°)")
+            
+            # Log overall assessment
+            has_issues = len(significant_diffs) > 0
+            wandb_run.log({
+                "orientation_analysis/has_distribution_issues": has_issues,
+                "orientation_analysis/num_significant_differences": len(significant_diffs)
+            })
+            
+            # Log issues as text
+            if significant_diffs:
+                issues_text = "⚠️ Potential Issues Detected:\n" + "\n".join(f"• {diff}" for diff in significant_diffs)
+                wandb_run.log({"orientation_analysis/detected_issues": wandb.Html(f"<pre>{issues_text}</pre>")})
+            else:
+                wandb_run.log({"orientation_analysis/detected_issues": wandb.Html("<pre>✅ No significant distribution differences detected.</pre>")})
+            
+            print("✅ Orientation analysis logged to WandB successfully")
+            
+        except Exception as e:
+            print(f"Warning: Failed to log orientation analysis to WandB: {e}")
+    
+    plt.show()
+    
+    # Print summary statistics
+    print("\n=== Distribution Statistics Summary ===")
+    for angle_idx, angle_name in enumerate(['roll', 'pitch', 'yaw']):
+        train_stats = stats[f'{angle_name}_train']
+        val_stats = stats[f'{angle_name}_val']
+        
+        print(f"\n{angle_name.upper()} Angle:")
+        print(f"  Training   - Mean: {train_stats['mean']:.2f}°, Std: {train_stats['std']:.2f}°")
+        print(f"  Validation - Mean: {val_stats['mean']:.2f}°, Std: {val_stats['std']:.2f}°")
+        print(f"  Difference - Mean: {abs(train_stats['mean'] - val_stats['mean']):.2f}°, Std: {abs(train_stats['std'] - val_stats['std']):.2f}°")
+    
+    return stats
+
+
+class GradientTracker:
+    """
+    Class to track gradients during training for different model components.
+    """
+    
+    def __init__(self):
+        self.gradient_logs = defaultdict(list)
+        self.iteration_count = 0
+    
+    def log_gradients(self, model, loss_components=None):
+        """
+        Log gradient magnitudes for different model components.
+        
+        Args:
+            model: The neural network model
+            loss_components: Optional dict of individual loss components
+        """
+        self.iteration_count += 1
+        
+        # Log gradients for different model components
+        component_gradients = {}
+        
+        # Check for different model components and log their gradients
+        if hasattr(model, 'outputlayer'):
+            # Final output layer (predicts full trajectory including orientation)
+            output_grads = []
+            for param in model.outputlayer.parameters():
+                if param.grad is not None:
+                    output_grads.append(param.grad.detach().flatten())
+            if output_grads:
+                output_grad_norm = torch.norm(torch.cat(output_grads), p=2).item()
+                component_gradients['output_layer'] = output_grad_norm
+        
+        # Motion-related components
+        if hasattr(model, 'motion_linear'):
+            motion_grads = []
+            for param in model.motion_linear.parameters():
+                if param.grad is not None:
+                    motion_grads.append(param.grad.detach().flatten())
+            if motion_grads:
+                motion_grad_norm = torch.norm(torch.cat(motion_grads), p=2).item()
+                component_gradients['motion_embedding'] = motion_grad_norm
+        
+        # Scene encoder components
+        if hasattr(model, 'scene_encoder'):
+            scene_grads = []
+            for param in model.scene_encoder.parameters():
+                if param.grad is not None:
+                    scene_grads.append(param.grad.detach().flatten())
+            if scene_grads:
+                scene_grad_norm = torch.norm(torch.cat(scene_grads), p=2).item()
+                component_gradients['scene_encoder'] = scene_grad_norm
+        
+        # Category embedding (if exists)
+        if hasattr(model, 'category_embedding'):
+            cat_grads = []
+            for param in model.category_embedding.parameters():
+                if param.grad is not None:
+                    cat_grads.append(param.grad.detach().flatten())
+            if cat_grads:
+                cat_grad_norm = torch.norm(torch.cat(cat_grads), p=2).item()
+                component_gradients['category_embedding'] = cat_grad_norm
+        
+        # Motion-bbox encoder
+        if hasattr(model, 'motion_bbox_encoder'):
+            motion_bbox_grads = []
+            for param in model.motion_bbox_encoder.parameters():
+                if param.grad is not None:
+                    motion_bbox_grads.append(param.grad.detach().flatten())
+            if motion_bbox_grads:
+                motion_bbox_grad_norm = torch.norm(torch.cat(motion_bbox_grads), p=2).item()
+                component_gradients['motion_bbox_encoder'] = motion_bbox_grad_norm
+        
+        # Output encoder
+        if hasattr(model, 'output_encoder'):
+            output_enc_grads = []
+            for param in model.output_encoder.parameters():
+                if param.grad is not None:
+                    output_enc_grads.append(param.grad.detach().flatten())
+            if output_enc_grads:
+                output_enc_grad_norm = torch.norm(torch.cat(output_enc_grads), p=2).item()
+                component_gradients['output_encoder'] = output_enc_grad_norm
+        
+        # Overall model gradient norm
+        total_grads = []
+        for param in model.parameters():
+            if param.grad is not None:
+                total_grads.append(param.grad.detach().flatten())
+        if total_grads:
+            total_grad_norm = torch.norm(torch.cat(total_grads), p=2).item()
+            component_gradients['total_model'] = total_grad_norm
+        
+        # Store the gradients
+        for component, grad_norm in component_gradients.items():
+            self.gradient_logs[component].append(grad_norm)
+        
+        # Also log loss components if provided
+        if loss_components:
+            for loss_name, loss_value in loss_components.items():
+                if isinstance(loss_value, torch.Tensor):
+                    loss_value = loss_value.item()
+                self.gradient_logs[f'loss_{loss_name}'].append(loss_value)
+    
+    def get_logs(self):
+        """
+        Get the current gradient logs.
+        
+        Returns:
+            dict: Dictionary of gradient logs
+        """
+        return dict(self.gradient_logs)
+    
+    def save_logs(self, save_path):
+        """
+        Save gradient logs to a file.
+        
+        Args:
+            save_path: Path to save the logs
+        """
+        logs_dict = self.get_logs()
+        torch.save(logs_dict, save_path)
+        print(f"Gradient logs saved to: {save_path}")
+    
+    def load_logs(self, load_path):
+        """
+        Load gradient logs from a file.
+        
+        Args:
+            load_path: Path to load the logs from
+        """
+        if os.path.exists(load_path):
+            logs_dict = torch.load(load_path)
+            self.gradient_logs = defaultdict(list, logs_dict)
+            self.iteration_count = len(list(logs_dict.values())[0]) if logs_dict else 0
+            print(f"Gradient logs loaded from: {load_path}")
+        else:
+            print(f"Warning: Gradient log file not found: {load_path}")
+
+
+def plot_gradient_magnitudes(gradient_logs, component_names=None, output_path=None, 
+                           window_size=50, show_losses=True, wandb_run=None, step=None):
+    """
+    Visualize gradient magnitudes over training iterations.
+    
+    Args:
+        gradient_logs: Dictionary containing gradient logs for different components
+        component_names: List of component names to plot (None for all)
+        output_path: Path to save the plot (optional)
+        window_size: Window size for moving average smoothing
+        show_losses: Whether to include loss curves in the plot
+        wandb_run: WandB run object for logging (optional)
+        step: Training step/epoch for WandB logging (optional)
+        
+    Returns:
+        dict: Summary statistics of gradients
+    """
+    if not gradient_logs:
+        print("No gradient logs provided!")
+        return {}
+    
+    # Filter logs based on component_names
+    if component_names is not None:
+        filtered_logs = {name: gradient_logs[name] for name in component_names if name in gradient_logs}
+    else:
+        filtered_logs = gradient_logs
+    
+    # Separate gradient logs from loss logs
+    grad_logs = {k: v for k, v in filtered_logs.items() if not k.startswith('loss_')}
+    loss_logs = {k: v for k, v in filtered_logs.items() if k.startswith('loss_')}
+    
+    # Determine subplot layout
+    if show_losses and loss_logs:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12))
+    else:
+        fig, ax1 = plt.subplots(1, 1, figsize=(15, 6))
+        ax2 = None
+    
+    # Plot gradient magnitudes
+    iterations = range(len(list(grad_logs.values())[0])) if grad_logs else []
+    
+    colors = plt.cm.tab10(np.linspace(0, 1, len(grad_logs)))
+    
+    for i, (component, grad_values) in enumerate(grad_logs.items()):
+        if len(grad_values) > 0:
+            # Apply moving average smoothing if window_size > 1
+            if window_size > 1 and len(grad_values) > window_size:
+                smoothed_values = np.convolve(grad_values, np.ones(window_size)/window_size, mode='valid')
+                smoothed_iterations = iterations[window_size-1:]
+                ax1.plot(smoothed_iterations, smoothed_values, label=f'{component} (smoothed)', 
+                        color=colors[i], linewidth=2)
+                ax1.plot(iterations, grad_values, alpha=0.3, color=colors[i], linewidth=0.5)
+            else:
+                ax1.plot(iterations, grad_values, label=component, color=colors[i], linewidth=2)
+    
+    ax1.set_xlabel('Training Iteration')
+    ax1.set_ylabel('Gradient Magnitude (L2 Norm)')
+    ax1.set_title('Gradient Magnitudes by Model Component')
+    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_yscale('log')  # Log scale for better visualization
+    
+    # Plot loss curves if requested
+    if show_losses and loss_logs and ax2 is not None:
+        loss_colors = plt.cm.Set1(np.linspace(0, 1, len(loss_logs)))
+        
+        for i, (loss_name, loss_values) in enumerate(loss_logs.items()):
+            if len(loss_values) > 0:
+                # Remove 'loss_' prefix from legend
+                display_name = loss_name.replace('loss_', '')
+                
+                # Apply moving average smoothing
+                if window_size > 1 and len(loss_values) > window_size:
+                    smoothed_values = np.convolve(loss_values, np.ones(window_size)/window_size, mode='valid')
+                    smoothed_iterations = iterations[window_size-1:]
+                    ax2.plot(smoothed_iterations, smoothed_values, label=f'{display_name} (smoothed)', 
+                            color=loss_colors[i], linewidth=2)
+                    ax2.plot(iterations, loss_values, alpha=0.3, color=loss_colors[i], linewidth=0.5)
+                else:
+                    ax2.plot(iterations, loss_values, label=display_name, color=loss_colors[i], linewidth=2)
+        
+        ax2.set_xlabel('Training Iteration')
+        ax2.set_ylabel('Loss Value')
+        ax2.set_title('Loss Components Over Time')
+        ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax2.grid(True, alpha=0.3)
+        ax2.set_yscale('log')  # Log scale for better visualization
+    
+    plt.tight_layout()
+    
+    # Save plot if path provided
+    if output_path:
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Gradient magnitude plot saved to: {output_path}")
+    
+    # Calculate and return summary statistics
+    stats = {}
+    for component, grad_values in grad_logs.items():
+        if len(grad_values) > 0:
+            stats[component] = {
+                'mean': np.mean(grad_values),
+                'std': np.std(grad_values),
+                'max': np.max(grad_values),
+                'min': np.min(grad_values),
+                'final': grad_values[-1] if len(grad_values) > 0 else 0,
+                'trend': 'increasing' if len(grad_values) > 10 and grad_values[-1] > np.mean(grad_values[:10]) else 'decreasing'
+            }
+    
+    # --- Enhanced WandB Integration ---
+    if wandb_run is not None:
+        try:
+            import wandb
+            
+            # 1. Log the main gradient plot
+            wandb_run.log({"gradient_analysis/magnitude_plot": wandb.Image(fig)}, step=step)
+            
+            # 2. Log detailed gradient statistics for each component
+            for component, component_stats in stats.items():
+                prefix = f"gradient_stats/{component}"
+                log_data = {
+                    f"{prefix}/mean": component_stats['mean'],
+                    f"{prefix}/std": component_stats['std'],
+                    f"{prefix}/max": component_stats['max'],
+                    f"{prefix}/min": component_stats['min'],
+                    f"{prefix}/final": component_stats['final'],
+                    f"{prefix}/trend_increasing": component_stats['trend'] == 'increasing'
+                }
+                wandb_run.log(log_data, step=step)
+            
+            # 3. Create and log gradient statistics table
+            gradient_table_data = []
+            for component, component_stats in stats.items():
+                # Determine status based on gradient health
+                status = "✅"
+                if component_stats['mean'] < 1e-6:
+                    status = "⚠️ Vanishing"
+                elif component_stats['max'] > 1000:
+                    status = "🔥 Exploding" 
+                elif component_stats['std'] > 10 * component_stats['mean']:
+                    status = "📈 Unstable"
+                elif component_stats['trend'] == 'increasing':
+                    status = "↗️ Increasing"
+                
+                gradient_table_data.append([
+                    component,
+                    f"{component_stats['mean']:.2e}",
+                    f"{component_stats['final']:.2e}",
+                    f"{component_stats['max']:.2e}",
+                    f"{component_stats['std']:.2e}",
+                    component_stats['trend'].title(),
+                    status
+                ])
+            
+            gradient_table = wandb.Table(
+                columns=["Component", "Mean", "Final", "Max", "Std", "Trend", "Status"],
+                data=gradient_table_data
+            )
+            wandb_run.log({"gradient_analysis/statistics_table": gradient_table}, step=step)
+            
+            # 4. Create individual component plots for WandB
+            for component, grad_values in grad_logs.items():
+                if len(grad_values) > 10:  # Only plot if enough data points
+                    fig_individual, ax = plt.subplots(1, 1, figsize=(12, 6))
+                    
+                    iterations_component = range(len(grad_values))
+                    ax.plot(iterations_component, grad_values, alpha=0.3, color='blue', linewidth=0.5, label='Raw')
+                    
+                    # Add smoothed line if enough data
+                    if window_size > 1 and len(grad_values) > window_size:
+                        smoothed = np.convolve(grad_values, np.ones(window_size)/window_size, mode='valid')
+                        smoothed_iter = iterations_component[window_size-1:]
+                        ax.plot(smoothed_iter, smoothed, color='red', linewidth=2, label=f'Smoothed (window={window_size})')
+                    
+                    ax.set_xlabel('Training Iteration')
+                    ax.set_ylabel('Gradient Magnitude (L2 Norm)')
+                    ax.set_title(f'Gradient Magnitude: {component}')
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+                    ax.set_yscale('log')
+                    
+                    # Add statistics as text
+                    component_stats = stats[component]
+                    stats_text = f"Mean: {component_stats['mean']:.2e}\nFinal: {component_stats['final']:.2e}\nTrend: {component_stats['trend']}"
+                    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=10, 
+                           verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+                    
+                    wandb_run.log({f"gradient_analysis/components/{component}": wandb.Image(fig_individual)}, step=step)
+                    plt.close(fig_individual)
+            
+            # 5. Log loss-specific analysis if available
+            if loss_logs:
+                for loss_name, loss_values in loss_logs.items():
+                    if len(loss_values) > 10:
+                        display_name = loss_name.replace('loss_', '')
+                        
+                        # Calculate loss trend
+                        first_quarter = np.mean(loss_values[:len(loss_values)//4])
+                        last_quarter = np.mean(loss_values[-len(loss_values)//4:])
+                        loss_trend = "increasing" if last_quarter > first_quarter * 1.1 else "decreasing"
+                        
+                        wandb_run.log({
+                            f"loss_analysis/{display_name}/trend": loss_trend,
+                            f"loss_analysis/{display_name}/final_value": loss_values[-1],
+                            f"loss_analysis/{display_name}/first_quarter_mean": first_quarter,
+                            f"loss_analysis/{display_name}/last_quarter_mean": last_quarter,
+                            f"loss_analysis/{display_name}/trend_increasing": loss_trend == "increasing"
+                        }, step=step)
+            
+            # 6. Log overall gradient health summary
+            total_issues = 0
+            issue_components = []
+            
+            for component, component_stats in stats.items():
+                has_issue = False
+                if component_stats['mean'] < 1e-6:
+                    issue_components.append(f"{component}: vanishing gradients")
+                    has_issue = True
+                elif component_stats['max'] > 1000:
+                    issue_components.append(f"{component}: exploding gradients")
+                    has_issue = True
+                elif component_stats['std'] > 10 * component_stats['mean']:
+                    issue_components.append(f"{component}: unstable gradients")
+                    has_issue = True
+                elif component_stats['trend'] == 'increasing':
+                    issue_components.append(f"{component}: non-converging gradients")
+                    has_issue = True
+                
+                if has_issue:
+                    total_issues += 1
+            
+            wandb_run.log({
+                "gradient_analysis/total_components_with_issues": total_issues,
+                "gradient_analysis/gradient_health_score": max(0, 1 - total_issues / len(stats)),
+                "gradient_analysis/num_components_tracked": len(stats)
+            }, step=step)
+            
+            # Log issues as HTML report
+            if issue_components:
+                issues_html = "<h3>⚠️ Gradient Issues Detected:</h3><ul>"
+                for issue in issue_components:
+                    issues_html += f"<li>{issue}</li>"
+                issues_html += "</ul>"
+                wandb_run.log({"gradient_analysis/issues_report": wandb.Html(issues_html)}, step=step)
+            else:
+                wandb_run.log({"gradient_analysis/issues_report": wandb.Html("<h3>✅ No gradient issues detected</h3>")}, step=step)
+            
+            print("✅ Gradient analysis logged to WandB successfully")
+            
+        except Exception as e:
+            print(f"Warning: Failed to log gradient analysis to WandB: {e}")
+    
+    plt.show()
+    
+    # Print summary
+    print("\n=== Gradient Magnitude Summary ===")
+    for component, component_stats in stats.items():
+        print(f"\n{component}:")
+        print(f"  Mean: {component_stats['mean']:.6f}")
+        print(f"  Final: {component_stats['final']:.6f}")
+        print(f"  Max: {component_stats['max']:.6f}")
+        print(f"  Trend: {component_stats['trend']}")
+    
+    return stats
 
 
 def compute_metrics_for_sample(pred_future, gt_future, future_mask):
