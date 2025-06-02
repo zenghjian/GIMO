@@ -658,7 +658,8 @@ def gimo_collate_fn(batch, dataset, num_sample_points):
             point_cloud = torch.from_numpy(point_cloud).float()
         
         if i == 0:  # Only print for first item to avoid log spam
-            print(f"Using full scene point cloud with {point_cloud.shape[0]} points")
+            # print(f"Using full scene point cloud with {point_cloud.shape[0]} points")
+            pass
     
         # Sample the point cloud to ensure consistent size
         if point_cloud.shape[0] >= num_sample_points:
@@ -668,7 +669,8 @@ def gimo_collate_fn(batch, dataset, num_sample_points):
         else:
             # If not enough points, sample with replacement
             if i == 0:  # Only print for first item to avoid log spam
-                print(f"Warning: Point cloud has only {point_cloud.shape[0]} points. Sampling with replacement to get {num_sample_points}.")
+                # print(f"Warning: Point cloud has only {point_cloud.shape[0]} points. Sampling with replacement to get {num_sample_points}.")
+                pass
             indices = np.random.choice(point_cloud.shape[0], num_sample_points, replace=True)
             sampled_pc = point_cloud[indices]
         

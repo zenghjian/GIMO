@@ -384,7 +384,9 @@ def visualize_prediction(past_positions, future_positions_gt, future_positions_p
 
     plt.close(fig)
 
-def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, bbox_corners_sequence=None, title="Full Trajectory", save_path=None, segment_idx=None):
+def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, bbox_corners_sequence=None, 
+                              trajectory_specific_bbox_info=None, trajectory_specific_bbox_mask=None, 
+                              title="Full Trajectory", save_path=None, segment_idx=None):
     """
     Visualize a complete trajectory without past/future split, optionally with surrounding point cloud and bounding boxes.
     
@@ -394,6 +396,10 @@ def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, 
         point_cloud: Optional tensor or ndarray of point cloud points [N, 3]
         bbox_corners_sequence: Optional tensor or ndarray of shape [trajectory_length, 8, 3] 
                                  representing the 8 corners of OBBs for each timestep.
+        trajectory_specific_bbox_info: Optional tensor or ndarray of shape [max_bboxes, 12]
+                                      representing filtered scene bboxes near this trajectory
+        trajectory_specific_bbox_mask: Optional tensor or ndarray of shape [max_bboxes]
+                                      indicating valid trajectory-specific bboxes
         title: Plot title
         save_path: Path to save the figure
         segment_idx: Optional segment index for multi-segment objects
@@ -503,6 +509,71 @@ def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, 
         # Add a legend entry for bboxes if any were plotted
         if num_bboxes_to_plot > 0:
             ax.plot([], [], [], color=bbox_color, linewidth=bbox_linewidth, label=f'Bounding Boxes ({num_bboxes_to_plot})')
+
+    # Plot Trajectory-Specific Scene Bounding Boxes if provided
+    if trajectory_specific_bbox_info is not None and trajectory_specific_bbox_mask is not None:
+        # Convert to numpy if needed
+        if isinstance(trajectory_specific_bbox_info, torch.Tensor):
+            trajectory_specific_bbox_info = trajectory_specific_bbox_info.detach().cpu().numpy()
+        if isinstance(trajectory_specific_bbox_mask, torch.Tensor):
+            trajectory_specific_bbox_mask = trajectory_specific_bbox_mask.detach().cpu().numpy()
+        
+        # Get valid scene bboxes based on mask
+        valid_scene_bbox_indices = np.where(trajectory_specific_bbox_mask > 0.5)[0]
+        
+        if len(valid_scene_bbox_indices) > 0:
+            scene_bbox_color = 'orange'
+            scene_bbox_alpha = 0.4
+            scene_bbox_linewidth = 1.0
+            
+            for idx in valid_scene_bbox_indices:
+                bbox_info = trajectory_specific_bbox_info[idx]  # [12] = [center(3) + dims(3) + rotation_6d(6)]
+                
+                # Extract center, dimensions, and rotation
+                center = bbox_info[:3]
+                dims = bbox_info[3:6]  # [width, height, depth]
+                rotation_6d = bbox_info[6:12]
+                
+                # Convert 6D rotation to rotation matrix
+                # 6D rotation representation: first two columns of rotation matrix
+                r1 = rotation_6d[:3]  # First column
+                r2 = rotation_6d[3:6]  # Second column
+                
+                # Normalize the columns
+                r1 = r1 / (np.linalg.norm(r1) + 1e-8)
+                r2 = r2 / (np.linalg.norm(r2) + 1e-8)
+                
+                # Compute third column via cross product
+                r3 = np.cross(r1, r2)
+                r3 = r3 / (np.linalg.norm(r3) + 1e-8)
+                
+                # Create rotation matrix
+                rotation_matrix = np.column_stack([r1, r2, r3])
+                
+                # Generate local corners of the bounding box
+                w, h, d = dims
+                local_corners = np.array([
+                    [-w/2, -h/2, -d/2], [w/2, -h/2, -d/2], [w/2, h/2, -d/2], [-w/2, h/2, -d/2],
+                    [-w/2, -h/2, d/2], [w/2, -h/2, d/2], [w/2, h/2, d/2], [-w/2, h/2, d/2]
+                ])
+                
+                # Transform corners to world coordinates
+                world_corners = (rotation_matrix @ local_corners.T).T + center
+                
+                # Draw edges of the bounding box
+                scene_bbox_edges = [
+                    (0, 1), (1, 2), (2, 3), (3, 0),  # Bottom face
+                    (4, 5), (5, 6), (6, 7), (7, 4),  # Top face
+                    (0, 4), (1, 5), (2, 6), (3, 7)   # Vertical edges
+                ]
+                
+                for edge in scene_bbox_edges:
+                    ax.plot(world_corners[edge, 0], world_corners[edge, 1], world_corners[edge, 2], 
+                            color=scene_bbox_color, alpha=scene_bbox_alpha, linewidth=scene_bbox_linewidth, label='_nolegend_')
+            
+            # Add legend entry for scene bboxes
+            ax.plot([], [], [], color=scene_bbox_color, linewidth=scene_bbox_linewidth, 
+                   label=f'Scene Objects ({len(valid_scene_bbox_indices)})')
 
     # Add labels and title
     ax.set_xlabel('X')

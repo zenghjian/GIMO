@@ -48,6 +48,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         normalize_data: bool = True,      # Whether to normalize data using scene bounds
         trajectory_pointcloud_radius: float = 0.5,  # Radius around trajectory to collect points (meters)
         force_use_cache: bool = False,    # Force use any compatible cache file, ignoring parameter mismatches
+        max_bboxes: int = 400,  # Maximum number of bounding boxes to use
     ):
         """
         Initialize the ADT trajectory dataset.
@@ -74,6 +75,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             normalize_data: Whether to normalize data using scene bounds (if config not provided)
             trajectory_pointcloud_radius: Radius around trajectory to collect points (meters)
             force_use_cache: Force use any compatible cache file, ignoring parameter mismatches
+            max_bboxes: Maximum number of bounding boxes to use for conditioning (for consistent batching)
         """
         from projectaria_tools.projects.adt import (
             AriaDigitalTwinDataProvider,
@@ -100,6 +102,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             self.normalize_data = getattr(config, 'normalize_data', normalize_data) # Get normalize_data from config
             self.trajectory_pointcloud_radius = getattr(config, 'trajectory_pointcloud_radius', trajectory_pointcloud_radius)
             self.force_use_cache = getattr(config, 'force_use_cache', force_use_cache) # Get force_use_cache from config
+            self.max_bboxes = getattr(config, 'max_bboxes', max_bboxes)
             # For cache_dir, don't use config directly - it might be set based on save_path
         else:
             self.trajectory_length = trajectory_length
@@ -117,6 +120,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             self.normalize_data = normalize_data # Use passed parameter if no config
             self.trajectory_pointcloud_radius = trajectory_pointcloud_radius
             self.force_use_cache = force_use_cache # Use passed parameter if no config
+            self.max_bboxes = max_bboxes
         
         # Force load_pointcloud to True when normalize_data is True for maximum precision
         self.load_pointcloud = self.load_pointcloud or self.normalize_data
@@ -126,6 +130,18 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         self.transform = transform
         self.pointcloud = None
         self.trajectories = []
+        
+        # Scene bbox caching attributes
+        self._scene_bboxes = None
+        self._scene_bboxes_mask = None
+        self._scene_bboxes_categories = None
+        
+        # Initialize recent valid bboxes cache attributes
+        self._recent_valid_bboxes = None
+        self._recent_valid_bbox_mask = None
+        self._recent_valid_bbox_categories = None
+        self._recent_valid_bboxes_timestamp = None
+        self._max_bbox_time_delta_ns = 100_000_000  # 100ms
         
         # Cache directory is now determined by the caller (GIMOMultiSequenceDataset) or defaults
         self.cache_dir = cache_dir if cache_dir is not None else './trajectory_cache'
@@ -191,6 +207,16 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                 print("Generating trajectory-specific point clouds...")
                 self._generate_trajectory_specific_pointclouds()
                 print(f"Completed generating trajectory-specific point clouds for {len(self.trajectories)} trajectories")
+            
+            # Cache the scene bounding boxes
+            print("Caching scene bounding boxes...")
+            self._scene_bboxes, self._scene_bboxes_mask, self._scene_bboxes_categories = self.get_all_scene_bboxes()
+            
+            # Generate trajectory-specific bboxes (new step)
+            if self._scene_bboxes is not None:
+                print("Generating trajectory-specific bounding boxes...")
+                self._generate_trajectory_specific_bboxes()
+                print(f"Completed generating trajectory-specific bounding boxes for {len(self.trajectories)} trajectories")
             
             # Save to cache if caching is enabled
             if self.use_cache:
@@ -345,7 +371,9 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             'pointcloud_subsample': self.pointcloud_subsample,
             'normalize_data': self.normalize_data, # Add normalize_data to cache key
             'trajectory_pointcloud_radius': self.trajectory_pointcloud_radius, # Add new parameter to cache key
-            'include_bbox_corners': True # New parameter for bbox corners
+            'include_bbox_corners': True, # New parameter for bbox corners
+            'max_bboxes': self.max_bboxes,  # Add max_bboxes to cache key
+            'include_trajectory_specific_bboxes': True,  # New parameter for trajectory-specific bboxes
         }
         
         # Generate hash from parameters
@@ -375,6 +403,10 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                 'scene_min': self.scene_min,
                 'scene_max': self.scene_max,
                 'scene_scale': self.scene_scale,
+                # Add scene bbox data to cache
+                'scene_bboxes': self._scene_bboxes,
+                'scene_bboxes_mask': self._scene_bboxes_mask,
+                'scene_bboxes_categories': self._scene_bboxes_categories,
                 'params': {
                     'sequence_name': sequence_name,  # Store sequence name, not full path
                     'trajectory_length': self.trajectory_length,
@@ -390,7 +422,9 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                     'pointcloud_subsample': self.pointcloud_subsample,
                     'normalize_data': self.normalize_data, # Save normalize_data state
                     'trajectory_pointcloud_radius': self.trajectory_pointcloud_radius, # Save new parameter
-                    'include_bbox_corners': True # Save new parameter state
+                    'include_bbox_corners': True, # Save new parameter state
+                    'max_bboxes': self.max_bboxes,  # Save max_bboxes state
+                    'include_trajectory_specific_bboxes': True,  # Save new parameter state
                 }
             }
             
@@ -460,7 +494,9 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                 'pointcloud_subsample': self.pointcloud_subsample,
                 'normalize_data': self.normalize_data,
                 'trajectory_pointcloud_radius': self.trajectory_pointcloud_radius,
-                'include_bbox_corners': True # Current setting for bbox corners
+                'include_bbox_corners': True, # Current setting for bbox corners
+                'max_bboxes': self.max_bboxes,  # Current setting for max_bboxes
+                'include_trajectory_specific_bboxes': True,  # Current setting for trajectory-specific bboxes
             }
             
             # Verify parameters match, with extra debug info
@@ -473,7 +509,7 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             if not self.force_use_cache:
                 critical_params = ['trajectory_length', 'skip_frames', 'use_displacements', 
                                 'normalize_data', 'motion_velocity_threshold',
-                                'include_bbox_corners'] # Add new param to critical check
+                                'include_bbox_corners', 'max_bboxes', 'include_trajectory_specific_bboxes'] # Add trajectory-specific bbox param to critical check
                 
                 for param in critical_params:
                     stored_value = stored_params.get(param, None)
@@ -491,6 +527,10 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             self.scene_min = cache_data.get('scene_min', np.zeros(3, dtype=np.float32))
             self.scene_max = cache_data.get('scene_max', np.ones(3, dtype=np.float32))
             self.scene_scale = cache_data.get('scene_scale', np.ones(3, dtype=np.float32))
+            # Load scene bbox data from cache
+            self._scene_bboxes = cache_data.get('scene_bboxes', None)
+            self._scene_bboxes_mask = cache_data.get('scene_bboxes_mask', None)
+            self._scene_bboxes_categories = cache_data.get('scene_bboxes_categories', None)
             # Ensure normalize_data flag is set correctly based on cache
             self.normalize_data = stored_params.get('normalize_data', True)
             # Bbox corners are already part of self.trajectories, no separate loading needed here
@@ -1052,18 +1092,6 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         metadata['category'] = getattr(instance_info, 'category', 'unknown')
         metadata['subcategory'] = getattr(instance_info, 'subcategory', 'unknown')
         
-        # Extract or assign category_id directly
-        # First try to get a direct category_id/uid from instance_info
-        category_id = getattr(instance_info, 'category_id', None)
-        if category_id is None:
-            # If not available, use a simple hash of the category string as backup
-            # This provides a consistent ID for the same category string
-            category_string = metadata['category']
-            category_id = hash(category_string) % 10000  # Limit to a reasonable range
-        
-        # Store the category_id in metadata
-        metadata['category_id'] = int(category_id)
-        
         # Create complete trajectory item
         trajectory_item = {
             'trajectory_data': trajectory_data,
@@ -1308,6 +1336,254 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         """
         return self.pointcloud
 
+    def get_all_scene_bboxes(self, timestamp_ns=None, use_recent_fallback=True):
+        """
+        Extract bounding box information for all objects in the scene at a specific timestamp.
+        
+        Args:
+            timestamp_ns: Optional timestamp for which to extract bounding boxes.
+                         If None, a valid timestamp will be automatically selected.
+            use_recent_fallback: Whether to use recently cached bounding boxes if retrieval fails
+            
+        Returns:
+            Tuple of (
+                torch.Tensor: Bounding box information [max_bboxes, bbox_dim],
+                torch.Tensor: Mask indicating which boxes are real (1) vs padding (0) [max_bboxes],
+                List[str]: Categories for each bounding box [max_bboxes]
+            ) or (None, None, None) if no bounding box information is available
+        """
+        try:
+            if not hasattr(self, 'adt_provider') or self.adt_provider is None:
+                print("Warning: ADT provider not available for bounding box retrieval.")
+                # Try to use recently cached bounding boxes as fallback
+                if use_recent_fallback and hasattr(self, '_recent_valid_bboxes') and self._recent_valid_bboxes is not None:
+                    return self._recent_valid_bboxes, self._recent_valid_bbox_mask, self._recent_valid_bbox_categories
+                return None, None, None
+            
+            # Get timestamps from RGB stream if we need to find the first timestamp
+            if timestamp_ns is None:
+                from projectaria_tools.core.stream_id import StreamId
+                rgb_stream_id = StreamId("214-1")  # Standard RGB camera ID
+                
+                # Get valid timestamps
+                all_timestamps = self.adt_provider.get_aria_device_capture_timestamps_ns(rgb_stream_id)
+                if not all_timestamps:
+                    print("Warning: No timestamps found in the scene.")
+                    # Try to use recent bounding boxes as fallback
+                    if use_recent_fallback and self._recent_valid_bboxes is not None:
+                        return self._recent_valid_bboxes, self._recent_valid_bbox_mask, self._recent_valid_bbox_categories
+                    return None, None, None
+                    
+                # Filter timestamps to valid range
+                start_time = self.adt_provider.get_start_time_ns()
+                end_time = self.adt_provider.get_end_time_ns()
+                valid_timestamps = [ts for ts in all_timestamps if start_time <= ts <= end_time]
+                
+                if not valid_timestamps:
+                    print("Warning: No valid timestamps found.")
+                    # Try to use recent bounding boxes as fallback
+                    if use_recent_fallback and self._recent_valid_bboxes is not None:
+                        return self._recent_valid_bboxes, self._recent_valid_bbox_mask, self._recent_valid_bbox_categories
+                    return None, None, None
+                    
+                # Use the first valid timestamp
+                timestamp_ns = valid_timestamps[0]
+                
+            # Get 3D bounding boxes at this timestamp
+            bbox3d_with_dt = self.adt_provider.get_object_3d_boundingboxes_by_timestamp_ns(timestamp_ns)
+            
+            if not bbox3d_with_dt.is_valid():
+                print(f"Warning: No valid bounding boxes at timestamp {timestamp_ns}.")
+                # Try to use recent bounding boxes as fallback
+                if use_recent_fallback and self._recent_valid_bboxes is not None:
+                    # Check if the recent bboxes are within acceptable time range
+                    if self._recent_valid_bboxes_timestamp is not None and abs(timestamp_ns - self._recent_valid_bboxes_timestamp) < self._max_bbox_time_delta_ns:
+                        print(f"Using recent bounding boxes from timestamp {self._recent_valid_bboxes_timestamp}")
+                        return self._recent_valid_bboxes, self._recent_valid_bbox_mask, self._recent_valid_bbox_categories
+                return None, None, None
+                
+            # Get the bounding box data
+            bboxes3d = bbox3d_with_dt.data()
+            
+            # Extract center positions, dimensions, and orientation from all bounding boxes
+            bbox_info = []
+            bbox_categories = []  # New list to store categories
+            
+            for obj_id, bbox in bboxes3d.items():
+                try:
+                    # Get the center position through the translation method
+                    center = bbox.transform_scene_object.translation()[0]
+                    
+                    # Get the dimensions from the AABB
+                    # AABB format is [xmin, xmax, ymin, ymax, zmin, zmax]
+                    aabb = bbox.aabb
+                    width = aabb[1] - aabb[0]   # xmax - xmin
+                    height = aabb[3] - aabb[2]  # ymax - ymin
+                    depth = aabb[5] - aabb[4]   # zmax - zmin
+                    
+                    # Extract rotation matrix from transform_scene_object
+                    rotation_matrix = bbox.transform_scene_object.rotation().to_matrix()
+                    
+                    # Use 6D rotation representation
+                    rotation_rep = rotation_matrix_to_6d(rotation_matrix)
+                    
+                    # Normalize center and dimensions if normalize_data is True
+                    if self.normalize_data:
+                        center = self.normalize_position(center)
+                        dimensions = self.normalize_size(np.array([width, height, depth]))
+                        width, height, depth = dimensions
+                    
+                    # Add the normalized center, dimensions, and rotation representation to our list
+                    # 6D rotation format: [cx, cy, cz, width, height, depth, r1, r2, r3, r4, r5, r6]
+                    bbox_info_entry = [
+                        center[0], center[1], center[2],
+                        width, height, depth,
+                        rotation_rep[0], rotation_rep[1], rotation_rep[2], 
+                        rotation_rep[3], rotation_rep[4], rotation_rep[5]
+                    ]
+                    
+                    bbox_info.append(bbox_info_entry)
+                    
+                    # Get object category if available
+                    category = "unknown"
+                    try:
+                        # Get instance info directly - this is more reliable for categories
+                        instance_info = self.adt_provider.get_instance_info_by_id(obj_id)
+                        if instance_info:
+                            # First try the direct category attribute (like in _process_trajectory_segment)
+                            category = getattr(instance_info, 'category', 'unknown')
+                            
+                            # If still unknown, try other potential category fields
+                            if category == "unknown" and hasattr(instance_info, 'semantic_category'):
+                                category = instance_info.semantic_category
+                            elif category == "unknown" and hasattr(instance_info, 'object_type'):
+                                category = instance_info.object_type
+                            elif category == "unknown" and hasattr(instance_info, 'type'):
+                                category = instance_info.type
+                            
+                            # If still unknown, try to get the prototype_name
+                            if category == "unknown" and hasattr(instance_info, 'prototype_name'):
+                                category = instance_info.prototype_name
+                        
+                    except Exception as e:
+                        # Log error but continue
+                        print(f"Warning: Failed to get category for object {obj_id}: {e}")
+                    
+                    bbox_categories.append(category)
+                    
+                except Exception as e:
+                    print(f"Warning: Failed to get bbox info for object {obj_id}: {e}")
+                    continue
+                    
+            if not bbox_info:
+                print(f"Warning: No valid bounding box info extracted at timestamp {timestamp_ns}.")
+                # Try to use recent bounding boxes as fallback
+                if use_recent_fallback and self._recent_valid_bboxes is not None:
+                    # Check if the recent bboxes are within acceptable time range
+                    if self._recent_valid_bboxes_timestamp is not None and abs(timestamp_ns - self._recent_valid_bboxes_timestamp) < self._max_bbox_time_delta_ns:
+                        print(f"Using recent bounding boxes from timestamp {self._recent_valid_bboxes_timestamp}")
+                        return self._recent_valid_bboxes, self._recent_valid_bbox_mask, self._recent_valid_bbox_categories
+                return None, None, None
+                
+            # Convert to tensor
+            bbox_tensor = torch.tensor(bbox_info, dtype=torch.float32)
+            
+            # Count actual bounding boxes
+            num_actual_bboxes = len(bbox_info)
+            # print(f"Found {num_actual_bboxes} bounding boxes in scene at timestamp {timestamp_ns}")
+            
+            # Create mask for real vs. padding boxes (1 for real, 0 for padding)
+            mask = torch.zeros(self.max_bboxes, dtype=torch.float32)
+            
+            # Create padded category list - fill with empties for padding boxes
+            padded_categories = ["unknown"] * self.max_bboxes
+            
+            # If we have more boxes than max, truncate
+            if num_actual_bboxes > self.max_bboxes:
+                print(f"Truncating from {num_actual_bboxes} to {self.max_bboxes} bounding boxes")
+                bbox_tensor = bbox_tensor[:self.max_bboxes]
+                mask[:self.max_bboxes] = 1.0
+                # Also truncate the categories
+                bbox_categories = bbox_categories[:self.max_bboxes]
+                for i, cat in enumerate(bbox_categories):
+                    padded_categories[i] = cat
+            else:
+                # Create padded tensor to fill with zeros
+                padded_boxes = torch.zeros(self.max_bboxes, 12, dtype=torch.float32)
+                padded_boxes[:num_actual_bboxes] = bbox_tensor
+                # Set 6D representation to identity rotation for padding boxes
+                # First 3 components (first column): [1,0,0]
+                padded_boxes[num_actual_bboxes:, 6] = 1.0  # rx1 = 1
+                padded_boxes[num_actual_bboxes:, 7] = 0.0  # ry1 = 0
+                padded_boxes[num_actual_bboxes:, 8] = 0.0  # rz1 = 0
+                # Next 3 components (second column): [0,1,0]
+                padded_boxes[num_actual_bboxes:, 9] = 0.0   # rx2 = 0
+                padded_boxes[num_actual_bboxes:, 10] = 1.0  # ry2 = 1
+                padded_boxes[num_actual_bboxes:, 11] = 0.0  # rz2 = 0
+                
+                bbox_tensor = padded_boxes
+                mask[:num_actual_bboxes] = 1.0
+                # Add categories to padded list
+                for i, cat in enumerate(bbox_categories):
+                    padded_categories[i] = cat
+            
+            # Cache these bounding boxes for future use
+            self._recent_valid_bboxes = bbox_tensor
+            self._recent_valid_bboxes_timestamp = timestamp_ns
+            self._recent_valid_bbox_mask = mask
+            self._recent_valid_bbox_categories = padded_categories
+                
+            return bbox_tensor, mask, padded_categories
+            
+        except Exception as e:
+            print(f"Error extracting bounding boxes at timestamp {timestamp_ns}: {e}")
+            traceback.print_exc()
+            # Try to use recent bounding boxes as fallback
+            if use_recent_fallback and self._recent_valid_bboxes is not None:
+                print(f"Using recent bounding boxes from timestamp {self._recent_valid_bboxes_timestamp} after error")
+                if hasattr(self, '_recent_valid_bbox_categories'):
+                    return self._recent_valid_bboxes, self._recent_valid_bbox_mask, self._recent_valid_bbox_categories
+                else:
+                    # Create default categories if not previously stored
+                    default_categories = ["unknown"] * self.max_bboxes
+                    return self._recent_valid_bboxes, self._recent_valid_bbox_mask, default_categories
+            return None, None, None
+
+    def get_scene_bboxes(self, batch_size=1):
+        """
+        Get scene bounding boxes for training or sampling.
+        
+        This method provides bounding boxes for the initial timestamp of the sequence.
+        Note that for individual trajectories accessed via __getitem__, each motion segment
+        uses bounding boxes from its specific start timestamp for more accurate scene context.
+        
+        Args:
+            batch_size: Number of copies of the bounding box information to return
+        
+        Returns:
+            Tuple of (
+                torch.Tensor: Bounding box information [batch_size, max_bboxes, bbox_dim],
+                torch.Tensor: Mask indicating which boxes are real (1) vs padding (0) [batch_size, max_bboxes],
+                List[List[str]]: Categories for each bounding box [batch_size, max_bboxes]
+            ) or (None, None, None) if no bounding box information is available
+        """
+        # Get bounding boxes (load or compute if not already available)
+        if not hasattr(self, '_scene_bboxes') or self._scene_bboxes is None:
+            self._scene_bboxes, self._scene_bboxes_mask, self._scene_bboxes_categories = self.get_all_scene_bboxes()
+        
+        if self._scene_bboxes is None:
+            return None, None, None
+        
+        # Repeat for batch size
+        if batch_size > 1:
+            bboxes = self._scene_bboxes.unsqueeze(0).repeat(batch_size, 1, 1)
+            mask = self._scene_bboxes_mask.unsqueeze(0).repeat(batch_size, 1)
+            # For categories, we need to repeat the list
+            categories = [self._scene_bboxes_categories for _ in range(batch_size)]
+            return bboxes, mask, categories
+        else:
+            return self._scene_bboxes.unsqueeze(0), self._scene_bboxes_mask.unsqueeze(0), [self._scene_bboxes_categories]
+
     def __len__(self):
         return len(self.trajectories)
 
@@ -1376,6 +1652,26 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
             # Fallback if not present, though it should be due to _process_trajectory_segment
             result['bbox_corners'] = torch.zeros(self.trajectory_length, 8, 3, dtype=torch.float32)
 
+        # Add scene-level bbox information - prioritize trajectory-specific bboxes
+        if 'trajectory_specific_bbox_info' in item:
+            # Use trajectory-specific bboxes (filtered by trajectory range)
+            result['scene_bbox_info'] = item['trajectory_specific_bbox_info']
+            result['scene_bbox_mask'] = item['trajectory_specific_bbox_mask']
+            result['scene_bbox_categories'] = item['trajectory_specific_bbox_categories']
+        elif hasattr(self, '_scene_bboxes') and self._scene_bboxes is not None:
+            # Fallback to full scene bboxes if trajectory-specific ones are not available
+            result['scene_bbox_info'] = self._scene_bboxes
+            result['scene_bbox_mask'] = self._scene_bboxes_mask
+            result['scene_bbox_categories'] = self._scene_bboxes_categories
+        else:
+            # Create empty scene bbox data if not available
+            result['scene_bbox_info'] = torch.zeros(self.max_bboxes, 12, dtype=torch.float32)
+            # Set identity rotation in 6D representation (first two columns of identity matrix)
+            result['scene_bbox_info'][:, 6] = 1.0   # rx1 = 1
+            result['scene_bbox_info'][:, 10] = 1.0  # ry2 = 1
+            result['scene_bbox_mask'] = torch.zeros(self.max_bboxes, dtype=torch.float32)
+            result['scene_bbox_categories'] = ["unknown"] * self.max_bboxes
+
         return result
     
     def get_trajectory_specific_pointcloud(self, idx):
@@ -1398,3 +1694,214 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
         else:
             print(f"Warning: No trajectory-specific pointcloud found for trajectory {idx}")
             return None
+
+    def get_trajectory_specific_bboxes(self, idx):
+        """
+        Get the trajectory-specific bboxes for a specific trajectory.
+        
+        Args:
+            idx: Index of the trajectory
+            
+        Returns:
+            Tuple of (
+                torch.Tensor: Filtered bounding box information [max_bboxes, 12],
+                torch.Tensor: Mask indicating which boxes are real (1) vs padding (0) [max_bboxes],
+                List[str]: Categories for each bounding box [max_bboxes]
+            ) or (None, None, None) if not available
+        """
+        if idx < 0 or idx >= len(self.trajectories):
+            print(f"Error: Index {idx} out of range [0, {len(self.trajectories)-1}]")
+            return None, None, None
+            
+        item = self.trajectories[idx]
+        if ('trajectory_specific_bbox_info' in item and 
+            'trajectory_specific_bbox_mask' in item and 
+            'trajectory_specific_bbox_categories' in item):
+            return (item['trajectory_specific_bbox_info'], 
+                    item['trajectory_specific_bbox_mask'], 
+                    item['trajectory_specific_bbox_categories'])
+        else:
+            print(f"Warning: No trajectory-specific bboxes found for trajectory {idx}")
+            return None, None, None
+
+    def _filter_bboxes_by_trajectory(self, trajectory_positions, radius=None, timestamp_ns=None):
+        """
+        Filter scene bounding boxes to include only those within a specified radius of any trajectory point.
+        
+        Args:
+            trajectory_positions: Numpy array of shape [N, 3] containing trajectory positions
+            radius: Radius in meters around each trajectory point to include scene bboxes (defaults to self.trajectory_pointcloud_radius)
+            timestamp_ns: Optional timestamp for which to extract bounding boxes
+            
+        Returns:
+            Tuple of (
+                torch.Tensor: Filtered bounding box information [M, 12] where M <= max_bboxes,
+                torch.Tensor: Mask indicating which boxes are real (1) vs padding (0) [max_bboxes],
+                List[str]: Categories for each bounding box [max_bboxes]
+            ) or (None, None, None) if no bounding box information is available
+        """
+        if trajectory_positions is None or len(trajectory_positions) == 0:
+            print("Warning: Empty trajectory provided for bbox filtering")
+            return None, None, None
+            
+        # Use instance default radius if not specified
+        if radius is None:
+            radius = self.trajectory_pointcloud_radius
+        
+        try:
+            # Get all scene bboxes at the specified timestamp
+            all_bboxes, all_mask, all_categories = self.get_all_scene_bboxes(timestamp_ns=timestamp_ns, use_recent_fallback=True)
+            
+            if all_bboxes is None:
+                return None, None, None
+            
+            # Convert trajectory positions to numpy if they're tensors
+            if isinstance(trajectory_positions, torch.Tensor):
+                trajectory_positions = trajectory_positions.detach().cpu().numpy()
+                
+            # If normalized, denormalize trajectory positions for consistent distance calculation
+            if self.normalize_data:
+                trajectory_positions = self.denormalize_position(trajectory_positions)
+            
+            # Extract bbox centers (first 3 dimensions) from all_bboxes
+            bbox_centers = all_bboxes[:, :3].numpy()  # [max_bboxes, 3]
+            
+            # If bboxes were normalized, denormalize them for distance calculation
+            if self.normalize_data:
+                bbox_centers = self.denormalize_position(bbox_centers)
+            
+            # Use KDTree for efficient distance calculation
+            from scipy.spatial import cKDTree
+            trajectory_tree = cKDTree(trajectory_positions)
+            
+            # Find distances from each bbox center to the nearest trajectory point
+            distances, _ = trajectory_tree.query(bbox_centers, k=1)
+            
+            # Create boolean mask for bboxes within radius and also valid (non-padding)
+            within_radius_mask = distances <= radius
+            valid_bbox_mask = all_mask.numpy() > 0.5  # Only consider non-padding bboxes
+            final_mask = within_radius_mask & valid_bbox_mask
+            
+            # Get indices of bboxes that are within range
+            valid_indices = np.where(final_mask)[0]
+            
+            if len(valid_indices) == 0:
+                print(f"Warning: No bboxes found within {radius}m of trajectory")
+                # Return empty but properly formatted result
+                empty_bboxes = torch.zeros(self.max_bboxes, 12, dtype=torch.float32)
+                empty_bboxes[:, 6] = 1.0   # rx1 = 1 (identity rotation)
+                empty_bboxes[:, 10] = 1.0  # ry2 = 1 (identity rotation)
+                empty_mask = torch.zeros(self.max_bboxes, dtype=torch.float32)
+                empty_categories = ["unknown"] * self.max_bboxes
+                return empty_bboxes, empty_mask, empty_categories
+            
+            # Create filtered results
+            num_filtered_bboxes = len(valid_indices)
+            
+            # Create new tensors for filtered results
+            filtered_bboxes = torch.zeros(self.max_bboxes, 12, dtype=torch.float32)
+            filtered_mask = torch.zeros(self.max_bboxes, dtype=torch.float32)
+            filtered_categories = ["unknown"] * self.max_bboxes
+            
+            # Set identity rotation for padding boxes
+            filtered_bboxes[:, 6] = 1.0   # rx1 = 1
+            filtered_bboxes[:, 10] = 1.0  # ry2 = 1
+            
+            # Copy filtered bboxes to the result (limit to max_bboxes)
+            copy_count = min(num_filtered_bboxes, self.max_bboxes)
+            for i in range(copy_count):
+                src_idx = valid_indices[i]
+                filtered_bboxes[i] = all_bboxes[src_idx]
+                filtered_mask[i] = 1.0
+                filtered_categories[i] = all_categories[src_idx]
+            
+            print(f"Filtered bboxes: {copy_count} boxes within {radius}m of trajectory (from {int(valid_bbox_mask.sum())} total valid boxes)")
+            
+            return filtered_bboxes, filtered_mask, filtered_categories
+            
+        except Exception as e:
+            print(f"Error filtering bboxes by trajectory: {e}")
+            traceback.print_exc()
+            return None, None, None
+    
+    def _generate_trajectory_specific_bboxes(self):
+        """
+        Generate and store trajectory-specific bboxes for each trajectory in the dataset.
+        These filtered bboxes only include boxes within trajectory_pointcloud_radius
+        of any point in the trajectory.
+        """
+        print(f"Generating trajectory-specific bounding boxes for {len(self.trajectories)} trajectories...")
+        
+        for i, traj_item in enumerate(self.trajectories):
+            try:
+                # Get trajectory poses and extract positions (first 3 dimensions)
+                poses_tensor = traj_item['trajectory_data']['poses']
+                positions_tensor = poses_tensor[:, :3]  # Extract first 3 dimensions (x, y, z)
+                
+                # Get attention mask to filter out padding
+                mask = traj_item['trajectory_data']['attention_mask']
+                
+                # Extract only valid positions (where mask is 1)
+                if isinstance(mask, torch.Tensor):
+                    valid_indices = torch.where(mask > 0.5)[0]
+                    valid_positions = positions_tensor[valid_indices]
+                else:
+                    # Fallback if mask isn't a tensor
+                    valid_indices = np.where(np.array(mask) > 0.5)[0]
+                    valid_positions = positions_tensor[valid_indices]
+                
+                # If normalized, denormalize positions for accurate distance calculation
+                if self.normalize_data and isinstance(valid_positions, torch.Tensor):
+                    # Convert to numpy, denormalize, then back to tensor if needed
+                    positions_np = valid_positions.detach().cpu().numpy()
+                    positions_np = self.denormalize_position(positions_np)
+                    valid_positions = positions_np
+                elif self.normalize_data:
+                    valid_positions = self.denormalize_position(valid_positions)
+                
+                # Get the trajectory's start timestamp for bbox context
+                start_timestamp = traj_item['metadata'].get('start_timestamp_ns')
+                
+                # Filter the bboxes
+                filtered_bboxes, filtered_mask, filtered_categories = self._filter_bboxes_by_trajectory(
+                    valid_positions, 
+                    radius=self.trajectory_pointcloud_radius,
+                    timestamp_ns=start_timestamp
+                )
+                
+                # Store the filtered bboxes with the trajectory
+                if filtered_bboxes is not None:
+                    traj_item['trajectory_specific_bbox_info'] = filtered_bboxes
+                    traj_item['trajectory_specific_bbox_mask'] = filtered_mask
+                    traj_item['trajectory_specific_bbox_categories'] = filtered_categories
+                else:
+                    # Create empty bbox data if filtering failed
+                    empty_bboxes = torch.zeros(self.max_bboxes, 12, dtype=torch.float32)
+                    empty_bboxes[:, 6] = 1.0   # rx1 = 1 (identity rotation)
+                    empty_bboxes[:, 10] = 1.0  # ry2 = 1 (identity rotation)
+                    empty_mask = torch.zeros(self.max_bboxes, dtype=torch.float32)
+                    empty_categories = ["unknown"] * self.max_bboxes
+                    
+                    traj_item['trajectory_specific_bbox_info'] = empty_bboxes
+                    traj_item['trajectory_specific_bbox_mask'] = empty_mask
+                    traj_item['trajectory_specific_bbox_categories'] = empty_categories
+                
+                # For progress reporting
+                if (i+1) % 10 == 0 or i == 0 or i == len(self.trajectories)-1:
+                    print(f"  Processed {i+1}/{len(self.trajectories)} trajectories for bbox filtering")
+                
+            except Exception as e:
+                print(f"Error generating trajectory-specific bboxes for trajectory {i}: {e}")
+                traceback.print_exc()
+                # Set empty bbox data as fallback
+                empty_bboxes = torch.zeros(self.max_bboxes, 12, dtype=torch.float32)
+                empty_bboxes[:, 6] = 1.0   # rx1 = 1 (identity rotation)
+                empty_bboxes[:, 10] = 1.0  # ry2 = 1 (identity rotation)
+                empty_mask = torch.zeros(self.max_bboxes, dtype=torch.float32)
+                empty_categories = ["unknown"] * self.max_bboxes
+                
+                traj_item['trajectory_specific_bbox_info'] = empty_bboxes
+                traj_item['trajectory_specific_bbox_mask'] = empty_mask
+                traj_item['trajectory_specific_bbox_categories'] = empty_categories
+        
+        print(f"Completed generating trajectory-specific bounding boxes")

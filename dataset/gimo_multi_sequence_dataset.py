@@ -10,35 +10,9 @@ import traceback
 from typing import Dict, List, Tuple, Optional, Union
 import sys
 
-# Import our existing ADT dataset class
-# try:
+
 from dataset.gimo_adt_trajectory_dataset import GimoAriaDigitalTwinTrajectoryDataset
-# except ImportError:
-#     print("Warning: Could not import AriaDigitalTwinTrajectoryDataset. Using mock implementation for testing.")
-#     
-#     # Create a mock implementation for testing
-#     class AriaDigitalTwinTrajectoryDataset(Dataset):
-#         """Mock implementation for testing."""
-#         def __init__(self, sequence_path, **kwargs):
-#             self.sequence_path = sequence_path
-#             # Create dummy data
-#             self.trajectories = [
-#                 {
-#                     'positions': torch.randn(100, 3),
-#                     'object_category': 'chair'
-#                 }
-#                 for _ in range(10)
-#             ]
-#             
-#         def __len__(self):
-#             return len(self.trajectories)
-#             
-#         def __getitem__(self, idx):
-#             """Return a sample from the mock trajectories."""
-#             return self.trajectories[idx]
-#             
-#         def get_scene_pointcloud(self):
-#             return torch.randn(10000, 3)
+
 
 class GIMOMultiSequenceDataset(Dataset):
     """Dataset for loading trajectories from multiple Aria Digital Twin sequences for GIMO model."""
@@ -62,6 +36,7 @@ class GIMOMultiSequenceDataset(Dataset):
         cache_dir: Optional[str] = None,
         normalize_data: bool = True,
         trajectory_pointcloud_radius: float = 0.5,  # Added parameter for trajectory filtering
+        max_bboxes: int = 400,  # Added parameter for bbox handling
     ):
         """
         Initialize the multi-sequence dataset for GIMO.
@@ -84,6 +59,7 @@ class GIMOMultiSequenceDataset(Dataset):
             cache_dir: Directory for caching trajectory data (if config not provided)
             normalize_data: Whether to normalize data using scene bounds (if config not provided)
             trajectory_pointcloud_radius: Radius around trajectory to collect points (meters)
+            max_bboxes: Maximum number of bounding boxes for consistent batching (if config not provided)
         """
         self.sequence_paths = sequence_paths
         
@@ -101,6 +77,7 @@ class GIMOMultiSequenceDataset(Dataset):
             self.normalize_data = getattr(config, 'normalize_data', normalize_data)
             self.trajectory_pointcloud_radius = getattr(config, 'trajectory_pointcloud_radius', trajectory_pointcloud_radius)
             self.force_use_cache = getattr(config, 'force_use_cache', False) # Get force_use_cache from config
+            self.max_bboxes = getattr(config, 'max_bboxes', max_bboxes)
             # For cache_dir, don't use config directly - it will be set below from save_path if provided
         else:
             self.trajectory_length = trajectory_length
@@ -114,6 +91,7 @@ class GIMOMultiSequenceDataset(Dataset):
             self.use_cache = use_cache
             self.normalize_data = normalize_data
             self.trajectory_pointcloud_radius = trajectory_pointcloud_radius
+            self.max_bboxes = max_bboxes
         
         # These parameters don't typically come from config
         self.max_objects = max_objects
@@ -166,45 +144,6 @@ class GIMOMultiSequenceDataset(Dataset):
         # Load all sequences
         self._load_sequences()
         
-        # --- Create Category ID Mapping ---
-        # This maps original (potentially sparse) category IDs to dense indices (0 to N-1)
-        self.original_to_dense_category_id = {}
-        self.dense_to_original_category_id = []
-        
-        # Scan all trajectories to collect unique category IDs
-        unique_category_ids = set()
-        for dataset_instance in self.individual_datasets:
-            for traj_item in dataset_instance.trajectories:
-                original_category_id = traj_item.get('metadata', {}).get('category_id', 0)
-                unique_category_ids.add(original_category_id)
-        
-        # Sort original IDs for deterministic mapping
-        sorted_unique_ids = sorted(list(unique_category_ids))
-        
-        # Create bidirectional mappings
-        for dense_id, original_id in enumerate(sorted_unique_ids):
-            self.original_to_dense_category_id[original_id] = dense_id
-            self.dense_to_original_category_id.append(original_id)
-        
-        # Set the number of categories to the actual number of unique categories
-        self.num_object_categories = len(unique_category_ids)
-        print(f"Found {self.num_object_categories} unique category IDs.")
-        if len(sorted_unique_ids) > 0:
-            print(f"Original ID range: min={sorted_unique_ids[0]}, max={sorted_unique_ids[-1]}")
-            print(f"Created mapping from original sparse IDs to dense IDs (0 to {self.num_object_categories-1}).")
-        
-        # Update config with the actual number of categories
-        if config is not None and hasattr(config, 'num_object_categories'):
-            if config.num_object_categories < self.num_object_categories:
-                print(f"WARNING: Configured num_object_categories ({config.num_object_categories}) is less than "
-                      f"discovered unique category count ({self.num_object_categories}). "
-                      f"Setting to {self.num_object_categories}.")
-                config.num_object_categories = self.num_object_categories
-            elif config.num_object_categories > self.num_object_categories and self.num_object_categories > 0:
-                print(f"INFO: Configured num_object_categories ({config.num_object_categories}) is greater than "
-                      f"discovered unique category count ({self.num_object_categories}). "
-                      f"This is acceptable if padding for future categories is intended.")
-
         print(f"GIMOMultiSequenceDataset initialized with {len(self.loaded_sequences)} sequences")
         print(f"Total trajectories: {len(self)}")
     
@@ -237,7 +176,8 @@ class GIMOMultiSequenceDataset(Dataset):
                     max_stationary_frames=getattr(self, 'max_stationary_frames', 3),
                     normalize_data=self.normalize_data,
                     trajectory_pointcloud_radius=self.trajectory_pointcloud_radius,
-                    force_use_cache=self.force_use_cache  # Pass force_use_cache parameter
+                    force_use_cache=self.force_use_cache,  # Pass force_use_cache parameter
+                    max_bboxes=self.max_bboxes  # Pass max_bboxes parameter
                 )
                 
                 # If the dataset has trajectories, add it to our collection
@@ -289,27 +229,10 @@ class GIMOMultiSequenceDataset(Dataset):
         sample['sequence_name'] = os.path.basename(sequence_path)
         sample['dataset_idx'] = dataset_idx # Ensure dataset_idx is in the sample for collate_fn
 
-        # --- Add Category ID to the sample ---
-        # Get original category_id from metadata
-        original_category_id = original_traj_item.get('metadata', {}).get('category_id', 0)
-        
-        # Map original ID to dense ID for embedding
-        if original_category_id in self.original_to_dense_category_id:
-            dense_category_id = self.original_to_dense_category_id[original_category_id]
-        else:
-            # Fallback for any unforeseen category IDs (should not happen)
-            print(f"Warning: Encountered unmapped category ID: {original_category_id}")
-            dense_category_id = 0  # Default to first category
-            
-        # Store both original and dense IDs
-        sample['object_category_id'] = dense_category_id
-        sample['original_category_id'] = original_category_id
-        
-        # Also include the category string for reference/debugging
+        # Add category to the sample
         sample['object_category'] = original_traj_item.get('metadata', {}).get('category', 'unknown')
-        # -------------------------------------
         
-        # --- Perform Past/Future Split Here --- 
+        # --- Perform Past/Future Split Here ---
         # Check if we have poses (9D) or positions (3D) - handle both for backward compatibility
         if 'poses' in sample:
             # Rename to full_ versions and remove original keys
@@ -387,41 +310,3 @@ class GIMOMultiSequenceDataset(Dataset):
 
         return sample
     
-    def get_scene_pointcloud(self, dataset_idx=0):
-        """
-        Get the scene pointcloud from a specific dataset.
-        
-        Args:
-            dataset_idx: Index of the dataset to get pointcloud from
-            
-        Returns:
-            torch.Tensor: Pointcloud data or None if not available
-        """
-        if not self.individual_datasets or dataset_idx >= len(self.individual_datasets):
-            return None
-        
-        return self.individual_datasets[dataset_idx].get_scene_pointcloud()
-        
-    def get_trajectory_specific_pointcloud(self, idx):
-        """
-        Get the trajectory-specific pointcloud for a given global trajectory index.
-        
-        Args:
-            idx: Global index of the trajectory
-            
-        Returns:
-            np.ndarray: The trajectory-specific point cloud or None if not available
-        """
-        if idx < 0 or idx >= len(self.index_map):
-            print(f"Error: Index {idx} out of range [0, {len(self.index_map)-1}]")
-            return None
-            
-        # Look up which dataset and local index to use
-        dataset_idx, local_idx = self.index_map[idx]
-        
-        # Get the trajectory-specific point cloud from the underlying dataset
-        try:
-            return self.individual_datasets[dataset_idx].get_trajectory_specific_pointcloud(local_idx)
-        except Exception as e:
-            print(f"Error getting trajectory-specific point cloud: {e}")
-            return None 

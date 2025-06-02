@@ -46,6 +46,12 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.scene_configs.add_argument('--sample_points', default=50000, type=int, help='Number of points to sample from the scene point cloud') 
         self.scene_configs.add_argument('--no_bbox', action='store_true', default=False, help='Disable bounding box processing and conditioning')
         self.scene_configs.add_argument('--no_scene', action='store_true', default=False, help='Disable scene global features and use only motion features')
+        self.scene_configs.add_argument('--no_semantic_bbox', action='store_true', default=False, help='Disable semantic bbox embedding for scene conditioning')
+        self.scene_configs.add_argument('--max_bboxes', default=50, type=int, help='Maximum number of bounding boxes for scene conditioning')
+        self.scene_configs.add_argument('--semantic_bbox_embed_dim', default=256, type=int, help='Output dimension of semantic bbox embedder')
+        self.scene_configs.add_argument('--semantic_bbox_hidden_dim', default=128, type=int, help='Hidden dimension in semantic bbox embedder')
+        self.scene_configs.add_argument('--semantic_bbox_num_heads', default=4, type=int, help='Number of attention heads in semantic bbox embedder')
+        self.scene_configs.add_argument('--semantic_bbox_use_attention', action='store_true', default=True, help='Use attention in semantic bbox embedder')
         # self.scene_configs.add_argument('--pointnet_chkpoints', default='pretrained/point.model', type=str, help='Path to pretrained PointNet weights') # Consider adding back later
 
         # === Motion Pathway Configuration (Based on GIMO) ===
@@ -64,11 +70,13 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.output_configs.add_argument('--output_n_heads', default=8, type=int, help='Number of attention heads in output encoder')
         self.output_configs.add_argument('--output_n_layers', default=3, type=int, help='Number of transformer layers in output encoder')
         
-        # === Category Encoder Configuration ===
-        self.category_configs = self.add_argument_group('Category Encoder')
-        self.category_configs.add_argument('--num_object_categories', default=512, type=int, help='Total number of unique object categories for embedding lookup.')
-        self.category_configs.add_argument('--category_embed_dim', default=64, type=int, help='Embedding dimension for category IDs')
-        self.category_configs.add_argument('--no_text_embedding', action='store_true', default=False, help='Disable category ID embedding and conditioning')
+        # === Text/Category Embedding Configuration ===
+        self.text_configs = self.add_argument_group('Text/Category Embedding')
+        self.text_configs.add_argument('--no_text_embedding', action='store_true', default=False, help='Disable text/category embedding')
+        self.text_configs.add_argument('--category_embed_dim', default=256, type=int, help='Dimension of category embedding')
+        self.text_configs.add_argument('--num_object_categories', default=50, type=int, help='Number of object categories (for legacy torch.embedding)')
+        self.text_configs.add_argument('--clip_model_name', default="ViT-B/32", type=str, choices=["ViT-B/32", "ViT-B/16", "ViT-L/14"], help='CLIP model to use for category embedding')
+        self.text_configs.add_argument('--use_legacy_category_embedding', action='store_true', default=False, help='Use legacy torch.embedding instead of CLIP for category embedding')
 
         # === Training Configuration ===
         self.train_configs = self.add_argument_group('Training')

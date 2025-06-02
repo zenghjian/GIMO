@@ -8,6 +8,165 @@ import matplotlib.pyplot as plt # Added for visualization
 # Actual GIMO components
 from .pointnet_plus2 import PointNet2SemSegSSGShape, PointNet, MyFPModule
 from .base_cross_model import PerceiveEncoder, PositionwiseFeedForward, PerceiveDecoder
+import clip
+class BBoxEmbedder(nn.Module):
+    """Embeds bounding box information of scene objects into a representation."""
+    
+    def __init__(self, input_dim=12, output_dim=640, hidden_dim=128, num_heads=4, use_attention=True):
+        super().__init__()
+        # Input dim is typically 12 for [center(3) + dimensions(3) + 6D_rotation(6)]
+        
+        self.use_attention = use_attention
+        
+        # Projection from input dimensions to intermediate representation
+        self.proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+        
+        # Self-attention for considering relationships between objects
+        if use_attention:
+            self.self_attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        
+        # Final projection to output dim
+        self.final_proj = nn.Sequential(
+            nn.Linear(hidden_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+        )
+        
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: Tensor of shape [batch_size, num_objects, input_dim] containing bounding box information
+               for multiple objects in the scene
+            mask: Optional tensor of shape [batch_size, num_objects] indicating which boxes are valid (1)
+                  and which are padding (0)
+        
+        Returns:
+            Tensor of shape [batch_size, output_dim] representing the scene context from bounding boxes
+        """
+        if x is None:
+            return None
+        
+        batch_size, num_objects, input_dim = x.shape
+        
+        # Project each bounding box individually
+        x_flat = x.reshape(-1, input_dim)
+        bbox_feats = self.proj(x_flat)
+        bbox_feats = bbox_feats.reshape(batch_size, num_objects, -1)
+        
+        # Apply self-attention to capture relationships between objects
+        if self.use_attention:
+            if mask is not None:
+                # For PyTorch's MultiheadAttention, we need to convert mask to boolean
+                # and invert it (True means mask, False means keep)
+                bool_mask = (mask == 0)
+                attn_out, _ = self.self_attn(
+                    bbox_feats, 
+                    bbox_feats, 
+                    bbox_feats,
+                    key_padding_mask=bool_mask
+                )
+            else:
+                attn_out, _ = self.self_attn(bbox_feats, bbox_feats, bbox_feats)
+            bbox_feats = attn_out
+        
+        # Apply mask to zero out padding features if provided
+        if mask is not None:
+            mask_expanded = mask.unsqueeze(-1).expand_as(bbox_feats)
+            bbox_feats = bbox_feats * mask_expanded
+        
+        # Global pooling - average over all valid objects
+        if mask is not None:
+            # Masked average
+            valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)  # [batch_size, 1]
+            pooled_feats = bbox_feats.sum(dim=1) / valid_counts  # [batch_size, hidden_dim]
+        else:
+            # Simple average
+            pooled_feats = bbox_feats.mean(dim=1)  # [batch_size, hidden_dim]
+        
+        # Final projection
+        result = self.final_proj(pooled_feats)  # [batch_size, output_dim]
+        
+        return result
+
+class CategoryEmbedder(nn.Module):
+    """Embeds object categories into a representation using CLIP."""
+    
+    def __init__(self, output_dim=640, clip_model_name="ViT-B/32"):
+        super().__init__()
+        
+        
+        # Load CLIP model
+        self.clip_model, _ = clip.load(clip_model_name, device="cpu")
+        
+        # Freeze CLIP parameters
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
+        
+        # Get CLIP text embedding dimension
+        if clip_model_name == "ViT-B/32":
+            self.clip_embed_dim = 512
+        elif clip_model_name == "ViT-B/16":
+            self.clip_embed_dim = 512
+        elif clip_model_name == "ViT-L/14":
+            self.clip_embed_dim = 768
+        else:
+            self.clip_embed_dim = 512  # Default fallback
+        
+        # Projection to match required embedding dimension
+        self.proj = nn.Sequential(
+            nn.Linear(self.clip_embed_dim, output_dim // 2),
+            nn.LayerNorm(output_dim // 2),
+            nn.GELU(),
+            nn.Linear(output_dim // 2, output_dim),
+            nn.LayerNorm(output_dim),
+        )
+    
+    def forward(self, categories):
+        """Convert category strings to embeddings using CLIP.
+        
+        Args:
+            categories: List of category strings or None
+            
+        Returns:
+            torch.Tensor: Category embeddings [batch_size, output_dim] or None
+        """
+        if categories is None:
+            return None
+        
+        device = next(self.parameters()).device
+        
+        # Move CLIP model to the correct device if needed
+        if next(self.clip_model.parameters()).device != device:
+            self.clip_model = self.clip_model.to(device)
+        
+        # Handle empty or invalid categories
+        processed_categories = []
+        for cat in categories:
+            if cat is None or cat == '' or cat == 'unknown':
+                processed_categories.append("object")  # Default fallback
+            else:
+                processed_categories.append(str(cat))
+        
+        # Tokenize all categories at once
+        try:
+            with torch.no_grad():
+                text_tokens = clip.tokenize(processed_categories, truncate=True).to(device)
+                embeddings = self.clip_model.encode_text(text_tokens).float()
+        except Exception as e:
+            print(f"Warning: CLIP encoding failed: {e}. Using fallback embeddings.")
+            # Create fallback embeddings
+            batch_size = len(categories)
+            embeddings = torch.zeros(batch_size, self.clip_embed_dim, dtype=torch.float32, device=device)
+        
+        # Project to required dimension
+        return self.proj(embeddings)
 
 class GIMO_ADT_Model(nn.Module):
     """
@@ -30,6 +189,9 @@ class GIMO_ADT_Model(nn.Module):
         # Check if scene global features are disabled
         self.use_scene = not getattr(config, 'no_scene', False)
         
+        # Check if semantic bbox embedding is disabled
+        self.use_semantic_bbox = not getattr(config, 'no_semantic_bbox', False)
+        
         # Still keep fixed trajectory_length for model definition
         self.sequence_length = config.trajectory_length 
 
@@ -40,6 +202,16 @@ class GIMO_ADT_Model(nn.Module):
 
         # 2. Point Cloud Encoder
         self.scene_encoder = PointNet2SemSegSSGShape({'feat_dim': config.scene_feats_dim})
+
+        # 3. Semantic BBox Embedder (for scene-level bbox conditioning)
+        if self.use_semantic_bbox:
+            self.semantic_bbox_embedder = BBoxEmbedder(
+                input_dim=12,  # [center(3) + dimensions(3) + 6D_rotation(6)]
+                output_dim=config.semantic_bbox_embed_dim,
+                hidden_dim=getattr(config, 'semantic_bbox_hidden_dim', 128),
+                num_heads=getattr(config, 'semantic_bbox_num_heads', 4),
+                use_attention=getattr(config, 'semantic_bbox_use_attention', True)
+            )
 
         # Bounding Box related layers (as per diagram)
         self.fp_layer = MyFPModule()
@@ -71,10 +243,12 @@ class GIMO_ADT_Model(nn.Module):
 
         # --- Category Embedding (simplified approach) ---
         if not config.no_text_embedding:
-            self.category_embedding = nn.Embedding(
-                num_embeddings=config.num_object_categories,
-                embedding_dim=config.category_embed_dim
+            self.category_embedder = CategoryEmbedder(
+                output_dim=config.category_embed_dim,
+                clip_model_name=getattr(config, 'clip_model_name', "ViT-B/32")
             )
+        else:
+            self.category_embedder = None
         
         # Final Embedded Layer (second fusion)
         # Prepare input dims for embedding layer
@@ -84,6 +258,8 @@ class GIMO_ADT_Model(nn.Module):
             embed_dim += config.scene_feats_dim
         if not config.no_text_embedding:
             embed_dim += config.category_embed_dim
+        if self.use_semantic_bbox:
+            embed_dim += config.semantic_bbox_embed_dim
         
         self.embedding_layer = PositionwiseFeedForward(
             d_in=embed_dim, 
@@ -105,7 +281,8 @@ class GIMO_ADT_Model(nn.Module):
         # Final output layer (predicts full motion trajectory)
         self.outputlayer = nn.Linear(config.output_latent_dim, config.object_motion_dim)
     
-    def forward(self, input_trajectory, point_cloud, bounding_box_corners=None, object_category_ids=None):
+    def forward(self, input_trajectory, point_cloud, bounding_box_corners=None, object_category_ids=None, 
+                semantic_bbox_info=None, semantic_bbox_mask=None):
         """
         Forward pass of the GIMO ADT model with 3D bounding box integration.
         
@@ -113,10 +290,12 @@ class GIMO_ADT_Model(nn.Module):
             input_trajectory: [batch_size, input_length, 9] - history trajectory (positions and 6D rotations)
             point_cloud: [batch_size, num_points, 3] - scene point cloud
             bounding_box_corners: [batch_size, input_length, 8, 3] - 3D bbox corners for each input timestep (optional if no_bbox=True)
-            object_category_ids: [batch_size] - category IDs for objects (optional if no_text_embedding=True)
+            object_category_ids: [batch_size] - category strings for objects (optional if no_text_embedding=True)
+            semantic_bbox_info: [batch_size, max_bboxes, 12] - semantic bbox information for scene conditioning (optional if no_semantic_bbox=True)
+            semantic_bbox_mask: [batch_size, max_bboxes] - mask for semantic bbox (1 for real, 0 for padding) (optional if no_semantic_bbox=True)
             
         Returns:
-            torch.Tensor: Predicted full trajectory [batch_size, sequence_length, 9]
+            torch.Tensor: Predicted future trajectory [batch_size, trajectory_length, 9]
         """
         batch_size = input_trajectory.shape[0]
         input_length = input_trajectory.shape[1]  # length of input trajectory
@@ -129,6 +308,10 @@ class GIMO_ADT_Model(nn.Module):
         if self.use_bbox and bounding_box_corners is None:
             raise ValueError("bounding_box_corners is required when no_bbox=False")
             
+        # --- Check if semantic bbox info is provided when needed ---
+        if self.use_semantic_bbox and semantic_bbox_info is None:
+            raise ValueError("semantic_bbox_info is required when no_semantic_bbox=False")
+            
         # Process Input Trajectory
         # Input trajectory to motion features [B, T, motion_hidden_dim]
         f_m = self.motion_linear(input_trajectory)
@@ -140,6 +323,11 @@ class GIMO_ADT_Model(nn.Module):
         point_cloud_6d = torch.cat([point_cloud, point_cloud], dim=2)  # [B, N, 6]
         with torch.amp.autocast(device_type='cuda', dtype=torch.float32):
             scene_feats_per_point, scene_global_feats = self.scene_encoder(point_cloud_6d)
+        
+        # Process Semantic BBox (if enabled)
+        semantic_bbox_embeddings = None
+        if self.use_semantic_bbox and semantic_bbox_info is not None:
+            semantic_bbox_embeddings = self.semantic_bbox_embedder(semantic_bbox_info, semantic_bbox_mask)  # [B, semantic_bbox_embed_dim]
         
         # Process Bounding Box (if enabled)
         if self.use_bbox and bounding_box_corners is not None:
@@ -185,7 +373,7 @@ class GIMO_ADT_Model(nn.Module):
         # --- Generate Category Embeddings (if used) ---
         category_embeddings_expanded = None
         if not self.config.no_text_embedding and object_category_ids is not None:
-            category_embeddings = self.category_embedding(object_category_ids) # [B, category_embed_dim]
+            category_embeddings = self.category_embedder(object_category_ids) # [B, category_embed_dim]
             category_embeddings_expanded = category_embeddings.unsqueeze(1).repeat(1, self.sequence_length, 1) # [B, sequence_length, category_embed_dim]
 
         # scene_global_feats is [B, scene_feats_dim]
@@ -205,6 +393,11 @@ class GIMO_ADT_Model(nn.Module):
 
         if category_embeddings_expanded is not None:
             features_to_fuse.append(category_embeddings_expanded)
+        
+        if semantic_bbox_embeddings is not None:
+            # Expand semantic bbox embeddings to sequence length
+            semantic_bbox_embeddings_expanded = semantic_bbox_embeddings.unsqueeze(1).repeat(1, self.sequence_length, 1)  # [B, sequence_length, semantic_bbox_embed_dim]
+            features_to_fuse.append(semantic_bbox_embeddings_expanded)
         
         # Concatenate all features along the last dimension
         final_fused_input = torch.cat(features_to_fuse, dim=2)

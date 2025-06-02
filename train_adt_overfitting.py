@@ -126,17 +126,28 @@ def validate(model, dataloader, device, config, epoch):
                         bbox_corners_input_batch = None
                 # --- End dynamic input history length determination ---
 
-                # Get object category IDs if embedding is enabled
+                # Get object category strings if embedding is enabled (use CLIP-based embedding)
                 if not config.no_text_embedding:
-                    object_category_ids = batch['object_category_id'].to(device)
+                    object_category_ids = batch['object_category']  # List of strings, no .to(device) needed
+                    if object_category_ids is not None: print(f"object_category_ids type: {type(object_category_ids)}, content: {object_category_ids}")
                 else:
                     object_category_ids = None
+
+                # Get semantic bbox information if semantic bbox embedding is enabled
+                if not config.no_semantic_bbox:
+                    semantic_bbox_info = batch['scene_bbox_info'].float().to(device)
+                    semantic_bbox_mask = batch['scene_bbox_mask'].float().to(device)
+                    if semantic_bbox_info is not None: print(f"semantic_bbox_info shape: {semantic_bbox_info.shape}")
+                    if semantic_bbox_mask is not None: print(f"semantic_bbox_mask shape: {semantic_bbox_mask.shape}")
+                else:
+                    semantic_bbox_info = None
+                    semantic_bbox_mask = None
 
             except KeyError as e: logger(f"Error: Missing key {e} in batch {batch_idx}. Skipping."); continue
             except Exception as e: logger(f"Error processing batch {batch_idx}: {e}. Skipping."); continue
 
             # Forward pass with input trajectory, point cloud, bbox corners, and category IDs
-            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids)
+            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask)
             total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
 
             val_total_loss += total_loss.item()
@@ -299,16 +310,34 @@ def validate(model, dataloader, device, config, epoch):
                         if not config.no_bbox and bbox_corners_batch is not None: # Check if bbox_corners_batch is not None
                             sample_bbox_corners_cpu = bbox_corners_batch[i].cpu()  # Extract bbox corners for current sample
                         
+                        # Get trajectory-specific bbox information if available
+                        sample_traj_bbox_info = None
+                        sample_traj_bbox_mask = None
+                        if 'scene_bbox_info' in batch and 'scene_bbox_mask' in batch:
+                            sample_traj_bbox_info = batch['scene_bbox_info'][i].cpu()
+                            sample_traj_bbox_mask = batch['scene_bbox_mask'][i].cpu()
+                        
                         # Apply transformations for visualization
                         gt_full_positions_vis = transform_coords_for_visualization(gt_full_positions.cpu())
                         sample_pointcloud_vis = transform_coords_for_visualization(sample_pointcloud.cpu())
                         sample_bbox_corners_vis = transform_coords_for_visualization(sample_bbox_corners_cpu)
+                        
+                        # Apply coordinate transformation to trajectory-specific bbox centers
+                        sample_traj_bbox_info_vis = None
+                        if sample_traj_bbox_info is not None:
+                            sample_traj_bbox_info_vis = sample_traj_bbox_info.clone()
+                            # Transform only the center coordinates (first 3 dimensions of each bbox)
+                            bbox_centers = sample_traj_bbox_info_vis[:, :3]  # [max_bboxes, 3]
+                            bbox_centers_vis = transform_coords_for_visualization(bbox_centers)
+                            sample_traj_bbox_info_vis[:, :3] = bbox_centers_vis
 
                         visualize_full_trajectory(
                             positions=gt_full_positions_vis,
                             attention_mask=gt_full_mask.cpu() if gt_full_mask is not None else None,
                             point_cloud=sample_pointcloud_vis,  # Pass the point cloud
                             bbox_corners_sequence=sample_bbox_corners_vis,  # Add bbox corners data if available
+                            trajectory_specific_bbox_info=sample_traj_bbox_info_vis,  # Add transformed trajectory-specific bbox info
+                            trajectory_specific_bbox_mask=sample_traj_bbox_mask,  # Add trajectory-specific bbox mask
                             title=f"Full GT - {vis_title_base}",
                             save_path=full_traj_path,
                             segment_idx=segment_idx
@@ -629,6 +658,8 @@ def main():
     logger(f"Trainable Parameters: {trainable_params:,}")
     logger(f"Text Embedding Enabled: {not getattr(config, 'no_text_embedding', False)}")
     logger(f"Bounding Box Processing Enabled: {not getattr(config, 'no_bbox', False)}")
+    logger(f"Semantic BBox Embedding Enabled: {not getattr(config, 'no_semantic_bbox', False)}")
+    logger(f"Scene Global Features Enabled: {not getattr(config, 'no_scene', False)}")
     logger(f"Overfitting Mode: True")
     
     # # Log model components
@@ -790,18 +821,28 @@ def main():
                 if bbox_corners_input_batch is not None: print(f"bbox_corners_input_batch shape: {bbox_corners_input_batch.shape}")
                  # --- End dynamic input history length determination ---
 
-                # Get object category IDs if embedding is enabled
+                # Get object category strings if embedding is enabled (use CLIP-based embedding)
                 if not config.no_text_embedding:
-                    object_category_ids = batch['object_category_id'].to(device)
-                    if object_category_ids is not None: print(f"object_category_ids shape: {object_category_ids.shape}")
+                    object_category_ids = batch['object_category']  # List of strings, no .to(device) needed
+                    if object_category_ids is not None: print(f"object_category_ids type: {type(object_category_ids)}, content: {object_category_ids}")
                 else:
                     object_category_ids = None
+
+                # Get semantic bbox information if semantic bbox embedding is enabled
+                if not config.no_semantic_bbox:
+                    semantic_bbox_info = batch['scene_bbox_info'].float().to(device)
+                    semantic_bbox_mask = batch['scene_bbox_mask'].float().to(device)
+                    if semantic_bbox_info is not None: print(f"semantic_bbox_info shape: {semantic_bbox_info.shape}")
+                    if semantic_bbox_mask is not None: print(f"semantic_bbox_mask shape: {semantic_bbox_mask.shape}")
+                else:
+                    semantic_bbox_info = None
+                    semantic_bbox_mask = None
 
             except KeyError as e: logger(f"Error: Missing key {e} in batch {batch_idx}. Skipping."); continue
             except Exception as e: logger(f"Error processing batch {batch_idx}: {e}. Skipping."); continue
 
             # Forward pass with input trajectory, point cloud, bbox corners, and category IDs
-            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids)
+            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask)
             if predicted_full_trajectory is not None: print(f"predicted_full_trajectory shape: {predicted_full_trajectory.shape}")
 
             # --- Compute Loss with Visualization for the first epoch ---
