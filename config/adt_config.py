@@ -45,6 +45,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.scene_configs.add_argument('--scene_feats_dim', default=256, type=int, help='Output dimension of the PointNet scene encoder')
         self.scene_configs.add_argument('--sample_points', default=50000, type=int, help='Number of points to sample from the scene point cloud') 
         self.scene_configs.add_argument('--no_bbox', action='store_true', default=False, help='Disable bounding box processing and conditioning')
+        self.scene_configs.add_argument('--no_scene', action='store_true', default=False, help='Disable scene global features and use only motion features')
         # self.scene_configs.add_argument('--pointnet_chkpoints', default='pretrained/point.model', type=str, help='Path to pretrained PointNet weights') # Consider adding back later
 
         # === Motion Pathway Configuration (Based on GIMO) ===
@@ -75,7 +76,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.train_configs.add_argument('--save_fre', type=int, default=10, help='Checkpoint saving frequency (epochs)')
         # self.train_configs.add_argument('--vis_fre', type=int, default=1000) # Maybe redefine for trajectory viz
         self.train_configs.add_argument('--val_fre', type=int, default=1, help='Validation frequency (epochs)')
-        self.train_configs.add_argument('--num_val_visualizations', type=int, default=500, help='Number of samples to visualize during validation')
+        self.train_configs.add_argument('--num_val_visualizations', type=int, default=10, help='Number of samples to visualize during validation')
         self.train_configs.add_argument('--load_model_dir', type=str, default=None, help='Path to load a pretrained model checkpoint')
         self.train_configs.add_argument('--load_optim_dir', type=str, default=None, help='Path to load optimizer state separately')
         self.train_configs.add_argument('--timestep', type=int, default=0, help='Timestep for autoregressive prediction ')

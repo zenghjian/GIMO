@@ -27,6 +27,9 @@ class GIMO_ADT_Model(nn.Module):
         # Check if bounding box processing is disabled
         self.use_bbox = not getattr(config, 'no_bbox', False)
         
+        # Check if scene global features are disabled
+        self.use_scene = not getattr(config, 'no_scene', False)
+        
         # Still keep fixed trajectory_length for model definition
         self.sequence_length = config.trajectory_length 
 
@@ -76,7 +79,9 @@ class GIMO_ADT_Model(nn.Module):
         # Final Embedded Layer (second fusion)
         # Prepare input dims for embedding layer
         # This layer will now potentially receive category embeddings as well
-        embed_dim = config.motion_latent_dim + config.scene_feats_dim
+        embed_dim = config.motion_latent_dim
+        if self.use_scene:
+            embed_dim += config.scene_feats_dim
         if not config.no_text_embedding:
             embed_dim += config.category_embed_dim
         
@@ -185,21 +190,25 @@ class GIMO_ADT_Model(nn.Module):
 
         # scene_global_feats is [B, scene_feats_dim]
         # encoded_motion_bbox is [B, sequence_length, motion_latent_dim]
-        scene_global_feats_expanded = scene_global_feats.unsqueeze(1).repeat(1, self.sequence_length, 1) # [B, sequence_length, scene_feats_dim]
         
-        features_to_fuse = [
-            scene_global_feats_expanded,  # Global scene context
-            encoded_motion_bbox,          # Motion + bounding box features
-        ]
+        # Check if scene features should be disabled
+        if not self.use_scene:
+            # Use only motion features when no_scene is enabled
+            features_to_fuse = [encoded_motion_bbox]  # Motion + bounding box features only
+        else:
+            # Default behavior: include scene global features
+            scene_global_feats_expanded = scene_global_feats.unsqueeze(1).repeat(1, self.sequence_length, 1) # [B, sequence_length, scene_feats_dim]
+            features_to_fuse = [
+                scene_global_feats_expanded,  # Global scene context
+                encoded_motion_bbox,          # Motion + bounding box features
+            ]
 
         if category_embeddings_expanded is not None:
             features_to_fuse.append(category_embeddings_expanded)
         
         # Concatenate all features along the last dimension
-        # [B, sequence_length, scene_feats_dim + motion_latent_dim + category_embed_dim]
         final_fused_input = torch.cat(features_to_fuse, dim=2)
-
-
+    
         cross_modal_embedding = self.embedding_layer(final_fused_input) # Output: [B, sequence_length, embed_input_dim]
 
         
