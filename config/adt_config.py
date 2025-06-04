@@ -47,7 +47,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.scene_configs.add_argument('--no_bbox', action='store_true', default=False, help='Disable bounding box processing and conditioning')
         self.scene_configs.add_argument('--no_scene', action='store_true', default=False, help='Disable scene global features and use only motion features')
         self.scene_configs.add_argument('--no_semantic_bbox', action='store_true', default=False, help='Disable semantic bbox embedding for scene conditioning')
-        self.scene_configs.add_argument('--max_bboxes', default=50, type=int, help='Maximum number of bounding boxes for scene conditioning')
+        self.scene_configs.add_argument('--max_bboxes', default=400, type=int, help='Maximum number of bounding boxes for scene conditioning')
         self.scene_configs.add_argument('--semantic_bbox_embed_dim', default=256, type=int, help='Output dimension of semantic bbox embedder')
         self.scene_configs.add_argument('--semantic_bbox_hidden_dim', default=128, type=int, help='Hidden dimension in semantic bbox embedder')
         self.scene_configs.add_argument('--semantic_bbox_num_heads', default=4, type=int, help='Number of attention heads in semantic bbox embedder')
@@ -125,6 +125,29 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.viz_configs.add_argument('--show_ori_arrows', action='store_true', default=False, help='Show orientation arrows in visualization')
         self.viz_configs.add_argument('--visualize_train_trajectories_on_start', action='store_true', default=False, help='Generate and save visualizations for a subset of the training data at the beginning of training.')
 
+        # === DiT Configuration ===
+        self.dit_configs = self.add_argument_group('Diffusion Transformer (DiT)')
+        self.dit_configs.add_argument('--use_dit', action='store_true', default=False, help='Use GIMO Multimodal DiT instead of standard GIMO model')
+        self.dit_configs.add_argument('--dit_patch_size', type=int, default=8, help='Patch size for DiT (trajectory will be divided into patches)')
+        self.dit_configs.add_argument('--dit_hidden_dim', type=int, default=384, help='Hidden dimension for DiT transformer blocks')
+        self.dit_configs.add_argument('--dit_depth', type=int, default=12, help='Number of DiT transformer blocks')
+        self.dit_configs.add_argument('--dit_num_heads', type=int, default=6, help='Number of attention heads in DiT blocks')
+        self.dit_configs.add_argument('--dit_mlp_ratio', type=float, default=4.0, help='MLP expansion ratio in DiT blocks')
+        self.dit_configs.add_argument('--dit_time_embed_dim', type=int, default=640, help='Timestep embedding dimension for DiT')
+        self.dit_configs.add_argument('--dit_cond_embed_dim', type=int, default=640, help='Conditioning embedding dimension for DiT')
+        self.dit_configs.add_argument('--dit_cond_dim', type=int, default=512, help='Output dimension of multimodal conditioning features')
+        self.dit_configs.add_argument('--dit_cond_heads', type=int, default=8, help='Number of attention heads in conditioning encoder')
+        self.dit_configs.add_argument('--dit_cond_layers', type=int, default=3, help='Number of layers in conditioning encoder')
+        self.dit_configs.add_argument('--dit_perceiver_latent_size', type=int, default=64, help='Size of perceiver latent array for multimodal conditioning')
+        
+        # === Diffusion Training Configuration ===
+        self.diffusion_configs = self.add_argument_group('Diffusion Training')
+        self.diffusion_configs.add_argument('--diffusion_timesteps', type=int, default=1000, help='Number of diffusion timesteps')
+        self.diffusion_configs.add_argument('--diffusion_beta_start', type=float, default=1e-4, help='Starting value for noise schedule')
+        self.diffusion_configs.add_argument('--diffusion_beta_end', type=float, default=0.02, help='Ending value for noise schedule')
+        self.diffusion_configs.add_argument('--diffusion_loss_type', type=str, default='l2', choices=['l1', 'l2'], help='Loss function for diffusion training')
+        self.diffusion_configs.add_argument('--diffusion_sampling_steps', type=int, default=100, help='Number of sampling steps during inference (can be less than training timesteps)')
+
     def get_configs(self):
         # Basic validation
         args = self.parse_args()
@@ -136,6 +159,17 @@ class ADTObjectMotionConfig(ArgumentParser):
                   f"object_rotation_dim ({args.object_rotation_dim}). "
                   f"Setting object_motion_dim = position_dim + rotation_dim.")
             args.object_motion_dim = args.object_position_dim + args.object_rotation_dim
+        
+        # Validate DiT patch size
+        if args.use_dit:
+            if args.trajectory_length % args.dit_patch_size != 0:
+                print(f"Warning: trajectory_length ({args.trajectory_length}) is not divisible by "
+                      f"dit_patch_size ({args.dit_patch_size}). This may cause issues with DiT.")
+                # Suggest a compatible patch size
+                for patch_size in [8, 4, 2, 1]:
+                    if args.trajectory_length % patch_size == 0:
+                        print(f"Suggested dit_patch_size: {patch_size}")
+                        break
             
         return args
 

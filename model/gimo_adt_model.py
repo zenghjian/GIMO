@@ -8,7 +8,9 @@ import matplotlib.pyplot as plt # Added for visualization
 # Actual GIMO components
 from .pointnet_plus2 import PointNet2SemSegSSGShape, PointNet, MyFPModule
 from .base_cross_model import PerceiveEncoder, PositionwiseFeedForward, PerceiveDecoder
+from utils.metrics_utils import clean_category_string, process_category_list
 import clip
+
 class BBoxEmbedder(nn.Module):
     """Embeds bounding box information of scene objects into a representation."""
     
@@ -98,26 +100,39 @@ class BBoxEmbedder(nn.Module):
 class CategoryEmbedder(nn.Module):
     """Embeds object categories into a representation using CLIP."""
     
-    def __init__(self, output_dim=640, clip_model_name="ViT-B/32"):
+    def __init__(self, output_dim=640, clip_model_name="ViT-B/32", clip_model=None):
         super().__init__()
         
-        
-        # Load CLIP model
-        self.clip_model, _ = clip.load(clip_model_name, device="cpu")
-        
-        # Freeze CLIP parameters
-        for param in self.clip_model.parameters():
-            param.requires_grad = False
-        
-        # Get CLIP text embedding dimension
-        if clip_model_name == "ViT-B/32":
-            self.clip_embed_dim = 512
-        elif clip_model_name == "ViT-B/16":
-            self.clip_embed_dim = 512
-        elif clip_model_name == "ViT-L/14":
-            self.clip_embed_dim = 768
+        # Use provided CLIP model or load a new one
+        if clip_model is None:
+            # Load CLIP model
+            self.clip_model, _ = clip.load(clip_model_name, device="cpu")
+            
+            # Freeze CLIP parameters
+            for param in self.clip_model.parameters():
+                param.requires_grad = False
+            
+            # Get CLIP text embedding dimension based on model name
+            if clip_model_name == "ViT-B/32":
+                self.clip_embed_dim = 512
+            elif clip_model_name == "ViT-B/16":
+                self.clip_embed_dim = 512
+            elif clip_model_name == "ViT-L/14":
+                self.clip_embed_dim = 768
+            else:
+                self.clip_embed_dim = 512  # Default fallback
         else:
-            self.clip_embed_dim = 512  # Default fallback
+            self.clip_model = clip_model
+            
+            # Auto-detect CLIP embedding dimension from the shared model
+            # Try to get it from the model's text projection layer
+            if hasattr(self.clip_model, 'text_projection'):
+                self.clip_embed_dim = self.clip_model.text_projection.shape[0]
+            else:
+                # Fallback to common dimensions
+                self.clip_embed_dim = 512  # Default for ViT-B/32 and ViT-B/16
+            
+            print(f"INFO: CategoryEmbedder using shared CLIP model with embed_dim={self.clip_embed_dim}")
         
         # Projection to match required embedding dimension
         self.proj = nn.Sequential(
@@ -146,13 +161,8 @@ class CategoryEmbedder(nn.Module):
         if next(self.clip_model.parameters()).device != device:
             self.clip_model = self.clip_model.to(device)
         
-        # Handle empty or invalid categories
-        processed_categories = []
-        for cat in categories:
-            if cat is None or cat == '' or cat == 'unknown':
-                processed_categories.append("object")  # Default fallback
-            else:
-                processed_categories.append(str(cat))
+        # Use the unified string processing function
+        processed_categories = process_category_list(categories, default_fallback="object")
         
         # Tokenize all categories at once
         try:
@@ -167,6 +177,140 @@ class CategoryEmbedder(nn.Module):
         
         # Project to required dimension
         return self.proj(embeddings)
+
+class SemanticTextEmbedder(nn.Module):
+    """
+    Embeds categories of scene bounding boxes into a representation.
+    This class processes a list of category names for each bounding box in the scene.
+    """
+    
+    def __init__(self, output_dim=640, clip_model=None):
+        super().__init__()
+        
+        # Use provided CLIP model or load a new one
+        if clip_model is None:
+            import clip
+            # Load CLIP model
+            self.clip_model, _ = clip.load("ViT-B/32", device="cpu")
+            
+            # Freeze CLIP parameters
+            for param in self.clip_model.parameters():
+                param.requires_grad = False
+            
+            # Get CLIP text embedding dimension for ViT-B/32
+            self.clip_embed_dim = 512
+        else:
+            self.clip_model = clip_model
+            
+            # Auto-detect CLIP embedding dimension from the model
+            # Try to get it from the model's text projection layer
+            if hasattr(self.clip_model, 'text_projection'):
+                self.clip_embed_dim = self.clip_model.text_projection.shape[0]
+            else:
+                # Fallback to common dimensions
+                self.clip_embed_dim = 512  # Default for ViT-B/32 and ViT-B/16
+            
+            print(f"INFO: SemanticTextEmbedder using shared CLIP model with embed_dim={self.clip_embed_dim}")
+        
+        # Projection from clip embedding to hidden dimension
+        self.proj = nn.Sequential(
+            nn.Linear(self.clip_embed_dim, output_dim // 2),
+            nn.GELU(),
+            nn.Linear(output_dim // 2, output_dim),
+        )
+        
+        # Final projection to output dim
+        self.final_proj = nn.Sequential(
+            nn.Linear(output_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+        )
+    
+    def forward(self, flat_categories, mask=None):
+        """
+        Args:
+            flat_categories: Flattened list of category strings for all bounding boxes across all batch items
+            mask: Optional tensor of shape [batch_size, max_bboxes] indicating which boxes are valid (1)
+                  and which are padding (0)
+        
+        Returns:
+            Tensor of shape [batch_size, output_dim] representing the scene context from bbox categories
+        """
+        if flat_categories is None or len(flat_categories) == 0:
+            return None
+        
+        device = next(self.parameters()).device
+        
+        # Move CLIP model to the correct device
+        if next(self.clip_model.parameters()).device != device:
+            self.clip_model = self.clip_model.to(device)
+        
+        # Determine batch structure from mask
+        if mask is not None:
+            batch_size, max_bboxes = mask.shape
+            total_expected_categories = batch_size * max_bboxes
+        else:
+            # If no mask provided, assume single batch with all categories
+            batch_size = 1
+            max_bboxes = len(flat_categories)
+            total_expected_categories = len(flat_categories)
+        
+        # Handle case where flat_categories length doesn't match expected
+        if len(flat_categories) != total_expected_categories:
+            print(f"Warning: Expected {total_expected_categories} categories but got {len(flat_categories)}. Adjusting...")
+            # Pad or truncate to match expected size
+            if len(flat_categories) < total_expected_categories:
+                # Pad with default categories
+                flat_categories = flat_categories + ["object"] * (total_expected_categories - len(flat_categories))
+            else:
+                # Truncate to expected size
+                flat_categories = flat_categories[:total_expected_categories]
+        
+        # Reshape flat categories into batch structure [batch_size, max_bboxes]
+        batch_categories = []
+        for b in range(batch_size):
+            start_idx = b * max_bboxes
+            end_idx = start_idx + max_bboxes
+            batch_item_categories = flat_categories[start_idx:end_idx]
+            batch_categories.append(batch_item_categories)
+        
+        all_embeddings = []
+        
+        # Process each batch item
+        for i in range(batch_size):
+            item_categories = batch_categories[i]
+            
+            # Use the unified string processing function
+            valid_categories = process_category_list(item_categories, default_fallback="object")
+            
+            # Tokenize all categories for this batch item
+            with torch.no_grad():
+                text_tokens = clip.tokenize(valid_categories).to(device)
+                batch_embedding = self.clip_model.encode_text(text_tokens)
+            
+            # Apply projection to each embedding
+            batch_embedding = self.proj(batch_embedding)  # [max_bboxes, output_dim]
+            
+            # Apply mask if provided
+            if mask is not None:
+                batch_mask = mask[i].unsqueeze(-1)  # [max_bboxes, 1]
+                batch_embedding = batch_embedding * batch_mask
+                # Average over valid boxes only
+                if batch_mask.sum() > 0:
+                    batch_embedding = batch_embedding.sum(dim=0, keepdim=True) / batch_mask.sum()
+                else:
+                    batch_embedding = torch.zeros(1, batch_embedding.size(-1), device=device)
+            else:
+                # Simple average
+                batch_embedding = batch_embedding.mean(dim=0, keepdim=True)
+            
+            all_embeddings.append(batch_embedding)
+        
+        # Stack all batch embeddings to [batch_size, output_dim]
+        embeddings = torch.cat(all_embeddings, dim=0)
+        
+        # Final projection
+        return self.final_proj(embeddings)
 
 class GIMO_ADT_Model(nn.Module):
     """
@@ -192,8 +336,24 @@ class GIMO_ADT_Model(nn.Module):
         # Check if semantic bbox embedding is disabled
         self.use_semantic_bbox = not getattr(config, 'no_semantic_bbox', False)
         
+        # Check if semantic text embedding is disabled
+        self.use_semantic_text = not getattr(config, 'no_semantic_text', False)
+        
         # Still keep fixed trajectory_length for model definition
         self.sequence_length = config.trajectory_length 
+
+        # --- Create shared CLIP model for text embeddings ---
+        shared_clip_model = None
+        if self.use_text_embedding or self.use_semantic_text:
+            clip_model_name = getattr(config, 'clip_model_name', "ViT-B/32")
+            shared_clip_model, _ = clip.load(clip_model_name, device="cpu")
+            
+            # Freeze CLIP parameters
+            for param in shared_clip_model.parameters():
+                param.requires_grad = False
+            
+            print(f"INFO: Loaded shared CLIP model ({clip_model_name}) for text embeddings.")
+            print(f"INFO: Shared CLIP model will be used by CategoryEmbedder: {self.use_text_embedding}, SemanticTextEmbedder: {self.use_semantic_text}")
 
         # --- Scene/Motion Encoding Components ---
 
@@ -211,6 +371,13 @@ class GIMO_ADT_Model(nn.Module):
                 hidden_dim=getattr(config, 'semantic_bbox_hidden_dim', 128),
                 num_heads=getattr(config, 'semantic_bbox_num_heads', 4),
                 use_attention=getattr(config, 'semantic_bbox_use_attention', True)
+            )
+
+        # 4. Semantic Text Embedder (for scene-level text category conditioning)
+        if self.use_semantic_text:
+            self.semantic_text_embedder = SemanticTextEmbedder(
+                output_dim=getattr(config, 'semantic_text_embed_dim', 640),
+                clip_model=shared_clip_model
             )
 
         # Bounding Box related layers (as per diagram)
@@ -245,7 +412,8 @@ class GIMO_ADT_Model(nn.Module):
         if not config.no_text_embedding:
             self.category_embedder = CategoryEmbedder(
                 output_dim=config.category_embed_dim,
-                clip_model_name=getattr(config, 'clip_model_name', "ViT-B/32")
+                clip_model_name=getattr(config, 'clip_model_name', "ViT-B/32"),
+                clip_model=shared_clip_model
             )
         else:
             self.category_embedder = None
@@ -260,6 +428,8 @@ class GIMO_ADT_Model(nn.Module):
             embed_dim += config.category_embed_dim
         if self.use_semantic_bbox:
             embed_dim += config.semantic_bbox_embed_dim
+        if self.use_semantic_text:
+            embed_dim += getattr(config, 'semantic_text_embed_dim', 640)
         
         self.embedding_layer = PositionwiseFeedForward(
             d_in=embed_dim, 
@@ -282,7 +452,7 @@ class GIMO_ADT_Model(nn.Module):
         self.outputlayer = nn.Linear(config.output_latent_dim, config.object_motion_dim)
     
     def forward(self, input_trajectory, point_cloud, bounding_box_corners=None, object_category_ids=None, 
-                semantic_bbox_info=None, semantic_bbox_mask=None):
+                semantic_bbox_info=None, semantic_bbox_mask=None, semantic_text_categories=None):
         """
         Forward pass of the GIMO ADT model with 3D bounding box integration.
         
@@ -293,6 +463,7 @@ class GIMO_ADT_Model(nn.Module):
             object_category_ids: [batch_size] - category strings for objects (optional if no_text_embedding=True)
             semantic_bbox_info: [batch_size, max_bboxes, 12] - semantic bbox information for scene conditioning (optional if no_semantic_bbox=True)
             semantic_bbox_mask: [batch_size, max_bboxes] - mask for semantic bbox (1 for real, 0 for padding) (optional if no_semantic_bbox=True)
+            semantic_text_categories: List of category strings for semantic text conditioning (optional if no_semantic_text=True)
             
         Returns:
             torch.Tensor: Predicted future trajectory [batch_size, trajectory_length, 9]
@@ -328,6 +499,11 @@ class GIMO_ADT_Model(nn.Module):
         semantic_bbox_embeddings = None
         if self.use_semantic_bbox and semantic_bbox_info is not None:
             semantic_bbox_embeddings = self.semantic_bbox_embedder(semantic_bbox_info, semantic_bbox_mask)  # [B, semantic_bbox_embed_dim]
+        
+        # Process Semantic Text Categories (if enabled)
+        semantic_text_embeddings = None
+        if self.use_semantic_text and semantic_text_categories is not None:
+            semantic_text_embeddings = self.semantic_text_embedder(semantic_text_categories, semantic_bbox_mask)  # [B, semantic_text_embed_dim]
         
         # Process Bounding Box (if enabled)
         if self.use_bbox and bounding_box_corners is not None:
@@ -398,6 +574,11 @@ class GIMO_ADT_Model(nn.Module):
             # Expand semantic bbox embeddings to sequence length
             semantic_bbox_embeddings_expanded = semantic_bbox_embeddings.unsqueeze(1).repeat(1, self.sequence_length, 1)  # [B, sequence_length, semantic_bbox_embed_dim]
             features_to_fuse.append(semantic_bbox_embeddings_expanded)
+        
+        if semantic_text_embeddings is not None:
+            # Expand semantic text embeddings to sequence length
+            semantic_text_embeddings_expanded = semantic_text_embeddings.unsqueeze(1).repeat(1, self.sequence_length, 1)  # [B, sequence_length, semantic_text_embed_dim]
+            features_to_fuse.append(semantic_text_embeddings_expanded)
         
         # Concatenate all features along the last dimension
         final_fused_input = torch.cat(features_to_fuse, dim=2)

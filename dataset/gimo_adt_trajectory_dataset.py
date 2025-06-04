@@ -1158,6 +1158,13 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                     center = bbox.transform_scene_object.translation()[0]
                     pos = [center[0], center[1], center[2]]
                     
+                    # Get the dimensions from the AABB to calculate proper geometric center
+                    aabb = bbox.aabb
+                    height = aabb[3] - aabb[2]  # ymax - ymin (height in Y-axis)
+                    
+                    # Adjust center from bottom center to geometric center by moving up by half height
+                    pos[1] = pos[1] + height / 2.0  # Move center up by half height in Y-axis
+                    
                     # Extract rotation matrix from transform_scene_object
                     rotation_matrix = bbox.transform_scene_object.rotation().to_matrix()
                     
@@ -1192,6 +1199,8 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                     try:
                         # Try the original method first
                         T_scene_object = bbox.transform_scene_object.matrix()
+                        # Adjust the translation to account for geometric center instead of bottom center
+                        T_scene_object[1, 3] = T_scene_object[1, 3] + sy / 2.0
                     except AttributeError:
                         # If matrix() not available, construct the matrix manually
                         rotation = bbox.transform_scene_object.rotation().to_matrix()
@@ -1202,6 +1211,9 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                         T_scene_object[:3, :3] = rotation
                         T_scene_object[:3, 3] = translation
                         
+                        # Adjust the translation to account for geometric center instead of bottom center
+                        # We need to move the center up by half height in the Y-axis
+                        T_scene_object[1, 3] = T_scene_object[1, 3] + sy / 2.0
 
                     # Transform local corners to world coordinates
                     local_corners_h = np.hstack((local_corners, np.ones((8, 1)))) # Homogeneous coordinates
@@ -1420,6 +1432,10 @@ class GimoAriaDigitalTwinTrajectoryDataset(Dataset):
                     width = aabb[1] - aabb[0]   # xmax - xmin
                     height = aabb[3] - aabb[2]  # ymax - ymin
                     depth = aabb[5] - aabb[4]   # zmax - zmin
+                    
+                    # Adjust center from bottom center to geometric center by moving up by half height
+                    # ADT bbox center is at the bottom, we need to move it to geometric center
+                    center = [center[0], center[1] + height / 2.0, center[2]]
                     
                     # Extract rotation matrix from transform_scene_object
                     rotation_matrix = bbox.transform_scene_object.rotation().to_matrix()

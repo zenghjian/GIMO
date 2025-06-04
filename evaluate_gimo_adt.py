@@ -18,6 +18,7 @@ import shutil # Import shutil
 
 # --- Imports from our project ---
 from model.gimo_adt_model import GIMO_ADT_Model
+from model.gimo_adt_autoregressive_model import GIMO_ADT_Autoregressive_Model
 from dataset.gimo_multi_sequence_dataset import GIMOMultiSequenceDataset
 from dataset.gimo_adt_trajectory_dataset import GimoAriaDigitalTwinTrajectoryDataset # Needed for denormalization access potentially
 from config.adt_config import ADTObjectMotionConfig
@@ -158,6 +159,24 @@ def parse_args():
         default=0.03,
         help="Size of points in Rerun visualization"
     )
+    parser.add_argument(
+        "--rerun_show_arrows",
+        action="store_true",
+        default=True,
+        help="Show orientation arrows in Rerun visualization"
+    )
+    parser.add_argument(
+        "--rerun_show_semantic_bboxes", 
+        action="store_true",
+        default=True,
+        help="Show semantic bounding boxes in Rerun visualization"
+    )
+    parser.add_argument(
+        "--rerun_arrow_length",
+        type=float,
+        default=0.2,
+        help="Length of orientation arrows in Rerun visualization"
+    )
     
     # --- Other Options ---
     parser.add_argument(
@@ -201,7 +220,7 @@ def parse_args():
 
 def load_model_and_config(checkpoint_path, device, logger):
     """
-    Load GIMO_ADT_Model and its config from a checkpoint.
+    Load GIMO_ADT_Model or GIMO_ADT_Autoregressive_Model and its config from a checkpoint.
     
     Args:
         checkpoint_path: Path to the model checkpoint (.pth)
@@ -209,7 +228,7 @@ def load_model_and_config(checkpoint_path, device, logger):
         logger: Logger instance for logging information
         
     Returns:
-        model: Loaded GIMO_ADT_Model
+        model: Loaded GIMO_ADT_Model or GIMO_ADT_Autoregressive_Model
         config: Configuration object from the checkpoint
         best_epoch (int): The epoch number at which this checkpoint was saved (usually the best validation epoch). Returns 0 if not found.
     """
@@ -237,8 +256,17 @@ def load_model_and_config(checkpoint_path, device, logger):
     logger.info("Configuration loaded from checkpoint:")
     logger.info(str(config))
 
-    # Create model instance using loaded config
-    model = GIMO_ADT_Model(config).to(device)
+    # Create model instance using loaded config - support both model types
+    if config.timestep == 0:
+        logger.info("Using GIMO_ADT_Model (non-autoregressive).")
+        model = GIMO_ADT_Model(config).to(device)
+    elif config.timestep == 1:
+        logger.info("Using GIMO_ADT_Autoregressive_Model.")
+        model = GIMO_ADT_Autoregressive_Model(config).to(device)
+    else:
+        error_msg = f"Invalid timestep configuration: {config.timestep}. Must be 0 or 1."
+        logger.error(error_msg)
+        raise ValueError(error_msg)
     
     # Load model state dict
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -246,7 +274,7 @@ def load_model_and_config(checkpoint_path, device, logger):
     
     param_count = sum(p.numel() for p in model.parameters())
     param_count_millions = param_count / 1_000_000
-    logger.info(f"Loaded GIMO_ADT_Model with {param_count_millions:.2f}M parameters.")
+    logger.info(f"Loaded model with {param_count_millions:.2f}M parameters.")
     
     # Get the epoch number
     best_epoch = checkpoint.get('epoch', 0) # Default to 0 if epoch key doesn't exist
@@ -458,17 +486,22 @@ def evaluate(model, config, args, best_epoch, logger,
                 object_names = batch.get('object_name', [])
                 segment_indices = batch.get('segment_idx', [])
                 
-                # Get object categories for the model
-                # Get object category IDs (using mapped dense IDs, not strings)
-                object_category_ids = batch.get('object_category_id', None)
-                if object_category_ids is not None:
-                    object_category_ids = object_category_ids.to(device)
+                # Get object categories for the model - use strings like in training
+                object_category_ids = None
+                if not config.no_text_embedding:
+                    object_category_ids = batch['object_category']  # List of strings, no .to(device) needed
                 
-                # For backward compatibility and visualization purposes, also get category strings
-                object_categories = batch.get('object_category', [f"unknown" for i in range(full_trajectory_batch.shape[0])])
-                # Convert categories to list of strings if they're tensors
-                if isinstance(object_categories, torch.Tensor):
-                    object_categories = [cat.item() if isinstance(cat.item(), str) else str(cat.item()) for cat in object_categories]
+                # Get semantic bbox information if semantic bbox embedding is enabled
+                semantic_bbox_info = None
+                semantic_bbox_mask = None
+                if not config.no_semantic_bbox:
+                    semantic_bbox_info = batch['scene_bbox_info'].float().to(device)
+                    semantic_bbox_mask = batch['scene_bbox_mask'].float().to(device)
+
+                # Get semantic text categories if semantic text embedding is enabled
+                semantic_text_categories = None
+                if not getattr(config, 'no_semantic_text', False):
+                    semantic_text_categories = batch.get('scene_bbox_categories', None)
 
                 # --- Dynamically determine input history length for the batch (evaluation) ---
                 actual_lengths_batch = full_attention_mask.sum(dim=1).int() # Shape [B]
@@ -502,12 +535,12 @@ def evaluate(model, config, args, best_epoch, logger,
                 
                 # --- Model Inference ---
                 logger.info("Running model inference...")
-                predicted_full_trajectory = model(
-                    input_trajectory=input_trajectory_batch,
-                    point_cloud=point_cloud_batch,
-                    bounding_box_corners=bbox_corners_input_batch,
-                    object_category_ids=object_category_ids
-                )
+                # Update forward call to match training script signature with positional arguments
+                # Handle different signatures between regular and autoregressive models
+                if config.timestep == 1:  # Autoregressive model
+                    predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask, semantic_text_categories)
+                else:  # Regular model
+                    predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask, semantic_text_categories)
                 total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
                 logger.info(f"Loss: {total_loss:.4f}")
 
@@ -619,6 +652,15 @@ def evaluate(model, config, args, best_epoch, logger,
                     l1_mean, rmse_ade, fde = compute_metrics_for_sample(pred_future_denorm, gt_future_denorm, future_mask)
                     logger.info(f"Sample {i}: L1={l1_mean.item():.4f}, RMSE={rmse_ade.item():.4f}, FDE={fde.item():.4f}")
                     
+                    # Calculate individual sample validation loss
+                    # Create single-sample batch for loss computation
+                    sample_batch = {
+                        'full_poses': batch['full_poses'][i:i+1],  # [1, T, dim]
+                        'full_attention_mask': batch['full_attention_mask'][i:i+1],  # [1, T]
+                    }
+                    sample_prediction = predicted_full_trajectory[i:i+1]  # [1, T, dim]
+                    sample_val_loss, sample_loss_dict = model.compute_loss(sample_prediction, sample_batch)
+                    
                     # For first_frame_only mode, also check reconstruction of the first frame
                     first_frame_rec_error = 0.0
                     if config.use_first_frame_only and gt_hist.shape[0] > 0 and hist_mask.sum() > 0:
@@ -662,6 +704,7 @@ def evaluate(model, config, args, best_epoch, logger,
                         'l1': l1_mean.item(),
                         'rmse': rmse_ade.item(),
                         'fde': fde.item(),
+                        'val_loss': sample_val_loss.item(),  # Add validation loss for sorting
                         'vis_path': current_sample_vis_path, # Path to matplotlib vis
                         'rerun_path': current_sample_rerun_path,  # Path to Rerun .rrd file
                         'sample_name': filename_base if 'filename_base' in locals() else f"batch{batch_idx}_sample{i}"
@@ -811,22 +854,68 @@ def evaluate(model, config, args, best_epoch, logger,
                                          pred_future_denorm_rerun_vis = transform_coords_for_visualization(pred_future_denorm.cpu())
                                          traj_point_cloud_rerun_vis = transform_coords_for_visualization(traj_point_cloud.cpu() if traj_point_cloud is not None else None)
                                          
-                                         # Log data for this sample. 
+                                         # --- Prepare semantic bbox data for Rerun visualization ---
+                                         semantic_bbox_info_rerun = None
+                                         semantic_bbox_mask_rerun = None
+                                         semantic_bbox_categories_rerun = None
+                                         
+                                         if not config.no_semantic_bbox and semantic_bbox_info is not None:
+                                             # Get semantic bbox info for this sample
+                                             sample_semantic_bbox_info = semantic_bbox_info[i]  # [max_bboxes, 12]
+                                             sample_semantic_bbox_mask = semantic_bbox_mask[i] if semantic_bbox_mask is not None else None  # [max_bboxes]
+                                             
+                                             # Get semantic bbox categories for this sample
+                                             if 'scene_bbox_categories' in batch:
+                                                 # Handle different possible batch structures for categories
+                                                 categories_data = batch['scene_bbox_categories']
+                                                 if isinstance(categories_data, list) and len(categories_data) > i:
+                                                     sample_semantic_bbox_categories = categories_data
+                                                 elif isinstance(categories_data, list) and len(categories_data) == sample_semantic_bbox_info.shape[0]:
+                                                     # Categories might be a single list for the whole batch
+                                                     sample_semantic_bbox_categories = categories_data
+                                                 else:
+                                                     sample_semantic_bbox_categories = ["unknown"] * sample_semantic_bbox_info.shape[0]
+                                             else:
+                                                 sample_semantic_bbox_categories = ["unknown"] * sample_semantic_bbox_info.shape[0]
+                                             
+                                             # Denormalize semantic bbox centers if needed
+                                             if sample_norm_params.get('is_normalized', False):
+                                                 semantic_bbox_denorm = sample_semantic_bbox_info.clone()
+                                                 # Only denormalize the center coordinates (first 3 dimensions of each bbox)
+                                                 bbox_centers = semantic_bbox_denorm[:, :3]  # [max_bboxes, 3]
+                                                 bbox_centers_denorm = denormalize_trajectory(bbox_centers.cpu(), sample_norm_params)
+                                                 semantic_bbox_denorm[:, :3] = bbox_centers_denorm
+                                                 semantic_bbox_info_rerun = semantic_bbox_denorm.cpu()
+                                             else:
+                                                 semantic_bbox_info_rerun = sample_semantic_bbox_info.cpu()
+                                             
+                                             # Do NOT apply coordinate transformation here - let rerun function handle it
+                                             semantic_bbox_mask_rerun = sample_semantic_bbox_mask.cpu() if sample_semantic_bbox_mask is not None else None
+                                             semantic_bbox_categories_rerun = sample_semantic_bbox_categories
+                                         # --- End semantic bbox preparation ---
+                                         
+                                         # Log data for this sample with enhanced visualization
                                          visualize_trajectory_rerun(
                                              past_positions=gt_hist_denorm_rerun_vis,
                                              future_positions_gt=gt_future_denorm_rerun_vis,
                                              future_positions_pred=pred_future_denorm_rerun_vis,
                                              past_mask=hist_mask,
                                              future_mask_gt=future_mask,
-                                             point_cloud=traj_point_cloud_rerun_vis, # Now defined and transformed
-                                             past_orientations=gt_hist_rot_denorm.cpu(), # Orientations not transformed
-                                             future_orientations_gt=gt_future_rot_denorm.cpu(), # Orientations not transformed
-                                             future_orientations_pred=pred_future_rot_denorm.cpu(), # Orientations not transformed
+                                             point_cloud=traj_point_cloud_rerun_vis,
+                                             past_orientations=gt_hist_rot_denorm.cpu(),
+                                             future_orientations_gt=gt_future_rot_denorm.cpu(),
+                                             future_orientations_pred=pred_future_rot_denorm.cpu(),
+                                             semantic_bbox_info=semantic_bbox_info_rerun,
+                                             semantic_bbox_mask=semantic_bbox_mask_rerun,
+                                             semantic_bbox_categories=semantic_bbox_categories_rerun,
                                              object_name=obj_name, 
                                              sequence_name=sequence_name_extracted, 
                                              segment_idx=seg_idx, 
+                                             arrow_length=args.rerun_arrow_length,
                                              line_width=args.rerun_line_width,
-                                             point_size=args.rerun_point_size
+                                             point_size=args.rerun_point_size,
+                                             show_arrows=args.rerun_show_arrows,
+                                             show_semantic_bboxes=args.rerun_show_semantic_bboxes
                                          )
 
                                          # Explicitly save if init fell back
@@ -933,9 +1022,10 @@ def evaluate(model, config, args, best_epoch, logger,
         
         num_to_save = args.num_top_worst_to_save
         logger.info(f"Saving top/worst {num_to_save} Rerun recordings and visualizations...")
+        logger.info(f"Samples sorted by L1 loss (lower is better)")
 
         # Save best samples
-        logger.info(f"--- Saving {min(num_to_save, len(all_samples_metrics))} best samples ---")
+        logger.info(f"--- Saving {min(num_to_save, len(all_samples_metrics))} best samples (lowest L1 loss) ---")
         for i in range(min(num_to_save, len(all_samples_metrics))):
             sample_data = all_samples_metrics[i]
             logger.info(f"Best sample {i+1}/{num_to_save} (L1: {sample_data['l1']:.4f}): {sample_data['sample_name']}")
@@ -953,7 +1043,7 @@ def evaluate(model, config, args, best_epoch, logger,
                     logger.error(f"  Error copying Rerun recording {sample_data['rerun_path']}: {e}")
 
         # Save worst samples (from the end of the sorted list)
-        logger.info(f"--- Saving {min(num_to_save, len(all_samples_metrics))} worst samples ---")
+        logger.info(f"--- Saving {min(num_to_save, len(all_samples_metrics))} worst samples (highest L1 loss) ---")
         for i in range(min(num_to_save, len(all_samples_metrics))):
             sample_data = all_samples_metrics[-(i+1)] # Get from the end
             logger.info(f"Worst sample {i+1}/{num_to_save} (L1: {sample_data['l1']:.4f}): {sample_data['sample_name']}")
@@ -1031,6 +1121,9 @@ def main():
             logger.info(f"Point cloud downsample factor: {args.pointcloud_downsample_factor}")
             logger.info(f"Line width: {args.rerun_line_width}")
             logger.info(f"Point size: {args.rerun_point_size}")
+            logger.info(f"Show orientation arrows: {'Enabled' if args.rerun_show_arrows else 'Disabled'}")
+            logger.info(f"Show semantic bounding boxes: {'Enabled' if args.rerun_show_semantic_bboxes else 'Disabled'}")
+            logger.info(f"Arrow length: {args.rerun_arrow_length}")
         else:
             logger.info("Rerun visualization: Requested but not available")
             args.use_rerun = False  # Disable Rerun if not available
@@ -1058,45 +1151,165 @@ def main():
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         
-        logger.info("\n=== MODEL ARCHITECTURE ===")
+        logger.info("\n=== MODEL ARCHITECTURE DETAILS ===")
+        logger.info(f"Model Type: {type(model).__name__}")
+        logger.info(f"Timestep Configuration: {config.timestep} ({'Autoregressive' if config.timestep == 1 else 'Non-autoregressive'})")
         logger.info(f"Total Parameters: {total_params:,}")
         logger.info(f"Trainable Parameters: {trainable_params:,}")
+        logger.info(f"Non-trainable Parameters: {total_params - trainable_params:,}")
+        
+        # Calculate model size in MB (assuming float32)
+        model_size_mb = (total_params * 4) / (1024 * 1024)
+        logger.info(f"Estimated Model Size: {model_size_mb:.2f} MB")
+        
+        # Log configuration flags
+        logger.info(f"\n--- Configuration Flags ---")
         logger.info(f"Text Embedding Enabled: {not getattr(config, 'no_text_embedding', False)}")
+        logger.info(f"Bounding Box Processing Enabled: {not getattr(config, 'no_bbox', False)}")
+        logger.info(f"Semantic BBox Embedding Enabled: {not getattr(config, 'no_semantic_bbox', False)}")
+        logger.info(f"Semantic Text Embedding Enabled: {not getattr(config, 'no_semantic_text', False)}")
+        logger.info(f"Scene Global Features Enabled: {not getattr(config, 'no_scene', False)}")
         logger.info(f"Use First Frame Only: {config.use_first_frame_only}")
         
-        # Log model components
-        components = {
-            'Motion Linear': (model.motion_linear, []), 
-            'Scene Encoder': (model.scene_encoder, ['hparams']), 
-            'FP Layer': (model.fp_layer, []),
-            'BBox PointNet': (model.bbox_pointnet, ['conv1']), 
-            'Motion BBox Encoder': (model.motion_bbox_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
-            'Embedding Layer (Fusion 2)': (model.embedding_layer, ['in_features', 'out_features']),
-            'Output Encoder': (model.output_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
-            'Output Layer': (model.outputlayer, ['in_features', 'out_features'])
-        }
+        # Log detailed component information
+        logger.info(f"\n--- Component-wise Parameter Breakdown ---")
         
-        # Add text embedding components if enabled
-        if not getattr(config, 'no_text_embedding', False): # Check if text embedding is enabled
-            if hasattr(model, 'category_embedding'): # Ensure the attribute exists
-                components.update({
-                    'Category Embedding': (model.category_embedding, ['num_embeddings', 'embedding_dim'])
-                })
+        def log_component_params(component_name, component):
+            """Helper function to log parameters for a component"""
+            if component is not None:
+                component_params = sum(p.numel() for p in component.parameters())
+                component_trainable = sum(p.numel() for p in component.parameters() if p.requires_grad)
+                logger.info(f"{component_name}:")
+                logger.info(f"  Total: {component_params:,} parameters")
+                logger.info(f"  Trainable: {component_trainable:,} parameters")
+                logger.info(f"  Frozen: {component_params - component_trainable:,} parameters")
+                return component_params
+            else:
+                logger.info(f"{component_name}: Not used")
+                return 0
         
-        # Log each component's structure and parameters
-        for name, (component, attrs) in components.items():
-            params = sum(p.numel() for p in component.parameters())
-            logger.info(f"\n{name}:")
-            logger.info(f"  Parameters: {params:,}")
-            try:
-                # Try to log attributes if available
-                for attr in attrs:
-                    if hasattr(component, attr):
-                        logger.info(f"  {attr}: {getattr(component, attr)}")
-            except:
-                pass
+        # Motion components
+        motion_params = log_component_params("Motion Linear Layer", getattr(model, 'motion_linear', None))
         
-        logger.info("=== END MODEL ARCHITECTURE ===\n")
+        # Scene encoder
+        scene_encoder_params = log_component_params("Scene Encoder (PointNet++)", getattr(model, 'scene_encoder', None))
+        
+        # Bounding box related components
+        if hasattr(model, 'fp_layer'):
+            fp_params = log_component_params("Feature Propagation Layer", model.fp_layer)
+        if hasattr(model, 'bbox_pointnet'):
+            bbox_pointnet_params = log_component_params("BBox PointNet", model.bbox_pointnet)
+        
+        # Motion-bbox encoder
+        motion_bbox_encoder_params = log_component_params("Motion-BBox Encoder", getattr(model, 'motion_bbox_encoder', None))
+        
+        # Embedding components
+        category_embedder_params = log_component_params("Category Embedder", getattr(model, 'category_embedder', None))
+        semantic_bbox_embedder_params = log_component_params("Semantic BBox Embedder", getattr(model, 'semantic_bbox_embedder', None))
+        semantic_text_embedder_params = log_component_params("Semantic Text Embedder", getattr(model, 'semantic_text_embedder', None))
+        
+        # Fusion and output components
+        embedding_layer_params = log_component_params("Embedding Layer", getattr(model, 'embedding_layer', None))
+        output_encoder_params = log_component_params("Output Encoder", getattr(model, 'output_encoder', None))
+        
+        # Handle different model types (regular vs autoregressive)
+        if hasattr(model, 'outputlayer'):
+            output_layer_params = log_component_params("Output Layer", model.outputlayer)
+        elif hasattr(model, 'regression_head'):
+            output_layer_params = log_component_params("Regression Head", model.regression_head)
+        else:
+            output_layer_params = 0
+        
+        # Log model architecture details
+        logger.info(f"\n--- Model Architecture Configuration ---")
+        logger.info(f"Sequence Length: {getattr(model, 'sequence_length', 'N/A')}")
+        logger.info(f"History Fraction: {getattr(model, 'history_fraction', 'N/A')}")
+        
+        # Log dimensions
+        logger.info(f"\n--- Dimension Configuration ---")
+        logger.info(f"Object Motion Dim: {getattr(config, 'object_motion_dim', 'N/A')}")
+        logger.info(f"Motion Hidden Dim: {getattr(config, 'motion_hidden_dim', 'N/A')}")
+        logger.info(f"Motion Latent Dim: {getattr(config, 'motion_latent_dim', 'N/A')}")
+        logger.info(f"Scene Features Dim: {getattr(config, 'scene_feats_dim', 'N/A')}")
+        if not getattr(config, 'no_text_embedding', False):
+            logger.info(f"Category Embed Dim: {getattr(config, 'category_embed_dim', 'N/A')}")
+        if not getattr(config, 'no_semantic_bbox', False):
+            logger.info(f"Semantic BBox Embed Dim: {getattr(config, 'semantic_bbox_embed_dim', 'N/A')}")
+        if not getattr(config, 'no_semantic_text', False):
+            logger.info(f"Semantic Text Embed Dim: {getattr(config, 'semantic_text_embed_dim', 640)}")
+        logger.info(f"Output Latent Dim: {getattr(config, 'output_latent_dim', 'N/A')}")
+        
+        # Log attention configuration
+        logger.info(f"\n--- Attention Configuration ---")
+        logger.info(f"Motion Attention Heads: {getattr(config, 'motion_n_heads', 'N/A')}")
+        logger.info(f"Motion Attention Layers: {getattr(config, 'motion_n_layers', 'N/A')}")
+        logger.info(f"Output Attention Heads: {getattr(config, 'output_n_heads', 'N/A')}")
+        logger.info(f"Output Attention Layers: {getattr(config, 'output_n_layers', 'N/A')}")
+        logger.info(f"Dropout Rate: {getattr(config, 'dropout', 'N/A')}")
+        
+        # Log CLIP model information if available
+        if hasattr(model, 'category_embedder') and model.category_embedder is not None:
+            logger.info(f"\n--- CLIP Model Information ---")
+            clip_model = getattr(model.category_embedder, 'clip_model', None)
+            if clip_model is not None:
+                clip_params = sum(p.numel() for p in clip_model.parameters())
+                logger.info(f"CLIP Model Parameters: {clip_params:,}")
+                clip_model_name = getattr(config, 'clip_model_name', 'ViT-B/32')
+                logger.info(f"CLIP Model Type: {clip_model_name}")
+                logger.info(f"CLIP Embedding Dim: {getattr(model.category_embedder, 'clip_embed_dim', 'N/A')}")
+        
+        # Memory estimation
+        logger.info(f"\n--- Memory Estimation ---")
+        # Rough estimation of memory usage during evaluation (forward only)
+        estimated_eval_memory_mb = model_size_mb * 2  # Model + activations (rough estimate)
+        logger.info(f"Estimated Evaluation Memory: {estimated_eval_memory_mb:.2f} MB")
+        
+        # Log device information
+        if torch.cuda.is_available() and device.type == 'cuda':
+            gpu_memory = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+            logger.info(f"GPU Memory Available: {gpu_memory:.2f} GB")
+            current_memory = torch.cuda.memory_allocated(device) / (1024**2)
+            logger.info(f"Current GPU Memory Used: {current_memory:.2f} MB")
+
+        # Log detailed model structure (simplified for evaluation)
+        logger.info(f"\n--- Model Structure Summary ---")
+        def log_model_structure_summary(module, max_components=10):
+            """Log a summary of the main model components"""
+            components = list(module.named_children())
+            logger.info(f"Main Components ({len(components)} total):")
+            
+            for i, (name, child) in enumerate(components[:max_components]):
+                child_params = sum(p.numel() for p in child.parameters())
+                child_trainable = sum(p.numel() for p in child.parameters() if p.requires_grad)
+                logger.info(f"  {i+1}. {name}: {type(child).__name__} ({child_params:,} params)")
+                
+            if len(components) > max_components:
+                logger.info(f"  ... and {len(components) - max_components} more components")
+        
+        try:
+            log_model_structure_summary(model)
+        except Exception as e:
+            logger.info(f"Error logging model structure summary: {e}")
+        
+        # Summary statistics
+        logger.info(f"\n--- Parameter Distribution ---")
+        components = [
+            ("Motion Processing", motion_params if 'motion_params' in locals() else 0),
+            ("Scene Encoding", scene_encoder_params if 'scene_encoder_params' in locals() else 0),
+            ("Motion-BBox Fusion", motion_bbox_encoder_params if 'motion_bbox_encoder_params' in locals() else 0),
+            ("Text Embeddings", category_embedder_params if 'category_embedder_params' in locals() else 0),
+            ("Semantic Embeddings", (semantic_bbox_embedder_params if 'semantic_bbox_embedder_params' in locals() else 0) + 
+                                    (semantic_text_embedder_params if 'semantic_text_embedder_params' in locals() else 0)),
+            ("Output Processing", (output_encoder_params if 'output_encoder_params' in locals() else 0) + 
+                                 (output_layer_params if 'output_layer_params' in locals() else 0)),
+        ]
+        
+        for comp_name, comp_params in components:
+            if comp_params > 0:
+                percentage = (comp_params / total_params) * 100
+                logger.info(f"  {comp_name}: {comp_params:,} ({percentage:.1f}%)")
+
+        logger.info("=== END MODEL ARCHITECTURE DETAILS ===\n")
             
     except Exception as e:
         logger.error(f"Error loading model: {e}")
@@ -1130,3 +1343,16 @@ if __name__ == "__main__":
 #
 # 6. Using the new command line arguments to override config
 # python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --visualize --show_ori_arrows --use_first_frame_only 
+#
+# 7. Evaluation with Rerun visualization including arrows and semantic bounding boxes with categories
+# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --use_rerun --rerun_show_arrows --rerun_show_semantic_bboxes --num_vis_samples 10
+#
+# 8. Customized Rerun visualization settings with semantic object categories
+# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --use_rerun --rerun_arrow_length 0.3 --rerun_line_width 0.03 --pointcloud_downsample_factor 5
+#
+# 9. Evaluation with both Matplotlib and Rerun visualization showing semantic objects
+# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --visualize --visualize_bbox --use_rerun --rerun_show_arrows --rerun_show_semantic_bboxes 
+#
+# Note: Each semantic bounding box will now appear as an individual object in Rerun,
+#       named by its category (e.g., "food_object_0", "dining_table_1", "cutting_board_2") with category-specific colors
+#       Category names are cleaned for Rerun paths (spaces become underscores, special characters removed) 

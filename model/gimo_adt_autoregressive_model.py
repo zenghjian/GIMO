@@ -993,7 +993,8 @@ class GIMO_ADT_Autoregressive_Model(nn.Module):
         
         return projected_context
     
-    def forward(self, input_trajectory, point_cloud, bounding_box_corners=None, object_category_ids=None):
+    def forward(self, input_trajectory, point_cloud, bounding_box_corners=None, object_category_ids=None, 
+                semantic_bbox_info=None, semantic_bbox_mask=None, semantic_text_categories=None):
         """
         Forward pass with autoregressive trajectory prediction.
         
@@ -1002,6 +1003,9 @@ class GIMO_ADT_Autoregressive_Model(nn.Module):
             point_cloud: [batch_size, num_points, 3] - scene point cloud
             bounding_box_corners: [batch_size, input_length, 8, 3] (optional)
             object_category_ids: [batch_size] (optional)
+            semantic_bbox_info: [batch_size, max_bboxes, 12] - semantic bbox information for scene conditioning (optional)
+            semantic_bbox_mask: [batch_size, max_bboxes] - mask for semantic bbox (optional)
+            semantic_text_categories: List of category strings for semantic text conditioning (optional)
             
         Returns:
             Predicted full trajectory [batch_size, sequence_length, 6]

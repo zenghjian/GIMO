@@ -14,13 +14,20 @@ import subprocess
 import sys
 from typing import Dict, List, Tuple, Optional, Union, Any
 
-# Check for availability of rerun visualization
+# Try to import rerun - if not available, disable functionality
 try:
     import rerun as rr
     HAS_RERUN = True
 except ImportError:
-    print("Warning: rerun module not available, some visualization features will be disabled.")
+    print("Warning: rerun-sdk not found. Rerun visualization will be disabled.")
     HAS_RERUN = False
+    rr = None
+
+# Import the unified string processing functions
+from .metrics_utils import clean_category_string
+
+# Import coordinate transformation utility
+from utils.metrics_utils import transform_coords_for_visualization
 
 def initialize_rerun(recording_name="gimo_adt_evaluation", spawn=True, output_dir=None) -> Tuple[bool, Optional[str]]:
     """
@@ -116,6 +123,295 @@ def extract_trajectory_specific_point_cloud(point_cloud, trajectory, radius=1.0,
     
     return point_cloud[near_points_indices]
 
+def convert_6d_rotation_to_direction(rotation_6d, arrow_length=0.3):
+    """
+    Convert 6D rotation representation to direction vectors for arrow visualization.
+    
+    Args:
+        rotation_6d: 6D rotation representation [6] (first two columns of rotation matrix)
+        arrow_length: Length of the direction arrow
+        
+    Returns:
+        direction_vector: [3] direction vector for the arrow
+    """
+    if rotation_6d is None or len(rotation_6d) < 6:
+        # Default forward direction
+        return np.array([arrow_length, 0.0, 0.0])
+    
+    try:
+        # Convert 6D rotation to rotation matrix
+        # 6D rotation: [a1, a2, a3, b1, b2, b3] where a and b are first two columns
+        a = rotation_6d[:3]
+        b = rotation_6d[3:6]
+        
+        # Normalize a
+        a = a / (np.linalg.norm(a) + 1e-8)
+        
+        # Make b orthogonal to a
+        b = b - np.dot(b, a) * a
+        b = b / (np.linalg.norm(b) + 1e-8)
+        
+        # Get the third column by cross product
+        c = np.cross(a, b)
+        
+        # Forward direction (use first column as forward)
+        forward_dir = a * arrow_length
+        
+        return forward_dir
+        
+    except Exception as e:
+        print(f"Error converting 6D rotation to direction: {e}")
+        # Return default forward direction
+        return np.array([arrow_length, 0.0, 0.0])
+
+def get_category_color(category):
+    """
+    Get a color for a specific object category.
+    
+    Args:
+        category: String category name (cleaned for Rerun paths)
+        
+    Returns:
+        List[float]: RGBA color values [r, g, b, a] in range [0, 1]
+    """
+    # Define a color mapping for common categories
+    category_colors = {
+        # Furniture
+        'chair': [0.8, 0.4, 0.2, 0.8],      # Brown
+        'table': [0.6, 0.3, 0.1, 0.8],     # Dark brown
+        'dining_table': [0.6, 0.3, 0.1, 0.8],  # Dark brown
+        'desk': [0.5, 0.3, 0.1, 0.8],      # Dark brown
+        'sofa': [0.2, 0.6, 0.8, 0.8],      # Blue
+        'bed': [0.7, 0.2, 0.7, 0.8],       # Purple
+        'cabinet': [0.4, 0.6, 0.2, 0.8],   # Green
+        'shelf': [0.3, 0.5, 0.3, 0.8],     # Dark green
+        'bookshelf': [0.3, 0.5, 0.3, 0.8], # Dark green
+        
+        # Electronics
+        'tv': [0.1, 0.1, 0.1, 0.8],        # Black
+        'monitor': [0.2, 0.2, 0.2, 0.8],   # Dark gray
+        'computer': [0.3, 0.3, 0.3, 0.8],  # Gray
+        'laptop': [0.4, 0.4, 0.4, 0.8],    # Light gray
+        
+        # Kitchen items
+        'refrigerator': [0.9, 0.9, 0.9, 0.8],  # White
+        'microwave': [0.8, 0.8, 0.8, 0.8],     # Light gray
+        'oven': [0.2, 0.2, 0.2, 0.8],          # Black
+        'cutting_board': [0.7, 0.5, 0.3, 0.8], # Wood brown
+        
+        # Food and kitchen tools
+        'food_object': [0.3, 1.0, 0.3, 0.8],   # Bright green
+        'food': [0.3, 1.0, 0.3, 0.8],          # Bright green
+        'fork': [0.7, 0.7, 0.7, 0.8],          # Silver
+        'spoon': [0.7, 0.7, 0.7, 0.8],         # Silver
+        'knife': [0.6, 0.6, 0.6, 0.8],         # Dark silver
+        
+        # Containers and bottles
+        'container': [0.3, 0.7, 0.9, 0.8],     # Light blue
+        'bottle': [0.1, 0.3, 0.6, 0.8],        # Dark blue
+        'can': [0.5, 0.5, 0.5, 0.8],           # Gray
+        'vase': [0.8, 0.6, 0.4, 0.8],          # Beige
+        'coaster': [0.6, 0.4, 0.2, 0.8],       # Brown
+        
+        # Plants and decorations
+        'plant': [0.2, 0.8, 0.2, 0.8],     # Green
+        'flower': [1.0, 0.6, 0.8, 0.8],    # Pink
+        
+        # Storage
+        'box': [0.7, 0.5, 0.3, 0.8],       # Cardboard brown
+        'bag': [0.6, 0.6, 0.6, 0.8],       # Gray
+        'basket': [0.8, 0.7, 0.4, 0.8],    # Wicker color
+        
+        # Lighting
+        'lamp': [1.0, 1.0, 0.6, 0.8],      # Light yellow
+        'light': [1.0, 1.0, 0.8, 0.8],     # Warm white
+        
+        # Other common objects
+        'door': [0.6, 0.4, 0.2, 0.8],      # Wood brown
+        'window': [0.8, 0.9, 1.0, 0.6],    # Light blue, transparent
+        'wall': [0.9, 0.9, 0.9, 0.4],      # Light gray, transparent
+        'floor': [0.7, 0.6, 0.5, 0.3],     # Floor color, transparent
+        
+        # Default/unknown
+        'unknown': [0.8, 0.8, 0.2, 0.7],   # Yellow (original default)
+    }
+    
+    # Normalize category name (lowercase, already cleaned)
+    normalized_category = category.lower()
+    
+    # Check for exact match first
+    if normalized_category in category_colors:
+        return category_colors[normalized_category]
+    
+    # Check for partial matches
+    for cat_key, color in category_colors.items():
+        if normalized_category in cat_key or cat_key in normalized_category:
+            return color
+    
+    # If no match found, generate a hash-based color for consistency
+    import hashlib
+    hash_value = int(hashlib.md5(category.encode()).hexdigest()[:8], 16)
+    
+    # Generate RGB values from hash
+    r = ((hash_value >> 16) & 0xFF) / 255.0
+    g = ((hash_value >> 8) & 0xFF) / 255.0
+    b = (hash_value & 0xFF) / 255.0
+    
+    # Ensure minimum brightness and alpha
+    r = max(0.3, r)
+    g = max(0.3, g) 
+    b = max(0.3, b)
+    
+    return [r, g, b, 0.8]
+
+def transform_coords_for_visualization_numpy(coords_3d):
+    """
+    Applies (x, y, z) -> (x, -z, y) transformation to a 3D numpy array for visualization.
+    
+    Args:
+        coords_3d: Input numpy array with last dimension of 3 (x, y, z coordinates)
+        
+    Returns:
+        numpy.ndarray: Transformed array with (x, -z, y) coordinates
+    """
+    if coords_3d is None or coords_3d.size == 0:
+        return coords_3d
+    
+    # Ensure it's a numpy array
+    if not isinstance(coords_3d, np.ndarray):
+        coords_3d = np.array(coords_3d)
+
+    if coords_3d.shape[-1] != 3:
+        return coords_3d
+
+    x = coords_3d[..., 0]
+    y = coords_3d[..., 1]
+    z = coords_3d[..., 2]
+    
+    transformed_coords = np.stack((x, -z, y), axis=-1)
+    return transformed_coords
+
+def create_semantic_bbox_edges(bbox_info):
+    """
+    Create edges for semantic bounding boxes from bbox info.
+    
+    Args:
+        bbox_info: [N, 12] array where each row contains bbox info:
+                  [center_x, center_y, center_z, size_x, size_y, size_z, 
+                   rot_6d_0, rot_6d_1, rot_6d_2, rot_6d_3, rot_6d_4, rot_6d_5]
+                  The last 6 dimensions represent 6D rotation (first two columns of rotation matrix)
+        
+    Returns:
+        List of bbox edges for visualization (after coordinate transformation)
+    """
+    if bbox_info is None or bbox_info.shape[0] == 0:
+        return []
+    
+    all_edges = []
+    
+    for i in range(bbox_info.shape[0]):
+        # Extract center and size from the first 6 dimensions
+        center = bbox_info[i, :3]  # [center_x, center_y, center_z]
+        size = bbox_info[i, 3:6]   # [size_x, size_y, size_z]
+        
+        # Extract rotation information if available (6D rotation representation)
+        if bbox_info.shape[1] >= 12:
+            rotation_6d = bbox_info[i, 6:12]  # [rot_6d_0, rot_6d_1, rot_6d_2, rot_6d_3, rot_6d_4, rot_6d_5]
+            
+            # Convert 6D rotation to rotation matrix
+            rotation_matrix = convert_6d_to_rotation_matrix(rotation_6d)
+        else:
+            # If no rotation info, use identity matrix (no rotation)
+            rotation_matrix = np.eye(3)
+        
+        # Create 8 corners of the bounding box in object-local coordinate system
+        # (relative to the bbox center, before rotation)
+        half_size = size / 2
+        local_corners = np.array([
+            [-half_size[0], -half_size[1], -half_size[2]],  # bottom back left
+            [+half_size[0], -half_size[1], -half_size[2]],  # bottom back right
+            [+half_size[0], +half_size[1], -half_size[2]],  # bottom front right
+            [-half_size[0], +half_size[1], -half_size[2]],  # bottom front left
+            [-half_size[0], -half_size[1], +half_size[2]],  # top back left
+            [+half_size[0], -half_size[1], +half_size[2]],  # top back right
+            [+half_size[0], +half_size[1], +half_size[2]],  # top front right
+            [-half_size[0], +half_size[1], +half_size[2]],  # top front left
+        ])
+        
+        # Apply rotation to each corner
+        rotated_corners = np.zeros_like(local_corners)
+        for j in range(8):
+            rotated_corners[j] = rotation_matrix @ local_corners[j]
+        
+        # Translate to world position (add center)
+        world_corners = rotated_corners + center
+        
+        # Apply coordinate transformation for visualization
+        corners_transformed = transform_coords_for_visualization_numpy(world_corners)
+        
+        # Define the 12 edges of the box
+        edge_indices = [
+            # Bottom face edges
+            [0, 1], [1, 2], [2, 3], [3, 0],
+            # Top face edges  
+            [4, 5], [5, 6], [6, 7], [7, 4],
+            # Vertical edges
+            [0, 4], [1, 5], [2, 6], [3, 7]
+        ]
+        
+        bbox_edges = []
+        for start_idx, end_idx in edge_indices:
+            edge = [corners_transformed[start_idx].tolist(), corners_transformed[end_idx].tolist()]
+            bbox_edges.append(edge)
+        
+        all_edges.extend(bbox_edges)
+    
+    return all_edges
+
+def convert_6d_to_rotation_matrix(rotation_6d):
+    """
+    Convert 6D rotation representation to 3x3 rotation matrix.
+    
+    Args:
+        rotation_6d: [6] array representing the first two columns of a rotation matrix
+                    [a1, a2, a3, b1, b2, b3] where a and b are the first two columns
+        
+    Returns:
+        np.ndarray: [3, 3] rotation matrix
+    """
+    if rotation_6d is None or len(rotation_6d) < 6:
+        return np.eye(3)
+    
+    try:
+        # Extract first two columns
+        a = rotation_6d[:3]  # First column
+        b = rotation_6d[3:6]  # Second column
+        
+        # Normalize first column
+        a = a / (np.linalg.norm(a) + 1e-8)
+        
+        # Make second column orthogonal to first column using Gram-Schmidt
+        b = b - np.dot(b, a) * a
+        b = b / (np.linalg.norm(b) + 1e-8)
+        
+        # Compute third column as cross product
+        c = np.cross(a, b)
+        c = c / (np.linalg.norm(c) + 1e-8)  # Normalize for safety
+        
+        # Construct rotation matrix
+        rotation_matrix = np.column_stack((a, b, c))
+        
+        # Ensure it's a proper rotation matrix (det = 1)
+        if np.linalg.det(rotation_matrix) < 0:
+            # If determinant is negative, flip the third column
+            rotation_matrix[:, 2] = -rotation_matrix[:, 2]
+        
+        return rotation_matrix
+        
+    except Exception as e:
+        print(f"Error converting 6D rotation to matrix: {e}")
+        return np.eye(3)  # Return identity matrix as fallback
+
 def visualize_trajectory_rerun(
     past_positions, 
     future_positions_gt=None, 
@@ -126,32 +422,44 @@ def visualize_trajectory_rerun(
     past_orientations=None,
     future_orientations_gt=None,
     future_orientations_pred=None,
+    semantic_bbox_info=None,
+    semantic_bbox_mask=None,
+    semantic_bbox_categories=None,
     object_name="object",
     sequence_name="sequence",
     segment_idx=None,
     arrow_length=0.3,
     line_width=0.02,
-    point_size=0.03
+    point_size=0.03,
+    show_arrows=True,
+    show_semantic_bboxes=True
 ):
     """
     Visualize trajectory data using Rerun.
     
     Args:
-        past_positions: Past trajectory positions [history_length, 3]
-        future_positions_gt: Ground truth future positions [future_length, 3]
-        future_positions_pred: Predicted future positions [future_length, 3]
+        past_positions: Past trajectory positions [history_length, 3] (already transformed for visualization)
+        future_positions_gt: Ground truth future positions [future_length, 3] (already transformed for visualization)
+        future_positions_pred: Predicted future positions [future_length, 3] (already transformed for visualization)
         past_mask: Optional mask for past positions [history_length]
         future_mask_gt: Optional mask for ground truth future positions [future_length]
-        point_cloud: Optional point cloud data [N, 3] or [N, 4]
-        past_orientations: Past orientations [history_length, 3] (roll, pitch, yaw)
-        future_orientations_gt: Ground truth future orientations [future_length, 3]
-        future_orientations_pred: Predicted future orientations [future_length, 3]
+        point_cloud: Optional point cloud data [N, 3] or [N, 4] (already transformed for visualization)
+        past_orientations: Past orientations [history_length, 6] (6D rotation representation, not transformed)
+        future_orientations_gt: Ground truth future orientations [future_length, 6] (6D rotation representation, not transformed)
+        future_orientations_pred: Predicted future orientations [future_length, 6] (6D rotation representation, not transformed)
+        semantic_bbox_info: Semantic bounding box information [N, 12] in original coordinates
+                           Format: [center_x, center_y, center_z, size_x, size_y, size_z, ...]
+                           Will be transformed internally after constructing bbox geometry
+        semantic_bbox_mask: Semantic bounding box mask [N]
+        semantic_bbox_categories: List of category names for each semantic bbox [N]
         object_name: Name/ID of the object, used to create a unique path in Rerun.
         sequence_name: Name of the sequence, used in the Rerun path.
         segment_idx: Optional segment index, used in the Rerun path.
         arrow_length: Length of orientation arrows.
         line_width: Width of trajectory lines.
         point_size: Size of trajectory points.
+        show_arrows: Whether to show orientation arrows.
+        show_semantic_bboxes: Whether to show semantic bounding boxes.
     """
     if not HAS_RERUN:
         return False
@@ -161,6 +469,7 @@ def visualize_trajectory_rerun(
         vis_path += f"/segment_{segment_idx}"
     vis_path += f"/{object_name}"
     
+    # Convert all inputs to numpy arrays
     if isinstance(past_positions, torch.Tensor):
         past_positions = past_positions.detach().cpu().numpy()
     if isinstance(future_positions_gt, torch.Tensor):
@@ -173,10 +482,6 @@ def visualize_trajectory_rerun(
         future_mask_gt = future_mask_gt.detach().cpu().numpy()
     if isinstance(point_cloud, torch.Tensor):
         point_cloud = point_cloud.detach().cpu().numpy()
-    elif point_cloud is not None:
-        pass
-    else:
-        pass
 
     if isinstance(past_orientations, torch.Tensor):
         past_orientations = past_orientations.detach().cpu().numpy()
@@ -185,6 +490,12 @@ def visualize_trajectory_rerun(
     if isinstance(future_orientations_pred, torch.Tensor):
         future_orientations_pred = future_orientations_pred.detach().cpu().numpy()
     
+    # Convert bbox corners to numpy
+    if isinstance(semantic_bbox_info, torch.Tensor):
+        semantic_bbox_info = semantic_bbox_info.detach().cpu().numpy()
+    if isinstance(semantic_bbox_mask, torch.Tensor):
+        semantic_bbox_mask = semantic_bbox_mask.detach().cpu().numpy()
+
     if past_mask is not None:
         valid_past_indices = np.where(past_mask > 0.5)[0]
         if len(valid_past_indices) > 0:
@@ -192,7 +503,7 @@ def visualize_trajectory_rerun(
             past_orientations_valid = past_orientations[valid_past_indices] if past_orientations is not None else None
         else:
             past_positions_valid = np.empty((0, 3))
-            past_orientations_valid = np.empty((0, 3)) if past_orientations is not None else None
+            past_orientations_valid = np.empty((0, 6)) if past_orientations is not None else None
     else:
         past_positions_valid = past_positions
         past_orientations_valid = past_orientations
@@ -204,7 +515,7 @@ def visualize_trajectory_rerun(
             future_orientations_gt_valid = future_orientations_gt[valid_future_gt_indices] if future_orientations_gt is not None else None
         else:
             future_positions_gt_valid = np.empty((0, 3))
-            future_orientations_gt_valid = np.empty((0, 3)) if future_orientations_gt is not None else None
+            future_orientations_gt_valid = np.empty((0, 6)) if future_orientations_gt is not None else None
     else:
         future_positions_gt_valid = future_positions_gt
         future_orientations_gt_valid = future_orientations_gt
@@ -229,6 +540,61 @@ def visualize_trajectory_rerun(
             except Exception as e:
                 print(f"Error logging point cloud: {e}")
         
+        # Log semantic bounding boxes once (they are static scene elements)
+        if show_semantic_bboxes and semantic_bbox_info is not None:
+            # Filter valid semantic bboxes using the mask
+            if semantic_bbox_mask is not None:
+                valid_semantic_indices = np.where(semantic_bbox_mask > 0.5)[0]
+                if len(valid_semantic_indices) > 0:
+                    valid_semantic_bbox_info = semantic_bbox_info[valid_semantic_indices]
+                    # Also filter categories if available
+                    if semantic_bbox_categories is not None:
+                        valid_semantic_categories = [semantic_bbox_categories[i] for i in valid_semantic_indices]
+                    else:
+                        valid_semantic_categories = ["unknown"] * len(valid_semantic_indices)
+                else:
+                    valid_semantic_bbox_info = None
+                    valid_semantic_categories = []
+            else:
+                valid_semantic_bbox_info = semantic_bbox_info
+                valid_semantic_categories = semantic_bbox_categories if semantic_bbox_categories is not None else ["unknown"] * len(semantic_bbox_info)
+            
+            if valid_semantic_bbox_info is not None and valid_semantic_bbox_info.shape[0] > 0:
+                rr.set_time_sequence("animation_step", current_animation_step)
+                
+                print(f"Creating {valid_semantic_bbox_info.shape[0]} semantic bbox objects:")
+                
+                # Create individual objects for each semantic bbox
+                for bbox_idx in range(valid_semantic_bbox_info.shape[0]):
+                    bbox_info_single = valid_semantic_bbox_info[bbox_idx:bbox_idx+1]  # [1, 12]
+                    
+                    # Get category for this bbox
+                    if semantic_bbox_categories and bbox_idx < len(semantic_bbox_categories):
+                        category_raw = semantic_bbox_categories[bbox_idx]
+                        # Use the unified string processing function
+                        bbox_category = clean_category_string(category_raw, default_fallback="unknown")
+                    else:
+                        bbox_category = "unknown"
+                    
+                    # Create edges for this single bbox
+                    single_bbox_edges = create_semantic_bbox_edges(bbox_info_single)
+                    
+                    if single_bbox_edges:
+                        # Create unique object name using cleaned category and index
+                        bbox_object_name = f"{bbox_category}_{bbox_idx}"
+                        
+                        # Choose color based on category
+                        bbox_color = get_category_color(bbox_category)
+                        
+                        print(f"  - {bbox_object_name} (color: {[f'{c:.2f}' for c in bbox_color[:3]]}, {len(single_bbox_edges)} edges)")
+                        
+                        rr.log(f"{vis_path}/semantic_objects/{bbox_object_name}",
+                               rr.LineStrips3D(
+                                   single_bbox_edges,
+                                   colors=[bbox_color] * len(single_bbox_edges),
+                                   radii=line_width * 0.8
+                               ))
+        
         # current_animation_step is still 0 here. 
         # Trajectory animations will start their loops using this current_animation_step = 0,
         # and then increment it inside their respective loops.
@@ -251,6 +617,21 @@ def visualize_trajectory_rerun(
                            colors=[0.3, 0.3, 1, 0.5], 
                            radii=point_size
                        ))
+                
+                # Log orientation arrows for past trajectory
+                if show_arrows and past_orientations_valid is not None and t < past_orientations_valid.shape[0]:
+                    current_position = past_positions_valid[t]
+                    current_orientation = past_orientations_valid[t]
+                    direction_vector = convert_6d_rotation_to_direction(current_orientation, arrow_length)
+                    arrow_end = current_position + direction_vector
+                    
+                    rr.log(f"{vis_path}/arrows/past_arrow_{t}",
+                           rr.Arrows3D(
+                               origins=[current_position],
+                               vectors=[direction_vector],
+                               colors=[0.3, 0.3, 1, 0.8]  # Blue arrows
+                           ))
+                
                 current_animation_step += 1
         
         # Define connection point from past trajectory
@@ -305,6 +686,20 @@ def visualize_trajectory_rerun(
                                colors=[0.3, 1, 0.3, 0.5], # Solid Green
                                radii=point_size
                            ))
+                
+                # Log orientation arrows for GT future trajectory
+                if show_arrows and future_orientations_gt_valid is not None and t < future_orientations_gt_valid.shape[0]:
+                    current_position = future_positions_gt_valid[t]
+                    current_orientation = future_orientations_gt_valid[t]
+                    direction_vector = convert_6d_rotation_to_direction(current_orientation, arrow_length)
+                    
+                    rr.log(f"{vis_path}/arrows/gt_arrow_{t}",
+                           rr.Arrows3D(
+                               origins=[current_position],
+                               vectors=[direction_vector],
+                               colors=[0.3, 1, 0.3, 0.8]  # Green arrows
+                           ))
+                
                 current_animation_step += 1
         
         # --- Animate Future Predicted Trajectory ---
@@ -380,6 +775,20 @@ def visualize_trajectory_rerun(
                                colors=[1, 0.3, 0.3, 0.5], # Solid Red
                                radii=point_size
                            ))
+                
+                # Log orientation arrows for predicted future trajectory
+                if show_arrows and future_orientations_pred_valid is not None and t < future_orientations_pred_valid.shape[0]:
+                    current_position = future_positions_pred_valid[t]
+                    current_orientation = future_orientations_pred_valid[t]
+                    direction_vector = convert_6d_rotation_to_direction(current_orientation, arrow_length)
+                    
+                    rr.log(f"{vis_path}/arrows/pred_arrow_{t}",
+                           rr.Arrows3D(
+                               origins=[current_position],
+                               vectors=[direction_vector],
+                               colors=[1, 0.3, 0.3, 0.8]  # Red arrows
+                           ))
+                
                 current_animation_step += 1
             
     except Exception as e:

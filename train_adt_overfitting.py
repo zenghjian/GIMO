@@ -422,6 +422,19 @@ def main():
     # --- Configuration ---
     print("Loading configuration...")
     config = ADTObjectMotionConfig().get_configs()
+    
+    # --- Add timestamp to save_path ---
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    original_save_path = config.save_path
+    # Get the parent directory and folder name
+    parent_dir = os.path.dirname(original_save_path)
+    folder_name = os.path.basename(original_save_path)
+    # Create new path with timestamp prefix for overfitting
+    timestamped_folder_name = f"{timestamp}_overfit_{folder_name}"
+    config.save_path = os.path.join(parent_dir, timestamped_folder_name)
+    print(f"Original save path: {original_save_path}")
+    print(f"Timestamped overfitting save path: {config.save_path}")
+    
     print("Configuration loaded:")
     print(config)
 
@@ -445,7 +458,8 @@ def main():
         try:
             # Extract the last part of save_path as the comment
             save_path_comment = os.path.basename(os.path.normpath(config.save_path))
-            run_name = f"GIMO_ADT_{time.strftime('%Y%m%d_%H%M%S')}_overfit_{save_path_comment}"
+            # Use the same timestamp that was used for save_path
+            run_name = f"GIMO_ADT_{timestamp}_overfit_{save_path_comment}"
             wandb.init(
                 project=config.wandb_project,
                 config=vars(config),

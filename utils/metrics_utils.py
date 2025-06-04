@@ -99,18 +99,351 @@ def convert_6d_to_euler_fallback(r6d_rotations):
     return np.array(euler_angles)
 
 
-def extract_orientations_from_loader(dataloader, max_samples=None, position_dim=3):
+def extract_trajectory_orientation_changes_from_loader(dataloader, max_samples=None, position_dim=3):
     """
-    Extract all orientation data from a dataloader.
+    Extract trajectory-level orientation change statistics from a dataloader.
     
     Args:
         dataloader: PyTorch DataLoader containing trajectory data
-        max_samples: Maximum number of samples to process (None for all)
+        max_samples: Maximum number of trajectories to process (None for all)
         position_dim: Number of position dimensions (default: 3)
         
     Returns:
-        numpy.ndarray: Array of Euler angles [N, 3] in radians
+        dict: Dictionary containing trajectory-level orientation change statistics
     """
+    trajectory_stats = {
+        'angular_velocities': [],      # Per-trajectory angular velocity statistics [N_traj, 3, stats]
+        'total_rotations': [],         # Total rotation change per trajectory [N_traj, 3]
+        'rotation_variances': [],      # Rotation variance per trajectory [N_traj, 3] 
+        'max_angular_speeds': [],      # Maximum angular speed per trajectory [N_traj, 3]
+        'trajectory_lengths': [],      # Valid length of each trajectory [N_traj]
+    }
+    sample_count = 0
+    
+    print(f"Extracting trajectory orientation changes from dataloader with {len(dataloader)} batches...")
+    
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc="Extracting trajectory orientation changes")):
+        try:
+            # Get full poses from batch
+            full_poses = batch['full_poses']  # [B, seq_len, 9]
+            attention_mask = batch.get('full_attention_mask', None)  # [B, seq_len]
+            
+            batch_size, seq_len, total_dim = full_poses.shape
+            rotation_dim = total_dim - position_dim
+            
+            # Extract rotation components (6D representation)
+            rotations = full_poses[:, :, position_dim:position_dim + rotation_dim]  # [B, seq_len, 6]
+            
+            # Process each trajectory in the batch
+            for i in range(batch_size):
+                trajectory_rotations = rotations[i]  # [seq_len, 6]
+                
+                # Apply attention mask to get valid frames
+                if attention_mask is not None:
+                    mask = attention_mask[i]  # [seq_len]
+                    valid_indices = torch.where(mask > 0)[0]
+                    if len(valid_indices) < 2:  # Need at least 2 frames to compute changes
+                        continue
+                    trajectory_rotations = trajectory_rotations[valid_indices]  # [valid_len, 6]
+                
+                valid_length = trajectory_rotations.shape[0]
+                if valid_length < 2:
+                    continue
+                
+                # Convert 6D rotations to Euler angles
+                if HAS_GEOMETRY_UTILS:
+                    euler_angles = convert_rotation_to_euler(trajectory_rotations)  # [valid_len, 3]
+                else:
+                    euler_angles = convert_6d_to_euler_fallback(trajectory_rotations)  # [valid_len, 3]
+                
+                if euler_angles is None or len(euler_angles) < 2:
+                    continue
+                
+                # Convert to torch tensor if needed
+                if isinstance(euler_angles, np.ndarray):
+                    euler_angles = torch.from_numpy(euler_angles).float()
+                
+                # Calculate frame-to-frame angular changes
+                angular_diffs = euler_angles[1:] - euler_angles[:-1]  # [valid_len-1, 3]
+                
+                # Handle angle wrapping (for angles around ±π)
+                angular_diffs = torch.remainder(angular_diffs + np.pi, 2*np.pi) - np.pi
+                
+                # Calculate trajectory-level statistics
+                # 1. Angular velocity statistics (mean, std, max of frame-to-frame changes)
+                angular_vel_mean = torch.mean(torch.abs(angular_diffs), dim=0)  # [3]
+                angular_vel_std = torch.std(torch.abs(angular_diffs), dim=0)   # [3]
+                angular_vel_max = torch.max(torch.abs(angular_diffs), dim=0)[0]  # [3]
+                
+                # Stack statistics: [3, 3] where second dim is [mean, std, max]
+                angular_vel_stats = torch.stack([angular_vel_mean, angular_vel_std, angular_vel_max], dim=1)
+                
+                # 2. Total rotation change (total absolute change across trajectory)
+                total_rotation = torch.sum(torch.abs(angular_diffs), dim=0)  # [3]
+                
+                # 3. Rotation variance (variance of angles across the trajectory)
+                rotation_variance = torch.var(euler_angles, dim=0)  # [3]
+                
+                # 4. Maximum angular speed (max of absolute angular velocities)
+                max_angular_speed = torch.max(torch.abs(angular_diffs), dim=0)[0]  # [3]
+                
+                # Store trajectory-level statistics
+                trajectory_stats['angular_velocities'].append(angular_vel_stats.numpy())
+                trajectory_stats['total_rotations'].append(total_rotation.numpy())
+                trajectory_stats['rotation_variances'].append(rotation_variance.numpy())
+                trajectory_stats['max_angular_speeds'].append(max_angular_speed.numpy())
+                trajectory_stats['trajectory_lengths'].append(valid_length)
+                
+                sample_count += 1
+                if max_samples is not None and sample_count >= max_samples:
+                    break
+            
+            if max_samples is not None and sample_count >= max_samples:
+                break
+                
+        except Exception as e:
+            print(f"Error processing batch {batch_idx}: {e}")
+            continue
+    
+    # Convert lists to numpy arrays for easier analysis
+    for key in ['angular_velocities', 'total_rotations', 'rotation_variances', 'max_angular_speeds']:
+        if trajectory_stats[key]:
+            trajectory_stats[key] = np.array(trajectory_stats[key])
+    
+    print(f"Extracted orientation change statistics for {sample_count} trajectories")
+    return trajectory_stats
+
+
+def plot_trajectory_orientation_distribution(train_loader, val_loader, output_path=None, max_samples_per_loader=1000, wandb_run=None):
+    """
+    Visualize and compare trajectory-level orientation change distributions between training and validation sets.
+    
+    Args:
+        train_loader: Training data loader
+        val_loader: Validation data loader
+        output_path: Path to save the plot (optional)
+        max_samples_per_loader: Maximum trajectories to extract from each loader
+        wandb_run: WandB run object for logging (optional)
+        
+    Returns:
+        dict: Statistics about the trajectory-level orientation change distributions
+    """
+    print("=== Analyzing Trajectory-Level Orientation Change Distributions ===")
+    
+    # Extract trajectory orientation change statistics from both loaders
+    print("Extracting training trajectory orientation changes...")
+    train_stats = extract_trajectory_orientation_changes_from_loader(train_loader, max_samples=max_samples_per_loader)
+    
+    print("Extracting validation trajectory orientation changes...")
+    val_stats = extract_trajectory_orientation_changes_from_loader(val_loader, max_samples=max_samples_per_loader)
+    
+    if (len(train_stats['angular_velocities']) == 0 or len(val_stats['angular_velocities']) == 0):
+        print("Error: No valid trajectory orientation changes found in one or both datasets!")
+        return {}
+    
+    # Convert from radians to degrees for better interpretability
+    angle_names = ['Roll', 'Pitch', 'Yaw']
+    stats_names = ['Mean Angular Velocity', 'Std Angular Velocity', 'Max Angular Velocity']
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(3, 4, figsize=(20, 15))
+    fig.suptitle('Trajectory-Level Orientation Change Distribution Comparison: Training vs Validation', fontsize=16)
+    
+    colors = ['blue', 'red']
+    labels = ['Training', 'Validation']
+    comparison_stats = {}
+    
+    # Plot 1: Angular Velocity Statistics (mean, std, max for each angle)
+    for angle_idx in range(3):
+        for stat_idx in range(3):
+            ax = axes[stat_idx, angle_idx]
+            
+            train_data = np.rad2deg(train_stats['angular_velocities'][:, angle_idx, stat_idx])
+            val_data = np.rad2deg(val_stats['angular_velocities'][:, angle_idx, stat_idx])
+            
+            # Plot histograms
+            bins = np.linspace(0, max(np.max(train_data), np.max(val_data)), 30)
+            ax.hist(train_data, bins=bins, alpha=0.7, color=colors[0], 
+                   label=f'{labels[0]} (n={len(train_data)})', density=True)
+            ax.hist(val_data, bins=bins, alpha=0.7, color=colors[1], 
+                   label=f'{labels[1]} (n={len(val_data)})', density=True)
+            
+            ax.set_xlabel(f'{stats_names[stat_idx]} (degrees/frame)')
+            ax.set_ylabel('Density')
+            ax.set_title(f'{angle_names[angle_idx]} - {stats_names[stat_idx]}')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Calculate comparison statistics
+            key = f'{angle_names[angle_idx].lower()}_{stats_names[stat_idx].lower().replace(" ", "_")}'
+            comparison_stats[f'{key}_train'] = {
+                'mean': np.mean(train_data),
+                'std': np.std(train_data),
+                'median': np.median(train_data),
+            }
+            comparison_stats[f'{key}_val'] = {
+                'mean': np.mean(val_data),
+                'std': np.std(val_data),
+                'median': np.median(val_data),
+            }
+    
+    # Plot 2: Total Rotation Change per Trajectory
+    ax_total = axes[0, 3]
+    train_total_rotation_norm = np.rad2deg(np.linalg.norm(train_stats['total_rotations'], axis=1))
+    val_total_rotation_norm = np.rad2deg(np.linalg.norm(val_stats['total_rotations'], axis=1))
+    
+    bins = np.linspace(0, max(np.max(train_total_rotation_norm), np.max(val_total_rotation_norm)), 30)
+    ax_total.hist(train_total_rotation_norm, bins=bins, alpha=0.7, color=colors[0], 
+                 label=f'{labels[0]}', density=True)
+    ax_total.hist(val_total_rotation_norm, bins=bins, alpha=0.7, color=colors[1], 
+                 label=f'{labels[1]}', density=True)
+    ax_total.set_xlabel('Total Rotation Change (degrees)')
+    ax_total.set_ylabel('Density')
+    ax_total.set_title('Total Rotation Change per Trajectory')
+    ax_total.legend()
+    ax_total.grid(True, alpha=0.3)
+    
+    # Plot 3: Rotation Variance per Trajectory
+    ax_var = axes[1, 3]
+    train_rotation_var_norm = np.rad2deg(np.sqrt(np.mean(train_stats['rotation_variances'], axis=1)))
+    val_rotation_var_norm = np.rad2deg(np.sqrt(np.mean(val_stats['rotation_variances'], axis=1)))
+    
+    bins = np.linspace(0, max(np.max(train_rotation_var_norm), np.max(val_rotation_var_norm)), 30)
+    ax_var.hist(train_rotation_var_norm, bins=bins, alpha=0.7, color=colors[0], 
+               label=f'{labels[0]}', density=True)
+    ax_var.hist(val_rotation_var_norm, bins=bins, alpha=0.7, color=colors[1], 
+               label=f'{labels[1]}', density=True)
+    ax_var.set_xlabel('RMS Rotation Variance (degrees)')
+    ax_var.set_ylabel('Density')
+    ax_var.set_title('Rotation Variance per Trajectory')
+    ax_var.legend()
+    ax_var.grid(True, alpha=0.3)
+    
+    # Plot 4: Trajectory Length Distribution
+    ax_len = axes[2, 3]
+    ax_len.hist(train_stats['trajectory_lengths'], bins=30, alpha=0.7, color=colors[0], 
+               label=f'{labels[0]}', density=True)
+    ax_len.hist(val_stats['trajectory_lengths'], bins=30, alpha=0.7, color=colors[1], 
+               label=f'{labels[1]}', density=True)
+    ax_len.set_xlabel('Trajectory Length (frames)')
+    ax_len.set_ylabel('Density')
+    ax_len.set_title('Trajectory Length Distribution')
+    ax_len.legend()
+    ax_len.grid(True, alpha=0.3)
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    
+    # Save plot if path provided
+    if output_path:
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Trajectory orientation change distribution plot saved to: {output_path}")
+    
+    plt.show()
+    
+    # Print summary statistics and detect potential issues
+    print("\n=== Trajectory-Level Orientation Change Statistics Summary ===")
+    
+    issues_detected = []
+    
+    # Check angular velocity differences
+    for angle_idx, angle_name in enumerate(['roll', 'pitch', 'yaw']):
+        train_mean_vel = np.mean(train_stats['angular_velocities'][:, angle_idx, 0])
+        val_mean_vel = np.mean(val_stats['angular_velocities'][:, angle_idx, 0])
+        mean_vel_diff = np.abs(np.rad2deg(train_mean_vel - val_mean_vel))
+        
+        train_max_vel = np.mean(train_stats['angular_velocities'][:, angle_idx, 2])
+        val_max_vel = np.mean(val_stats['angular_velocities'][:, angle_idx, 2])
+        max_vel_diff = np.abs(np.rad2deg(train_max_vel - val_max_vel))
+        
+        print(f"\n{angle_name.upper()} Angular Velocity:")
+        print(f"  Training   - Mean: {np.rad2deg(train_mean_vel):.2f}°/frame, Max: {np.rad2deg(train_max_vel):.2f}°/frame")
+        print(f"  Validation - Mean: {np.rad2deg(val_mean_vel):.2f}°/frame, Max: {np.rad2deg(val_max_vel):.2f}°/frame")
+        print(f"  Difference - Mean: {mean_vel_diff:.2f}°/frame, Max: {max_vel_diff:.2f}°/frame")
+        
+        # Detect issues
+        if mean_vel_diff > 5.0:  # More than 5 degrees/frame difference
+            issues_detected.append(f"{angle_name.upper()}: Large mean angular velocity difference ({mean_vel_diff:.1f}°/frame)")
+        if max_vel_diff > 10.0:  # More than 10 degrees/frame difference
+            issues_detected.append(f"{angle_name.upper()}: Large max angular velocity difference ({max_vel_diff:.1f}°/frame)")
+    
+    # Check total rotation differences
+    train_total_mean = np.mean(train_total_rotation_norm)
+    val_total_mean = np.mean(val_total_rotation_norm)
+    total_diff = np.abs(train_total_mean - val_total_mean)
+    
+    print(f"\nTotal Rotation per Trajectory:")
+    print(f"  Training   - Mean: {train_total_mean:.2f}°")
+    print(f"  Validation - Mean: {val_total_mean:.2f}°")
+    print(f"  Difference: {total_diff:.2f}°")
+    
+    if total_diff > 20.0:  # More than 20 degrees difference
+        issues_detected.append(f"TOTAL_ROTATION: Large difference in total rotation per trajectory ({total_diff:.1f}°)")
+    
+    # Check trajectory length differences
+    train_len_mean = np.mean(train_stats['trajectory_lengths'])
+    val_len_mean = np.mean(val_stats['trajectory_lengths'])
+    len_diff = np.abs(train_len_mean - val_len_mean)
+    
+    print(f"\nTrajectory Lengths:")
+    print(f"  Training   - Mean: {train_len_mean:.1f} frames")
+    print(f"  Validation - Mean: {val_len_mean:.1f} frames")
+    print(f"  Difference: {len_diff:.1f} frames")
+    
+    if len_diff > 5.0:  # More than 5 frames difference
+        issues_detected.append(f"TRAJECTORY_LENGTH: Large difference in average trajectory length ({len_diff:.1f} frames)")
+    
+    # Report issues
+    if issues_detected:
+        print(f"\n⚠️  Potential Issues Detected:")
+        for issue in issues_detected:
+            print(f"  - {issue}")
+        print(f"\nThese differences might contribute to orientation loss issues.")
+        print(f"Consider:")
+        print(f"  - Data augmentation for orientation changes")
+        print(f"  - Adjusting lambda_ori weight based on these differences")
+        print(f"  - Trajectory-specific normalization")
+    else:
+        print(f"\n✅ No major distribution differences detected.")
+    
+    # Store additional statistics
+    comparison_stats.update({
+        'total_rotation_train_mean': train_total_mean,
+        'total_rotation_val_mean': val_total_mean,
+        'trajectory_length_train_mean': train_len_mean,
+        'trajectory_length_val_mean': val_len_mean,
+        'issues_detected': issues_detected,
+    })
+    
+    return comparison_stats
+
+
+# Update the existing function name to maintain backward compatibility
+def plot_orientation_distribution(train_loader, val_loader, num_bins=36, output_path=None, max_samples_per_loader=1000, wandb_run=None):
+    """
+    Legacy function name - now calls the trajectory-level analysis.
+    """
+    print("🔄 Redirecting to trajectory-level orientation change analysis...")
+    return plot_trajectory_orientation_distribution(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        output_path=output_path,
+        max_samples_per_loader=max_samples_per_loader,
+        wandb_run=wandb_run
+    )
+
+
+# Keep the old function for compatibility, but add a deprecation warning
+def extract_orientations_from_loader(dataloader, max_samples=None, position_dim=3):
+    """
+    Legacy function - extract all orientation data from a dataloader.
+    
+    ⚠️ DEPRECATED: This function analyzes individual orientation points rather than trajectory-level changes.
+    Use extract_trajectory_orientation_changes_from_loader() for more meaningful analysis.
+    """
+    print("⚠️ WARNING: extract_orientations_from_loader is deprecated.")
+    print("   It analyzes individual points rather than trajectory-level changes.")
+    print("   Consider using extract_trajectory_orientation_changes_from_loader() instead.")
+    
     all_orientations = []
     sample_count = 0
     
@@ -168,126 +501,6 @@ def extract_orientations_from_loader(dataloader, max_samples=None, position_dim=
     else:
         print("No valid orientations found!")
         return np.array([])
-
-
-def plot_orientation_distribution(train_loader, val_loader, num_bins=36, output_path=None, max_samples_per_loader=1000, wandb_run=None):
-    """
-    Visualize and compare orientation angle distributions between training and validation sets.
-    
-    Args:
-        train_loader: Training data loader
-        val_loader: Validation data loader
-        num_bins: Number of bins for histogram (default: 36, i.e., 10-degree bins for 360 degrees)
-        output_path: Path to save the plot (optional)
-        max_samples_per_loader: Maximum samples to extract from each loader
-        wandb_run: WandB run object for logging (optional)
-        
-    Returns:
-        dict: Statistics about the distributions
-    """
-    print("=== Analyzing Orientation Distributions ===")
-    
-    # Extract orientations from both loaders
-    print("Extracting training orientations...")
-    train_orientations = extract_orientations_from_loader(train_loader, max_samples=max_samples_per_loader)
-    
-    print("Extracting validation orientations...")
-    val_orientations = extract_orientations_from_loader(val_loader, max_samples=max_samples_per_loader)
-    
-    if len(train_orientations) == 0 or len(val_orientations) == 0:
-        print("Error: No valid orientations found in one or both datasets!")
-        return {}
-    
-    # Convert from radians to degrees for better interpretability
-    train_orientations_deg = np.rad2deg(train_orientations)
-    val_orientations_deg = np.rad2deg(val_orientations)
-    
-    # Create figure with subplots for each angle component
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.suptitle('Orientation Distribution Comparison: Training vs Validation', fontsize=16)
-    
-    angle_names = ['Roll', 'Pitch', 'Yaw']
-    colors = ['blue', 'red']
-    labels = ['Training', 'Validation']
-    
-    stats = {}
-    
-    # Plot distribution for each angle component
-    for angle_idx in range(3):
-        # Top row: Individual histograms
-        ax_individual = axes[0, angle_idx]
-        
-        train_angles = train_orientations_deg[:, angle_idx]
-        val_angles = val_orientations_deg[:, angle_idx]
-        
-        # Calculate appropriate bins that cover both datasets
-        all_angles = np.concatenate([train_angles, val_angles])
-        bins = np.linspace(-180, 180, num_bins + 1)
-        
-        # Plot histograms with transparency
-        ax_individual.hist(train_angles, bins=bins, alpha=0.7, color=colors[0], 
-                          label=f'{labels[0]} (n={len(train_angles)})', density=True)
-        ax_individual.hist(val_angles, bins=bins, alpha=0.7, color=colors[1], 
-                          label=f'{labels[1]} (n={len(val_angles)})', density=True)
-        
-        ax_individual.set_xlabel(f'{angle_names[angle_idx]} Angle (degrees)')
-        ax_individual.set_ylabel('Density')
-        ax_individual.set_title(f'{angle_names[angle_idx]} Distribution')
-        ax_individual.legend()
-        ax_individual.grid(True, alpha=0.3)
-        
-        # Calculate statistics
-        stats[f'{angle_names[angle_idx].lower()}_train'] = {
-            'mean': np.mean(train_angles),
-            'std': np.std(train_angles),
-            'median': np.median(train_angles),
-            'min': np.min(train_angles),
-            'max': np.max(train_angles)
-        }
-        
-        stats[f'{angle_names[angle_idx].lower()}_val'] = {
-            'mean': np.mean(val_angles),
-            'std': np.std(val_angles),
-            'median': np.median(val_angles),
-            'min': np.min(val_angles),
-            'max': np.max(val_angles)
-        }
-        
-        # Bottom row: Box plots for direct comparison
-        ax_box = axes[1, angle_idx]
-        data_to_plot = [train_angles, val_angles]
-        box_plot = ax_box.boxplot(data_to_plot, labels=labels, patch_artist=True)
-        
-        # Color the boxes
-        for patch, color in zip(box_plot['boxes'], colors):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.7)
-        
-        ax_box.set_ylabel(f'{angle_names[angle_idx]} Angle (degrees)')
-        ax_box.set_title(f'{angle_names[angle_idx]} Box Plot Comparison')
-        ax_box.grid(True, alpha=0.3)
-    
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    
-    # Save plot if path provided
-    if output_path:
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-        print(f"Orientation distribution plot saved to: {output_path}")
-    
-    plt.show()
-    
-    # Print summary statistics
-    print("\n=== Distribution Statistics Summary ===")
-    for angle_idx, angle_name in enumerate(['roll', 'pitch', 'yaw']):
-        train_stats = stats[f'{angle_name}_train']
-        val_stats = stats[f'{angle_name}_val']
-        
-        print(f"\n{angle_name.upper()} Angle:")
-        print(f"  Training   - Mean: {train_stats['mean']:.2f}°, Std: {train_stats['std']:.2f}°")
-        print(f"  Validation - Mean: {val_stats['mean']:.2f}°, Std: {val_stats['std']:.2f}°")
-        print(f"  Difference - Mean: {abs(train_stats['mean'] - val_stats['mean']):.2f}°, Std: {abs(train_stats['std'] - val_stats['std']):.2f}°")
-    
-    return stats
 
 
 class GradientTracker:
@@ -643,8 +856,6 @@ def gimo_collate_fn(batch, dataset, num_sample_points):
             if isinstance(point_cloud, np.ndarray):
                 point_cloud = torch.from_numpy(point_cloud).float()
                 
-            if i == 0:  # Only print for first item to avoid log spam
-                print(f"Using trajectory-specific point cloud with {point_cloud.shape[0]} points")
         else:
             # Fallback to getting from dataset if not included in the item
             dataset_idx = item.get('dataset_idx', 0)
@@ -694,3 +905,74 @@ def gimo_collate_fn(batch, dataset, num_sample_points):
     collated_batch['point_cloud'] = batched_point_clouds
     
     return collated_batch
+
+
+def clean_category_string(category, default_fallback="object"):
+    """
+    Clean and normalize category strings for use in embeddings and visualizations.
+    
+    Args:
+        category: The input category, can be string, tuple, list, or None
+        default_fallback: Default string to use when category is invalid or empty
+        
+    Returns:
+        str: Cleaned category string
+    """
+    # Handle category extraction properly
+    if isinstance(category, (tuple, list)):
+        # Extract string from tuple/list if necessary
+        clean_cat = category[0] if len(category) > 0 else default_fallback
+    else:
+        clean_cat = category
+    
+    # Convert to string and validate
+    clean_cat = str(clean_cat) if clean_cat is not None else default_fallback
+    
+    # Clean the category string - remove/replace special characters
+    clean_cat = (clean_cat
+                 .replace(' ', '_')
+                 .replace('-', '_')
+                 .replace('(', '')
+                 .replace(')', '')
+                 .replace("'", '')
+                 .replace('"', '')
+                 .replace(',', '')
+                 .replace('[', '')
+                 .replace(']', '')
+                 .replace('{', '')
+                 .replace('}', ''))
+    
+    # Ensure it's not empty and handle special cases
+    if (not clean_cat or 
+        clean_cat.isspace() or 
+        clean_cat == '' or 
+        clean_cat == 'unknown' or 
+        clean_cat == '<unconditional>'):
+        clean_cat = default_fallback
+    
+    return clean_cat
+
+def process_category_list(categories, default_fallback="object"):
+    """
+    Process a list of categories, cleaning each one.
+    
+    Args:
+        categories: List of categories (can contain tuples, strings, etc.)
+        default_fallback: Default string to use for invalid categories
+        
+    Returns:
+        List[str]: List of cleaned category strings
+    """
+    if categories is None:
+        return []
+    
+    if not isinstance(categories, list):
+        # If it's a single category, wrap it in a list
+        categories = [categories]
+    
+    processed_categories = []
+    for cat in categories:
+        clean_cat = clean_category_string(cat, default_fallback)
+        processed_categories.append(clean_cat)
+    
+    return processed_categories

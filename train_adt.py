@@ -139,11 +139,17 @@ def validate(model, dataloader, device, config, epoch):
                     semantic_bbox_info = None
                     semantic_bbox_mask = None
 
+                # Get semantic text categories if semantic text embedding is enabled
+                if not getattr(config, 'no_semantic_text', False):
+                    semantic_text_categories = batch.get('scene_bbox_categories', None)
+                else:
+                    semantic_text_categories = None
+
             except KeyError as e: logger(f"Error: Missing key {e} in batch {batch_idx}. Skipping."); continue
             except Exception as e: logger(f"Error processing batch {batch_idx}: {e}. Skipping."); continue
 
             # 1. Forward pass with input trajectory, point cloud, bbox corners, and category strings
-            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask)
+            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask, semantic_text_categories)
 
             # 2. Compute loss
             total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
@@ -325,21 +331,17 @@ def validate(model, dataloader, device, config, epoch):
                         sample_pointcloud_vis = transform_coords_for_visualization(sample_pointcloud.cpu())
                         sample_bbox_corners_vis = transform_coords_for_visualization(sample_bbox_corners_cpu)
                         
-                        # Apply coordinate transformation to trajectory-specific bbox centers
-                        sample_traj_bbox_info_vis = None
-                        if sample_traj_bbox_info is not None:
-                            sample_traj_bbox_info_vis = sample_traj_bbox_info.clone()
-                            # Transform only the center coordinates (first 3 dimensions of each bbox)
-                            bbox_centers = sample_traj_bbox_info_vis[:, :3]  # [max_bboxes, 3]
-                            bbox_centers_vis = transform_coords_for_visualization(bbox_centers)
-                            sample_traj_bbox_info_vis[:, :3] = bbox_centers_vis
+                        # Do NOT apply coordinate transformation to semantic bbox data externally
+                        # Let visualize_full_trajectory handle the transformation internally after constructing bbox geometry
+                        # Pass original semantic bbox data directly
+                        sample_traj_bbox_info_vis = sample_traj_bbox_info  # Pass original data without transformation
 
                         visualize_full_trajectory(
                             positions=gt_full_positions_vis,
                             attention_mask=gt_full_mask.cpu() if gt_full_mask is not None else None,
                             point_cloud=sample_pointcloud_vis,  # Pass the point cloud
                             bbox_corners_sequence=sample_bbox_corners_vis,  # Add bbox corners data if available
-                            trajectory_specific_bbox_info=sample_traj_bbox_info_vis,  # Add transformed trajectory-specific bbox info
+                            trajectory_specific_bbox_info=sample_traj_bbox_info_vis,  # Add original trajectory-specific bbox info
                             trajectory_specific_bbox_mask=sample_traj_bbox_mask,  # Add trajectory-specific bbox mask
                             title=f"Full GT - {vis_title_base}",
                             save_path=full_traj_path,
@@ -509,21 +511,17 @@ def visualize_initial_train_data(train_loader, device, config, logger):
                 sample_pointcloud_vis = transform_coords_for_visualization(sample_pointcloud.cpu())
                 sample_bbox_corners_vis = transform_coords_for_visualization(sample_bbox_corners_cpu)
                 
-                # Apply coordinate transformation to trajectory-specific bbox centers
-                sample_traj_bbox_info_vis = None
-                if sample_traj_bbox_info is not None:
-                    sample_traj_bbox_info_vis = sample_traj_bbox_info.clone()
-                    # Transform only the center coordinates (first 3 dimensions of each bbox)
-                    bbox_centers = sample_traj_bbox_info_vis[:, :3]  # [max_bboxes, 3]
-                    bbox_centers_vis = transform_coords_for_visualization(bbox_centers)
-                    sample_traj_bbox_info_vis[:, :3] = bbox_centers_vis
+                # Do NOT apply coordinate transformation to semantic bbox data externally
+                # Let visualize_full_trajectory handle the transformation internally after constructing bbox geometry
+                # Pass original semantic bbox data directly
+                sample_traj_bbox_info_vis = sample_traj_bbox_info  # Pass original data without transformation
 
                 visualize_full_trajectory(
                     positions=gt_full_positions_vis,
                     attention_mask=gt_full_mask.cpu() if gt_full_mask is not None else None,
                     point_cloud=sample_pointcloud_vis,
                     bbox_corners_sequence=sample_bbox_corners_vis,
-                    trajectory_specific_bbox_info=sample_traj_bbox_info_vis,  # Add transformed trajectory-specific bbox info
+                    trajectory_specific_bbox_info=sample_traj_bbox_info_vis,  # Add original trajectory-specific bbox info
                     trajectory_specific_bbox_mask=sample_traj_bbox_mask,  # Add trajectory-specific bbox mask
                     title=f"Full GT - {vis_title_base}",
                     save_path=full_traj_path,
@@ -554,6 +552,24 @@ def main():
     # --- Configuration ---
     print("Loading configuration...")
     config = ADTObjectMotionConfig().get_configs()
+    
+    # --- Add timestamp to save_path ---
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    original_save_path = config.save_path
+    # Get the parent directory and folder name
+    parent_dir = os.path.dirname(original_save_path)
+    folder_name = os.path.basename(original_save_path)
+    # Create new path with timestamp prefix
+    timestamped_folder_name = f"{timestamp}_{folder_name}"
+    # config.save_path = os.path.join(parent_dir, timestamped_folder_name)
+    # TODO for dataset speed up
+    config.save_path = original_save_path
+    
+    print(f"Original save path: {original_save_path}")
+    print(f"Timestamped save path: {config.save_path}")
+    
+    # config.save_path = original_save_path
+    
     print("Configuration loaded:")
     print(config)
 
@@ -576,7 +592,8 @@ def main():
         try:
             # Extract the last part of save_path as the comment
             save_path_comment = os.path.basename(os.path.normpath(config.save_path))
-            run_name = f"GIMO_ADT_{time.strftime('%Y%m%d_%H%M%S')}_{save_path_comment}"
+            # Use the same timestamp that was used for save_path
+            run_name = f"GIMO_ADT_{timestamp}_{save_path_comment}"
             wandb.init(
                 project=config.wandb_project,
                 config=vars(config),
@@ -793,54 +810,174 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
-    logger("\n=== MODEL ARCHITECTURE ===")
+    logger("\n=== MODEL ARCHITECTURE DETAILS ===")
+    logger(f"Model Type: {type(model).__name__}")
     logger(f"Total Parameters: {total_params:,}")
     logger(f"Trainable Parameters: {trainable_params:,}")
+    logger(f"Non-trainable Parameters: {total_params - trainable_params:,}")
+    
+    # Calculate model size in MB (assuming float32)
+    model_size_mb = (total_params * 4) / (1024 * 1024)
+    logger(f"Estimated Model Size: {model_size_mb:.2f} MB")
+    
+    # Log configuration flags
+    logger(f"\n--- Configuration Flags ---")
     logger(f"Text Embedding Enabled: {not getattr(config, 'no_text_embedding', False)}")
     logger(f"Bounding Box Processing Enabled: {not getattr(config, 'no_bbox', False)}")
     logger(f"Semantic BBox Embedding Enabled: {not getattr(config, 'no_semantic_bbox', False)}")
+    logger(f"Semantic Text Embedding Enabled: {not getattr(config, 'no_semantic_text', False)}")
     logger(f"Scene Global Features Enabled: {not getattr(config, 'no_scene', False)}")
+    logger(f"Use First Frame Only: {getattr(config, 'use_first_frame_only', False)}")
     
-    # # Log model components
-    # components = {
-    #     'Motion Linear': (model.motion_linear, []), # Add relevant attributes if any
-    #     'Scene Encoder': (model.scene_encoder, ['hparams']), # PointNet2SemSegSSGShape uses hparams
-    # }
+    # Log detailed component information
+    logger(f"\n--- Component-wise Parameter Breakdown ---")
     
-    # # Add bounding box related components if enabled
-    # if not getattr(config, 'no_bbox', False):
-    #     components.update({
-    #         'FP Layer': (model.fp_layer, []),
-    #         'BBox PointNet': (model.bbox_pointnet, ['conv1']), # Example attribute
-    #     })
+    def log_component_params(component_name, component):
+        """Helper function to log parameters for a component"""
+        if component is not None:
+            component_params = sum(p.numel() for p in component.parameters())
+            component_trainable = sum(p.numel() for p in component.parameters() if p.requires_grad)
+            logger(f"{component_name}:")
+            logger(f"  Total: {component_params:,} parameters")
+            logger(f"  Trainable: {component_trainable:,} parameters")
+            logger(f"  Frozen: {component_params - component_trainable:,} parameters")
+            return component_params
+        else:
+            logger(f"{component_name}: Not used")
+            return 0
     
-    # components.update({
-    #     'Motion BBox Encoder': (model.motion_bbox_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
-    #     'Embedding Layer (Fusion 2)': (model.embedding_layer, ['in_features', 'out_features']),
-    #     'Output Encoder': (model.output_encoder, ['n_input_channels', 'n_latent_channels', 'n_self_att_heads', 'n_self_att_layers']),
-    #     'Output Layer': (model.outputlayer, ['in_features', 'out_features'])
-    # })
+    # Motion components
+    motion_params = log_component_params("Motion Linear Layer", getattr(model, 'motion_linear', None))
     
-    # # Add text embedding components if enabled
-    # if model.use_text_embedding: # Corrected condition
-    #     components.update({
-    #         'Category Embedding': (model.category_embedding, ['num_embeddings', 'embedding_dim'])
-    #     })
+    # Scene encoder
+    scene_encoder_params = log_component_params("Scene Encoder (PointNet++)", getattr(model, 'scene_encoder', None))
     
-    # # Log each component's structure and parameters
-    # for name, (component, attrs) in components.items():
-    #     params = sum(p.numel() for p in component.parameters())
-    #     logger(f"\n{name}:")
-    #     logger(f"  Parameters: {params:,}")
-    #     try:
-    #         # Try to log attributes if available
-    #         for attr in attrs:
-    #             if hasattr(component, attr):
-    #                 logger(f"  {attr}: {getattr(component, attr)}")
-    #     except:
-    #         pass
+    # Bounding box related components
+    if hasattr(model, 'fp_layer'):
+        fp_params = log_component_params("Feature Propagation Layer", model.fp_layer)
+    if hasattr(model, 'bbox_pointnet'):
+        bbox_pointnet_params = log_component_params("BBox PointNet", model.bbox_pointnet)
     
-    logger("=== END MODEL ARCHITECTURE ===\n")
+    # Motion-bbox encoder
+    motion_bbox_encoder_params = log_component_params("Motion-BBox Encoder", getattr(model, 'motion_bbox_encoder', None))
+    
+    # Embedding components
+    category_embedder_params = log_component_params("Category Embedder", getattr(model, 'category_embedder', None))
+    semantic_bbox_embedder_params = log_component_params("Semantic BBox Embedder", getattr(model, 'semantic_bbox_embedder', None))
+    semantic_text_embedder_params = log_component_params("Semantic Text Embedder", getattr(model, 'semantic_text_embedder', None))
+    
+    # Fusion and output components
+    embedding_layer_params = log_component_params("Embedding Layer", getattr(model, 'embedding_layer', None))
+    output_encoder_params = log_component_params("Output Encoder", getattr(model, 'output_encoder', None))
+    output_layer_params = log_component_params("Output Layer", getattr(model, 'outputlayer', None))
+    
+    # Log model architecture details
+    logger(f"\n--- Model Architecture Configuration ---")
+    logger(f"Sequence Length: {getattr(model, 'sequence_length', 'N/A')}")
+    logger(f"History Fraction: {getattr(model, 'history_fraction', 'N/A')}")
+    
+    # Log dimensions
+    logger(f"\n--- Dimension Configuration ---")
+    logger(f"Object Motion Dim: {getattr(config, 'object_motion_dim', 'N/A')}")
+    logger(f"Motion Hidden Dim: {getattr(config, 'motion_hidden_dim', 'N/A')}")
+    logger(f"Motion Latent Dim: {getattr(config, 'motion_latent_dim', 'N/A')}")
+    logger(f"Scene Features Dim: {getattr(config, 'scene_feats_dim', 'N/A')}")
+    if not getattr(config, 'no_text_embedding', False):
+        logger(f"Category Embed Dim: {getattr(config, 'category_embed_dim', 'N/A')}")
+    if not getattr(config, 'no_semantic_bbox', False):
+        logger(f"Semantic BBox Embed Dim: {getattr(config, 'semantic_bbox_embed_dim', 'N/A')}")
+    if not getattr(config, 'no_semantic_text', False):
+        logger(f"Semantic Text Embed Dim: {getattr(config, 'semantic_text_embed_dim', 640)}")
+    logger(f"Output Latent Dim: {getattr(config, 'output_latent_dim', 'N/A')}")
+    
+    # Log attention configuration
+    logger(f"\n--- Attention Configuration ---")
+    logger(f"Motion Attention Heads: {getattr(config, 'motion_n_heads', 'N/A')}")
+    logger(f"Motion Attention Layers: {getattr(config, 'motion_n_layers', 'N/A')}")
+    logger(f"Output Attention Heads: {getattr(config, 'output_n_heads', 'N/A')}")
+    logger(f"Output Attention Layers: {getattr(config, 'output_n_layers', 'N/A')}")
+    logger(f"Dropout Rate: {getattr(config, 'dropout', 'N/A')}")
+    
+    # Log CLIP model information if available
+    if hasattr(model, 'category_embedder') and model.category_embedder is not None:
+        logger(f"\n--- CLIP Model Information ---")
+        clip_model = getattr(model.category_embedder, 'clip_model', None)
+        if clip_model is not None:
+            clip_params = sum(p.numel() for p in clip_model.parameters())
+            logger(f"CLIP Model Parameters: {clip_params:,}")
+            clip_model_name = getattr(config, 'clip_model_name', 'ViT-B/32')
+            logger(f"CLIP Model Type: {clip_model_name}")
+            logger(f"CLIP Embedding Dim: {getattr(model.category_embedder, 'clip_embed_dim', 'N/A')}")
+    
+    # Memory estimation
+    logger(f"\n--- Memory Estimation ---")
+    # Rough estimation of memory usage during training (forward + backward + optimizer states)
+    estimated_training_memory_mb = model_size_mb * 4  # Model + gradients + optimizer states (rough estimate)
+    logger(f"Estimated Training Memory: {estimated_training_memory_mb:.2f} MB")
+    
+    # Log device information
+    device_name = str(device)
+    if torch.cuda.is_available() and 'cuda' in device_name:
+        gpu_memory = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+        logger(f"GPU Memory Available: {gpu_memory:.2f} GB")
+        current_memory = torch.cuda.memory_allocated(device) / (1024**2)
+        logger(f"Current GPU Memory Used: {current_memory:.2f} MB")
+
+    # Log detailed model structure
+    logger(f"\n--- Detailed Model Structure ---")
+    def log_model_structure(module, prefix="", max_depth=3, current_depth=0):
+        """Recursively log model structure with parameter counts"""
+        if current_depth >= max_depth:
+            return
+            
+        for name, child in module.named_children():
+            child_params = sum(p.numel() for p in child.parameters())
+            child_trainable = sum(p.numel() for p in child.parameters() if p.requires_grad)
+            
+            indent = "  " * current_depth
+            logger(f"{indent}{prefix}{name}: {type(child).__name__}")
+            logger(f"{indent}  └─ Parameters: {child_params:,} (Trainable: {child_trainable:,})")
+            
+            # Log some key attributes if they exist
+            if hasattr(child, 'in_features') and hasattr(child, 'out_features'):
+                logger(f"{indent}  └─ Shape: {child.in_features} → {child.out_features}")
+            elif hasattr(child, 'num_features'):
+                logger(f"{indent}  └─ Features: {child.num_features}")
+            elif hasattr(child, 'embed_dim'):
+                logger(f"{indent}  └─ Embed Dim: {child.embed_dim}")
+            
+            # Recursively log children (but limit depth to avoid too much output)
+            if child_params > 0 and current_depth < max_depth - 1:
+                log_model_structure(child, "", max_depth, current_depth + 1)
+    
+    try:
+        log_model_structure(model, max_depth=2)  # Limit depth to keep output manageable
+    except Exception as e:
+        logger(f"Error logging model structure: {e}")
+    
+    # Summary statistics
+    logger(f"\n--- Summary Statistics ---")
+    logger(f"Parameters per Component:")
+    component_stats = []
+    
+    # Collect component stats for summary
+    components = [
+        ("Motion Processing", motion_params if 'motion_params' in locals() else 0),
+        ("Scene Encoding", scene_encoder_params if 'scene_encoder_params' in locals() else 0),
+        ("Motion-BBox Fusion", motion_bbox_encoder_params if 'motion_bbox_encoder_params' in locals() else 0),
+        ("Text Embeddings", category_embedder_params if 'category_embedder_params' in locals() else 0),
+        ("Semantic Embeddings", (semantic_bbox_embedder_params if 'semantic_bbox_embedder_params' in locals() else 0) + 
+                                (semantic_text_embedder_params if 'semantic_text_embedder_params' in locals() else 0)),
+        ("Output Processing", (output_encoder_params if 'output_encoder_params' in locals() else 0) + 
+                             (output_layer_params if 'output_layer_params' in locals() else 0)),
+    ]
+    
+    for comp_name, comp_params in components:
+        if comp_params > 0:
+            percentage = (comp_params / total_params) * 100
+            logger(f"  {comp_name}: {comp_params:,} ({percentage:.1f}%)")
+
+    logger("=== END MODEL ARCHITECTURE DETAILS ===\n")
     
     if config.wandb_mode != 'disabled':
         wandb.watch(model) # Watch model gradients
@@ -956,11 +1093,17 @@ def main():
                     semantic_bbox_info = None
                     semantic_bbox_mask = None
 
+                # Get semantic text categories if semantic text embedding is enabled
+                if not getattr(config, 'no_semantic_text', False):
+                    semantic_text_categories = batch.get('scene_bbox_categories', None)
+                else:
+                    semantic_text_categories = None
+
             except KeyError as e: logger(f"Error: Missing key {e} in batch {batch_idx}. Skipping."); continue
             except Exception as e: logger(f"Error processing batch {batch_idx}: {e}. Skipping."); continue
 
             # 1. Forward pass with input trajectory, point cloud, bbox corners, and category strings
-            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask)
+            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask, semantic_text_categories)
 
             # 2. Compute loss
             total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)

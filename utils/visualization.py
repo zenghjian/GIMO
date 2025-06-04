@@ -7,6 +7,8 @@ import matplotlib.cm as cm # Import colormap library
 
 # Import geometry utilities
 from utils.geometry_utils import convert_rotation_to_euler
+# Import metrics utilities for coordinate transformation
+from utils.metrics_utils import transform_coords_for_visualization
 
 def visualize_trajectory(past_positions, future_positions, past_mask=None, future_mask=None, title="Trajectory", save_path=None, segment_idx=None, show_orientation=False, past_orientations=None, future_orientations=None):
     """
@@ -534,6 +536,9 @@ def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, 
                 dims = bbox_info[3:6]  # [width, height, depth]
                 rotation_6d = bbox_info[6:12]
                 
+                # Note: center should already be adjusted to geometric center (not bottom center)
+                # during data extraction in gimo_adt_trajectory_dataset.py
+                
                 # Convert 6D rotation to rotation matrix
                 # 6D rotation representation: first two columns of rotation matrix
                 r1 = rotation_6d[:3]  # First column
@@ -560,7 +565,13 @@ def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, 
                 # Transform corners to world coordinates
                 world_corners = (rotation_matrix @ local_corners.T).T + center
                 
-                # Draw edges of the bounding box
+                # Apply coordinate transformation for visualization to the complete bbox geometry
+                # Convert to torch tensor for transformation, then back to numpy
+                world_corners_tensor = torch.from_numpy(world_corners).float()
+                world_corners_transformed_tensor = transform_coords_for_visualization(world_corners_tensor)
+                world_corners_transformed = world_corners_transformed_tensor.detach().cpu().numpy()
+                
+                # Draw edges of the bounding box using transformed coordinates
                 scene_bbox_edges = [
                     (0, 1), (1, 2), (2, 3), (3, 0),  # Bottom face
                     (4, 5), (5, 6), (6, 7), (7, 4),  # Top face
@@ -568,7 +579,7 @@ def visualize_full_trajectory(positions, attention_mask=None, point_cloud=None, 
                 ]
                 
                 for edge in scene_bbox_edges:
-                    ax.plot(world_corners[edge, 0], world_corners[edge, 1], world_corners[edge, 2], 
+                    ax.plot(world_corners_transformed[edge, 0], world_corners_transformed[edge, 1], world_corners_transformed[edge, 2], 
                             color=scene_bbox_color, alpha=scene_bbox_alpha, linewidth=scene_bbox_linewidth, label='_nolegend_')
             
             # Add legend entry for scene bboxes
