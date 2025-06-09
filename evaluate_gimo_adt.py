@@ -197,6 +197,11 @@ def parse_args():
         default=None,
         help="Path to a shared global directory for trajectory cache (overrides cache within output_dir)"
     )
+    parser.add_argument(
+        "--use_full_scene_pointcloud",
+        action="store_true",
+        help="Use complete scene pointcloud for visualization instead of trajectory-specific pointcloud"
+    )
     
     # --- Model Configuration Overrides ---
     parser.add_argument(
@@ -215,20 +220,6 @@ def parse_args():
         default=10,
         help="Number of best and worst Rerun recordings and visualizations to save."
     )
-
-    # Add new argument for controlling point cloud choice
-    parser.add_argument(
-        "--use_full_scene_pointcloud",
-        action="store_true",
-        help="Use full scene point cloud instead of trajectory-specific point cloud for visualization (default: True)"
-    )
-    parser.add_argument(
-        "--no-use_full_scene_pointcloud",
-        dest="use_full_scene_pointcloud",
-        action="store_false",
-        help="Use trajectory-specific point cloud instead of full scene point cloud for visualization"
-    )
-    parser.set_defaults(use_full_scene_pointcloud=True)  # Set default to True
 
     return parser.parse_args()
 
@@ -818,33 +809,28 @@ def evaluate(model, config, args, best_epoch, logger,
                                  # Apply transformation for visualization
                                  gt_full_denorm_vis = transform_coords_for_visualization(gt_full_denorm.cpu())
                                  
-                                 # Choose point cloud for matplotlib visualization based on user preference
-                                 sample_point_cloud_for_vis = None
-                                 if args.use_full_scene_pointcloud:
-                                     # Use full scene point cloud
-                                     sample_point_cloud_for_vis = point_cloud_batch[i].cpu()
-                                     logger.info(f"Using full scene point cloud for matplotlib visualization (points: {sample_point_cloud_for_vis.shape[0]})")
+                                 # Choose point cloud for visualization based on user preference
+                                 if args.use_full_scene_pointcloud and 'scene_pointcloud' in batch and i < len(batch['scene_pointcloud']):
+                                     # Use complete scene point cloud if available and requested
+                                     scene_pc_data = batch['scene_pointcloud'][i]
+                                     if scene_pc_data is not None and isinstance(scene_pc_data, torch.Tensor) and scene_pc_data.numel() > 0:
+                                         sample_point_cloud_vis = transform_coords_for_visualization(scene_pc_data.cpu())
+                                         logger.info(f"Using full scene pointcloud for visualization ({scene_pc_data.shape[0]} points)")
+                                     else:
+                                         # Fallback to default point cloud if scene pointcloud is not available
+                                         sample_point_cloud_vis = transform_coords_for_visualization(point_cloud_batch[i].cpu())
+                                         logger.info(f"Scene pointcloud not available, using default point cloud for visualization")
                                  else:
-                                     # Try to use trajectory-specific point cloud first
-                                     if 'trajectory_specific_pointcloud' in batch and i < len(batch['trajectory_specific_pointcloud']):
-                                         traj_specific_pc_data = batch['trajectory_specific_pointcloud'][i]
-                                         if traj_specific_pc_data is not None and isinstance(traj_specific_pc_data, torch.Tensor) and traj_specific_pc_data.numel() > 0:
-                                             sample_point_cloud_for_vis = traj_specific_pc_data.cpu()
-                                             logger.info(f"Using trajectory-specific point cloud for matplotlib visualization (points: {sample_point_cloud_for_vis.shape[0]})")
-                                     
-                                     # Fallback to full scene point cloud if trajectory-specific not available
-                                     if sample_point_cloud_for_vis is None:
-                                         sample_point_cloud_for_vis = point_cloud_batch[i].cpu()
-                                         logger.info(f"Fallback to full scene point cloud for matplotlib visualization (trajectory-specific not available)")
+                                     # Use default point cloud (trajectory-specific or sampled)
+                                     sample_point_cloud_vis = transform_coords_for_visualization(point_cloud_batch[i].cpu())
                                  
-                                 sample_point_cloud_vis = transform_coords_for_visualization(sample_point_cloud_for_vis)
                                  sample_bbox_corners_vis = transform_coords_for_visualization(sample_bbox_corners_cpu)
 
                                  # Visualize the full trajectory with bbox
                                  visualize_full_trajectory(
                                      positions=gt_full_denorm_vis,
                                      attention_mask=full_mask,
-                                     point_cloud=sample_point_cloud_vis,  # Use point cloud for this sample
+                                     point_cloud=sample_point_cloud_vis,  # Use selected point cloud for this sample
                                      bbox_corners_sequence=sample_bbox_corners_vis,  # Add bounding box corners
                                      title=f"Full Trajectory - {vis_title_base} (Eval)",
                                      save_path=full_traj_path,
@@ -866,45 +852,45 @@ def evaluate(model, config, args, best_epoch, logger,
                                      )
 
                                      if sample_rerun_initialized:
-                                         # --- Prepare point cloud for Rerun (MODIFIED for full scene support) ---
+                                         # --- Prepare point cloud for Rerun (moved here, was missing) ---
                                          traj_point_cloud = None # Initialize to None
+                                         if point_cloud_batch is not None and point_cloud_batch.shape[0] > i:
+                                             sample_pc_for_rerun = point_cloud_batch[i].cpu()
+                                             if args.pointcloud_downsample_factor > 1:
+                                                 sample_pc_for_rerun = downsample_point_cloud(
+                                                     sample_pc_for_rerun, 
+                                                     args.pointcloud_downsample_factor
+                                                 )
+                                             traj_point_cloud = sample_pc_for_rerun
                                          
-                                         # Choose point cloud based on user preference
-                                         if args.use_full_scene_pointcloud:
-                                             # Priority 1: Use full scene point cloud if requested
-                                             if point_cloud_batch is not None and point_cloud_batch.shape[0] > i:
-                                                 sample_pc_for_rerun = point_cloud_batch[i].cpu()
+                                         # Check for trajectory-specific point cloud from the batch (if applicable)
+                                         if 'trajectory_specific_pointcloud' in batch and i < len(batch['trajectory_specific_pointcloud']):
+                                             traj_specific_pc_data = batch['trajectory_specific_pointcloud'][i]
+                                             if traj_specific_pc_data is not None and isinstance(traj_specific_pc_data, torch.Tensor) and traj_specific_pc_data.numel() > 0:
+                                                 processed_traj_specific_pc = traj_specific_pc_data.cpu()
                                                  if args.pointcloud_downsample_factor > 1:
-                                                     sample_pc_for_rerun = downsample_point_cloud(
-                                                         sample_pc_for_rerun, 
+                                                     processed_traj_specific_pc = downsample_point_cloud(
+                                                         processed_traj_specific_pc, 
                                                          args.pointcloud_downsample_factor
                                                      )
-                                                 traj_point_cloud = sample_pc_for_rerun
-                                                 logger.info(f"Using full scene point cloud for sample {i} visualization (points: {traj_point_cloud.shape[0] if traj_point_cloud is not None else 0})")
-                                         else:
-                                             # Priority 2: Use trajectory-specific point cloud if available and requested
-                                             if 'trajectory_specific_pointcloud' in batch and i < len(batch['trajectory_specific_pointcloud']):
-                                                 traj_specific_pc_data = batch['trajectory_specific_pointcloud'][i]
-                                                 if traj_specific_pc_data is not None and isinstance(traj_specific_pc_data, torch.Tensor) and traj_specific_pc_data.numel() > 0:
-                                                     processed_traj_specific_pc = traj_specific_pc_data.cpu()
-                                                     if args.pointcloud_downsample_factor > 1:
-                                                         processed_traj_specific_pc = downsample_point_cloud(
-                                                             processed_traj_specific_pc, 
-                                                             args.pointcloud_downsample_factor
-                                                         )
-                                                     traj_point_cloud = processed_traj_specific_pc
-                                                     logger.info(f"Using trajectory-specific point cloud for sample {i} visualization (points: {traj_point_cloud.shape[0] if traj_point_cloud is not None else 0})")
-                                             
-                                             # Fallback: Use full scene point cloud if trajectory-specific is not available
-                                             if traj_point_cloud is None and point_cloud_batch is not None and point_cloud_batch.shape[0] > i:
-                                                 sample_pc_for_rerun = point_cloud_batch[i].cpu()
+                                                 traj_point_cloud = processed_traj_specific_pc # Override with more specific PC if available
+                                         
+                                         # Check for complete scene point cloud if requested
+                                         if args.use_full_scene_pointcloud and 'scene_pointcloud' in batch and i < len(batch['scene_pointcloud']):
+                                             # Use complete scene point cloud if available and requested
+                                             scene_pc_data = batch['scene_pointcloud'][i]
+                                             if scene_pc_data is not None and isinstance(scene_pc_data, torch.Tensor) and scene_pc_data.numel() > 0:
+                                                 processed_scene_pc = scene_pc_data.cpu()
                                                  if args.pointcloud_downsample_factor > 1:
-                                                     sample_pc_for_rerun = downsample_point_cloud(
-                                                         sample_pc_for_rerun, 
+                                                     processed_scene_pc = downsample_point_cloud(
+                                                         processed_scene_pc, 
                                                          args.pointcloud_downsample_factor
                                                      )
-                                                 traj_point_cloud = sample_pc_for_rerun
-                                                 logger.info(f"Fallback to full scene point cloud for sample {i} visualization (trajectory-specific not available)")
+                                                 traj_point_cloud = processed_scene_pc # Override with full scene PC if available
+                                                 logger.info(f"Using full scene pointcloud for Rerun visualization ({scene_pc_data.shape[0]} points)")
+                                             else:
+                                                 logger.info(f"Scene pointcloud not available for Rerun, using default")
+                                         
                                          # --- End of point cloud preparation ---
 
                                          # Apply transformation for Rerun visualization
@@ -1077,7 +1063,6 @@ def evaluate(model, config, args, best_epoch, logger,
         'mean_frechet': mean_frechet,
         'mean_angular_cosine': mean_angular_cosine,
         'first_frame_only_mode': config.use_first_frame_only, # Flag indicating special mode
-        'use_full_scene_pointcloud': args.use_full_scene_pointcloud, # Record point cloud choice
         'num_test_samples_processed': total_valid_samples, # Report processed samples
         'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
         'comment': os.path.basename(os.path.normpath(args.model_path)), # Extract comment from model_path
@@ -1199,7 +1184,7 @@ def main():
     logger.info(f"Number of samples to visualize: {args.num_vis_samples}")
     logger.info(f"Show orientation arrows: {'Enabled' if args.show_ori_arrows else 'Disabled'}")
     logger.info(f"Visualize bounding boxes: {'Enabled' if args.visualize_bbox else 'Disabled'}")
-    logger.info(f"Point cloud choice: {'Full scene' if args.use_full_scene_pointcloud else 'Trajectory-specific'}")
+    logger.info(f"Use full scene pointcloud: {'Enabled' if args.use_full_scene_pointcloud else 'Disabled'}")
     
     # Log Rerun visualization settings
     logger.info("\n=== RERUN VISUALIZATION SETTINGS ===")
@@ -1208,7 +1193,6 @@ def main():
             logger.info("Rerun visualization for saving recordings: Enabled (viewer will not spawn)")
             logger.info(f"Rerun output directory: {os.path.join(output_dir, 'rerun_visualization')}")
             logger.info(f"Point cloud downsample factor: {args.pointcloud_downsample_factor}")
-            logger.info(f"Point cloud choice: {'Full scene' if args.use_full_scene_pointcloud else 'Trajectory-specific'}")
             logger.info(f"Line width: {args.rerun_line_width}")
             logger.info(f"Point size: {args.rerun_point_size}")
             logger.info(f"Show orientation arrows: {'Enabled' if args.rerun_show_arrows else 'Disabled'}")
@@ -1416,38 +1400,33 @@ if __name__ == "__main__":
     main()
 
 # Example usage:
-# 1. Basic evaluation with visualization (using full scene point cloud by default)
+# 1. Basic evaluation with visualization
 # python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --visualize --num_vis_samples 5
 #
-# 2. Evaluating with trajectory-specific point clouds
-# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --visualize --num_vis_samples 5 --no-use_full_scene_pointcloud
+# 2. Evaluating a model trained with use_first_frame_only enabled
+# python evaluate_gimo_adt.py --model_path ./checkpoints/first_frame_only_model.pth --visualize --num_vis_samples 10 --output_dir eval_first_frame_only
 #
-# 3. Evaluating a model trained with use_first_frame_only enabled (with full scene point cloud)
-# python evaluate_gimo_adt.py --model_path ./checkpoints/first_frame_only_model.pth --visualize --num_vis_samples 10 --output_dir eval_first_frame_only --use_full_scene_pointcloud
-#
-# 4. Evaluating on a specific test set (overriding the one in the checkpoint's config)
+# 3. Evaluating on a specific test set (overriding the one in the checkpoint's config)
 # python evaluate_gimo_adt.py --model_path ./checkpoints/gimo_model.pth --adt_dataroot /path/to/test_data --batch_size 8 
 #
-# 5. Example for latest GIMO model with text categories and full scene visualization
-# python evaluate_gimo_adt.py --model_path ./checkpoints/gimo_adt_with_categories.pth --visualize --num_vis_samples 20 --output_dir eval_with_categories --use_full_scene_pointcloud
+# 4. Example for latest GIMO model with text categories
+# python evaluate_gimo_adt.py --model_path ./checkpoints/gimo_adt_with_categories.pth --visualize --num_vis_samples 20 --output_dir eval_with_categories
 #
-# 6. Evaluating 6D pose model with orientation visualization enabled
+# 5. Evaluating 6D pose model with orientation visualization enabled
 # python evaluate_gimo_adt.py --model_path ./checkpoints/full_6d_model.pth --visualize --num_vis_samples 30 --output_dir eval_with_orientation 
 #
-# 7. Using the new command line arguments to override config
+# 6. Using the new command line arguments to override config
 # python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --visualize --show_ori_arrows --use_first_frame_only 
 #
-# 8. Evaluation with Rerun visualization including arrows and semantic bounding boxes with full scene point cloud
-# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --use_rerun --rerun_show_arrows --rerun_show_semantic_bboxes --num_vis_samples 10 --use_full_scene_pointcloud
+# 7. Evaluation with Rerun visualization including arrows and semantic bounding boxes with categories
+# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --use_rerun --rerun_show_arrows --rerun_show_semantic_bboxes --num_vis_samples 10
 #
-# 9. Customized Rerun visualization settings with semantic object categories and trajectory-specific point cloud
-# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --use_rerun --rerun_arrow_length 0.3 --rerun_line_width 0.03 --pointcloud_downsample_factor 5 --no-use_full_scene_pointcloud
+# 8. Customized Rerun visualization settings with semantic object categories
+# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --use_rerun --rerun_arrow_length 0.3 --rerun_line_width 0.03 --pointcloud_downsample_factor 5
 #
-# 10. Evaluation with both Matplotlib and Rerun visualization showing semantic objects with full scene point cloud
-# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --visualize --visualize_bbox --use_rerun --rerun_show_arrows --rerun_show_semantic_bboxes --use_full_scene_pointcloud
+# 9. Evaluation with both Matplotlib and Rerun visualization showing semantic objects
+# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --visualize --visualize_bbox --use_rerun --rerun_show_arrows --rerun_show_semantic_bboxes 
 #
-# Note: --use_full_scene_pointcloud is the default behavior for better trajectory context visualization
-#       Use --no-use_full_scene_pointcloud to switch back to trajectory-specific point clouds
-#       Each semantic bounding box will appear as an individual object in Rerun,
+# Note: Each semantic bounding box will now appear as an individual object in Rerun,
 #       named by its category (e.g., "food_object_0", "dining_table_1", "cutting_board_2") with category-specific colors
-#       Category names are cleaned for Rerun paths (spaces become underscores, special characters removed)
+#       Category names are cleaned for Rerun paths (spaces become underscores, special characters removed) 

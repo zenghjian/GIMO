@@ -308,5 +308,22 @@ class GIMOMultiSequenceDataset(Dataset):
             except Exception as e:
                 print(f"Warning: Could not get trajectory-specific point cloud for sample {idx}: {e}")
 
+        # Add complete scene pointcloud for evaluation visualization
+        if 'scene_pointcloud' not in sample:
+            try:
+                # Get complete scene point cloud from the dataset
+                scene_pc = self.individual_datasets[dataset_idx].get_scene_pointcloud()
+                if scene_pc is not None and len(scene_pc) > 0:
+                    # Convert to tensor if it's numpy array
+                    if isinstance(scene_pc, np.ndarray):
+                        scene_pc = torch.from_numpy(scene_pc).float()
+                    sample['scene_pointcloud'] = scene_pc
+                    # Also store the sequence info for debugging
+                    sample['scene_pointcloud_source'] = f"sequence_{dataset_idx}"
+                else:
+                    print(f"Warning: No scene point cloud available for sequence {dataset_idx}")
+            except Exception as e:
+                print(f"Warning: Could not get scene point cloud for sample {idx}: {e}")
+
         return sample
     
