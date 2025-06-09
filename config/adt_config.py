@@ -47,6 +47,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.scene_configs.add_argument('--no_bbox', action='store_true', default=False, help='Disable bounding box processing and conditioning')
         self.scene_configs.add_argument('--no_scene', action='store_true', default=False, help='Disable scene global features and use only motion features')
         self.scene_configs.add_argument('--no_semantic_bbox', action='store_true', default=False, help='Disable semantic bbox embedding for scene conditioning')
+        self.scene_configs.add_argument('--no_semantic_text', action='store_true', default=False, help='Disable semantic text embedding for scene conditioning')
         self.scene_configs.add_argument('--max_bboxes', default=400, type=int, help='Maximum number of bounding boxes for scene conditioning')
         self.scene_configs.add_argument('--semantic_bbox_embed_dim', default=256, type=int, help='Output dimension of semantic bbox embedder')
         self.scene_configs.add_argument('--semantic_bbox_hidden_dim', default=128, type=int, help='Hidden dimension in semantic bbox embedder')
@@ -84,7 +85,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.train_configs.add_argument('--save_fre', type=int, default=10, help='Checkpoint saving frequency (epochs)')
         # self.train_configs.add_argument('--vis_fre', type=int, default=1000) # Maybe redefine for trajectory viz
         self.train_configs.add_argument('--val_fre', type=int, default=1, help='Validation frequency (epochs)')
-        self.train_configs.add_argument('--num_val_visualizations', type=int, default=10, help='Number of samples to visualize during validation')
+        self.train_configs.add_argument('--num_val_visualizations', type=int, default=1, help='Number of samples to visualize during validation, 0 means no visualization')
         self.train_configs.add_argument('--load_model_dir', type=str, default=None, help='Path to load a pretrained model checkpoint')
         self.train_configs.add_argument('--load_optim_dir', type=str, default=None, help='Path to load optimizer state separately')
         self.train_configs.add_argument('--timestep', type=int, default=0, help='Timestep for autoregressive prediction ')

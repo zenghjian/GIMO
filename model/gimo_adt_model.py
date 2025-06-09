@@ -297,7 +297,7 @@ class SemanticTextEmbedder(nn.Module):
                 batch_embedding = batch_embedding * batch_mask
                 # Average over valid boxes only
                 if batch_mask.sum() > 0:
-                    batch_embedding = batch_embedding.sum(dim=0, keepdim=True) / batch_mask.sum()
+                    batch_embedding = batch_embedding.sum(dim=0, keepdim=True) / batch_mask.sum() # [1, output_dim]
                 else:
                     batch_embedding = torch.zeros(1, batch_embedding.size(-1), device=device)
             else:

@@ -78,6 +78,8 @@ def validate(model, dataloader, device, config, epoch):
     total_l1 = 0.0
     total_rmse = 0.0
     total_fde = 0.0
+    total_frechet = 0.0
+    total_angular_cosine = 0.0
     total_valid_samples = 0
 
     print("\nRunning validation...")
@@ -197,7 +199,7 @@ def validate(model, dataloader, device, config, epoch):
                     continue  # Skip if no valid future points
                 
                 # Compute metrics
-                l1_mean, rmse_ade, fde = compute_metrics_for_sample(
+                l1_mean, rmse_ade, fde, frechet_distance, angular_cosine_similarity = compute_metrics_for_sample(
                     pred_future_positions, 
                     gt_future_positions, 
                     future_mask
@@ -207,6 +209,8 @@ def validate(model, dataloader, device, config, epoch):
                 total_l1 += l1_mean.item()
                 total_rmse += rmse_ade.item()
                 total_fde += fde.item()
+                total_frechet += frechet_distance.item()
+                total_angular_cosine += angular_cosine_similarity.item()
                 total_valid_samples += 1
 
             # --- Visualization Logic ---
@@ -397,13 +401,17 @@ def validate(model, dataloader, device, config, epoch):
         avg_l1 = total_l1 / total_valid_samples
         avg_rmse = total_rmse / total_valid_samples
         avg_fde = total_fde / total_valid_samples
+        avg_frechet = total_frechet / total_valid_samples
+        avg_angular_cosine = total_angular_cosine / total_valid_samples
         
         # Add metrics to the returned components
         avg_loss_components['l1_mean'] = avg_l1
         avg_loss_components['rmse'] = avg_rmse
         avg_loss_components['fde'] = avg_fde
+        avg_loss_components['frechet'] = avg_frechet
+        avg_loss_components['angular_cosine'] = avg_angular_cosine
         
-        print(f"Validation Metrics - L1: {avg_l1:.4f}, RMSE: {avg_rmse:.4f}, FDE: {avg_fde:.4f}")
+        print(f"Validation Metrics - L1: {avg_l1:.4f}, RMSE: {avg_rmse:.4f}, FDE: {avg_fde:.4f}, Frechet: {avg_frechet:.4f}, Angular Cosine: {avg_angular_cosine:.4f}")
     
     return avg_loss_components
 
@@ -561,9 +569,9 @@ def main():
     folder_name = os.path.basename(original_save_path)
     # Create new path with timestamp prefix
     timestamped_folder_name = f"{timestamp}_{folder_name}"
-    # config.save_path = os.path.join(parent_dir, timestamped_folder_name)
+    config.save_path = os.path.join(parent_dir, timestamped_folder_name)
     # TODO for dataset speed up
-    config.save_path = original_save_path
+    # config.save_path = original_save_path
     
     print(f"Original save path: {original_save_path}")
     print(f"Timestamped save path: {config.save_path}")

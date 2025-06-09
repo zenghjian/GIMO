@@ -216,6 +216,20 @@ def parse_args():
         help="Number of best and worst Rerun recordings and visualizations to save."
     )
 
+    # Add new argument for controlling point cloud choice
+    parser.add_argument(
+        "--use_full_scene_pointcloud",
+        action="store_true",
+        help="Use full scene point cloud instead of trajectory-specific point cloud for visualization (default: True)"
+    )
+    parser.add_argument(
+        "--no-use_full_scene_pointcloud",
+        dest="use_full_scene_pointcloud",
+        action="store_false",
+        help="Use trajectory-specific point cloud instead of full scene point cloud for visualization"
+    )
+    parser.set_defaults(use_full_scene_pointcloud=True)  # Set default to True
+
     return parser.parse_args()
 
 def load_model_and_config(checkpoint_path, device, logger):
@@ -434,6 +448,8 @@ def evaluate(model, config, args, best_epoch, logger,
     total_l1 = 0.0
     total_rmse_ade = 0.0 # Accumulate RMSE/ADE (L2)
     total_fde = 0.0
+    total_frechet = 0.0
+    total_angular_cosine = 0.0
     num_batches = 0
     total_valid_samples = 0 # Count total valid samples across all batches
     all_samples_metrics = [] # List to store metrics and paths for each sample
@@ -548,6 +564,8 @@ def evaluate(model, config, args, best_epoch, logger,
                 batch_l1 = 0.0
                 batch_rmse_ade = 0.0
                 batch_fde = 0.0
+                batch_frechet = 0.0
+                batch_angular_cosine = 0.0
                 valid_samples_in_batch = 0
 
                 logger.info(f"Processing {full_trajectory_batch.shape[0]} samples in batch")
@@ -649,8 +667,8 @@ def evaluate(model, config, args, best_epoch, logger,
                         pred_future_rot_denorm = pred_future_rot
 
                     # Compute Metrics for this sample
-                    l1_mean, rmse_ade, fde = compute_metrics_for_sample(pred_future_denorm, gt_future_denorm, future_mask)
-                    logger.info(f"Sample {i}: L1={l1_mean.item():.4f}, RMSE={rmse_ade.item():.4f}, FDE={fde.item():.4f}")
+                    l1_mean, rmse_ade, fde, frechet_distance, angular_cosine_similarity = compute_metrics_for_sample(pred_future_denorm, gt_future_denorm, future_mask)
+                    logger.info(f"Sample {i}: L1={l1_mean.item():.4f}, RMSE={rmse_ade.item():.4f}, FDE={fde.item():.4f}, Fréchet={frechet_distance.item():.4f}, Angular_Cos={angular_cosine_similarity.item():.4f}")
                     
                     # Calculate individual sample validation loss
                     # Create single-sample batch for loss computation
@@ -677,6 +695,8 @@ def evaluate(model, config, args, best_epoch, logger,
                     batch_l1 += l1_mean.item()
                     batch_rmse_ade += rmse_ade.item()
                     batch_fde += fde.item()
+                    batch_frechet += frechet_distance.item()
+                    batch_angular_cosine += angular_cosine_similarity.item()
                     valid_samples_in_batch += 1
 
                     # --- Store sample metrics and paths for later sorting --- 
@@ -704,6 +724,8 @@ def evaluate(model, config, args, best_epoch, logger,
                         'l1': l1_mean.item(),
                         'rmse': rmse_ade.item(),
                         'fde': fde.item(),
+                        'frechet': frechet_distance.item(),
+                        'angular_cosine': angular_cosine_similarity.item(),
                         'val_loss': sample_val_loss.item(),  # Add validation loss for sorting
                         'vis_path': current_sample_vis_path, # Path to matplotlib vis
                         'rerun_path': current_sample_rerun_path,  # Path to Rerun .rrd file
@@ -795,7 +817,27 @@ def evaluate(model, config, args, best_epoch, logger,
                                  
                                  # Apply transformation for visualization
                                  gt_full_denorm_vis = transform_coords_for_visualization(gt_full_denorm.cpu())
-                                 sample_point_cloud_vis = transform_coords_for_visualization(point_cloud_batch[i].cpu())
+                                 
+                                 # Choose point cloud for matplotlib visualization based on user preference
+                                 sample_point_cloud_for_vis = None
+                                 if args.use_full_scene_pointcloud:
+                                     # Use full scene point cloud
+                                     sample_point_cloud_for_vis = point_cloud_batch[i].cpu()
+                                     logger.info(f"Using full scene point cloud for matplotlib visualization (points: {sample_point_cloud_for_vis.shape[0]})")
+                                 else:
+                                     # Try to use trajectory-specific point cloud first
+                                     if 'trajectory_specific_pointcloud' in batch and i < len(batch['trajectory_specific_pointcloud']):
+                                         traj_specific_pc_data = batch['trajectory_specific_pointcloud'][i]
+                                         if traj_specific_pc_data is not None and isinstance(traj_specific_pc_data, torch.Tensor) and traj_specific_pc_data.numel() > 0:
+                                             sample_point_cloud_for_vis = traj_specific_pc_data.cpu()
+                                             logger.info(f"Using trajectory-specific point cloud for matplotlib visualization (points: {sample_point_cloud_for_vis.shape[0]})")
+                                     
+                                     # Fallback to full scene point cloud if trajectory-specific not available
+                                     if sample_point_cloud_for_vis is None:
+                                         sample_point_cloud_for_vis = point_cloud_batch[i].cpu()
+                                         logger.info(f"Fallback to full scene point cloud for matplotlib visualization (trajectory-specific not available)")
+                                 
+                                 sample_point_cloud_vis = transform_coords_for_visualization(sample_point_cloud_for_vis)
                                  sample_bbox_corners_vis = transform_coords_for_visualization(sample_bbox_corners_cpu)
 
                                  # Visualize the full trajectory with bbox
@@ -824,28 +866,45 @@ def evaluate(model, config, args, best_epoch, logger,
                                      )
 
                                      if sample_rerun_initialized:
-                                         # --- Prepare point cloud for Rerun (moved here, was missing) ---
+                                         # --- Prepare point cloud for Rerun (MODIFIED for full scene support) ---
                                          traj_point_cloud = None # Initialize to None
-                                         if point_cloud_batch is not None and point_cloud_batch.shape[0] > i:
-                                             sample_pc_for_rerun = point_cloud_batch[i].cpu()
-                                             if args.pointcloud_downsample_factor > 1:
-                                                 sample_pc_for_rerun = downsample_point_cloud(
-                                                     sample_pc_for_rerun, 
-                                                     args.pointcloud_downsample_factor
-                                                 )
-                                             traj_point_cloud = sample_pc_for_rerun
                                          
-                                         # Check for trajectory-specific point cloud from the batch (if applicable)
-                                         if 'trajectory_specific_pointcloud' in batch and i < len(batch['trajectory_specific_pointcloud']):
-                                             traj_specific_pc_data = batch['trajectory_specific_pointcloud'][i]
-                                             if traj_specific_pc_data is not None and isinstance(traj_specific_pc_data, torch.Tensor) and traj_specific_pc_data.numel() > 0:
-                                                 processed_traj_specific_pc = traj_specific_pc_data.cpu()
+                                         # Choose point cloud based on user preference
+                                         if args.use_full_scene_pointcloud:
+                                             # Priority 1: Use full scene point cloud if requested
+                                             if point_cloud_batch is not None and point_cloud_batch.shape[0] > i:
+                                                 sample_pc_for_rerun = point_cloud_batch[i].cpu()
                                                  if args.pointcloud_downsample_factor > 1:
-                                                     processed_traj_specific_pc = downsample_point_cloud(
-                                                         processed_traj_specific_pc, 
+                                                     sample_pc_for_rerun = downsample_point_cloud(
+                                                         sample_pc_for_rerun, 
                                                          args.pointcloud_downsample_factor
                                                      )
-                                                 traj_point_cloud = processed_traj_specific_pc # Override with more specific PC if available
+                                                 traj_point_cloud = sample_pc_for_rerun
+                                                 logger.info(f"Using full scene point cloud for sample {i} visualization (points: {traj_point_cloud.shape[0] if traj_point_cloud is not None else 0})")
+                                         else:
+                                             # Priority 2: Use trajectory-specific point cloud if available and requested
+                                             if 'trajectory_specific_pointcloud' in batch and i < len(batch['trajectory_specific_pointcloud']):
+                                                 traj_specific_pc_data = batch['trajectory_specific_pointcloud'][i]
+                                                 if traj_specific_pc_data is not None and isinstance(traj_specific_pc_data, torch.Tensor) and traj_specific_pc_data.numel() > 0:
+                                                     processed_traj_specific_pc = traj_specific_pc_data.cpu()
+                                                     if args.pointcloud_downsample_factor > 1:
+                                                         processed_traj_specific_pc = downsample_point_cloud(
+                                                             processed_traj_specific_pc, 
+                                                             args.pointcloud_downsample_factor
+                                                         )
+                                                     traj_point_cloud = processed_traj_specific_pc
+                                                     logger.info(f"Using trajectory-specific point cloud for sample {i} visualization (points: {traj_point_cloud.shape[0] if traj_point_cloud is not None else 0})")
+                                             
+                                             # Fallback: Use full scene point cloud if trajectory-specific is not available
+                                             if traj_point_cloud is None and point_cloud_batch is not None and point_cloud_batch.shape[0] > i:
+                                                 sample_pc_for_rerun = point_cloud_batch[i].cpu()
+                                                 if args.pointcloud_downsample_factor > 1:
+                                                     sample_pc_for_rerun = downsample_point_cloud(
+                                                         sample_pc_for_rerun, 
+                                                         args.pointcloud_downsample_factor
+                                                     )
+                                                 traj_point_cloud = sample_pc_for_rerun
+                                                 logger.info(f"Fallback to full scene point cloud for sample {i} visualization (trajectory-specific not available)")
                                          # --- End of point cloud preparation ---
 
                                          # Apply transformation for Rerun visualization
@@ -948,17 +1007,23 @@ def evaluate(model, config, args, best_epoch, logger,
                     total_l1 += batch_l1 # batch_l1 is already sum of means for the batch
                     total_rmse_ade += batch_rmse_ade # Accumulate sum of sample RMSEs
                     total_fde += batch_fde # batch_fde is already sum of means for the batch
+                    total_frechet += batch_frechet # batch_frechet is already sum of means for the batch
+                    total_angular_cosine += batch_angular_cosine # batch_angular_cosine is already sum of means for the batch
                     total_valid_samples += valid_samples_in_batch
                     num_batches += 1
                     batch_avg_l1 = batch_l1 / valid_samples_in_batch
                     batch_avg_rmse = batch_rmse_ade / valid_samples_in_batch
                     batch_avg_fde = batch_fde / valid_samples_in_batch
+                    batch_avg_frechet = batch_frechet / valid_samples_in_batch
+                    batch_avg_angular_cosine = batch_angular_cosine / valid_samples_in_batch
                     
-                    logger.info(f"Batch {batch_idx} metrics: L1={batch_avg_l1:.4f}, RMSE={batch_avg_rmse:.4f}, FDE={batch_avg_fde:.4f}")
+                    logger.info(f"Batch {batch_idx} metrics: L1={batch_avg_l1:.4f}, RMSE={batch_avg_rmse:.4f}, FDE={batch_avg_fde:.4f}, Fréchet={batch_avg_frechet:.4f}, Angular_Cos={batch_avg_angular_cosine:.4f}")
                     progress_bar.set_postfix({
                          'Batch L1': f"{batch_avg_l1:.4f}",
                          'Batch RMSE': f"{batch_avg_rmse:.4f}",
-                         'Batch FDE': f"{batch_avg_fde:.4f}"
+                         'Batch FDE': f"{batch_avg_fde:.4f}",
+                         'Batch Fréchet': f"{batch_avg_frechet:.4f}",
+                         'Batch Angular_Cos': f"{batch_avg_angular_cosine:.4f}"
                     })
 
             except Exception as e:
@@ -972,12 +1037,16 @@ def evaluate(model, config, args, best_epoch, logger,
         mean_l1 = total_l1 / total_valid_samples
         mean_rmse = total_rmse_ade / total_valid_samples # This is the overall mean RMSE
         mean_fde = total_fde / total_valid_samples
+        mean_frechet = total_frechet / total_valid_samples
+        mean_angular_cosine = total_angular_cosine / total_valid_samples
 
         logger.info(f"--- Evaluation Complete ---")
         logger.info(f" Model from Epoch: {best_epoch}") # Print the epoch
         logger.info(f" Mean L1 (MAE): {mean_l1:.4f}")
         logger.info(f" Mean RMSE: {mean_rmse:.4f}")
         logger.info(f" Mean FDE: {mean_fde:.4f}")
+        logger.info(f" Mean Fréchet: {mean_frechet:.4f}")
+        logger.info(f" Mean Angular_Cos: {mean_angular_cosine:.4f}")
         
         # Log visualization statistics
         logger.info(f" Visualized {visualized_count} samples")
@@ -993,6 +1062,8 @@ def evaluate(model, config, args, best_epoch, logger,
         mean_l1 = float('inf')
         mean_rmse = float('inf')
         mean_fde = float('inf')
+        mean_frechet = float('inf')
+        mean_angular_cosine = float('inf')
 
     # --- Save Results ---
     results = {
@@ -1003,7 +1074,10 @@ def evaluate(model, config, args, best_epoch, logger,
         'mean_l1': mean_l1,
         'mean_rmse': mean_rmse,
         'mean_fde': mean_fde,
+        'mean_frechet': mean_frechet,
+        'mean_angular_cosine': mean_angular_cosine,
         'first_frame_only_mode': config.use_first_frame_only, # Flag indicating special mode
+        'use_full_scene_pointcloud': args.use_full_scene_pointcloud, # Record point cloud choice
         'num_test_samples_processed': total_valid_samples, # Report processed samples
         'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
         'comment': os.path.basename(os.path.normpath(args.model_path)), # Extract comment from model_path
@@ -1015,51 +1089,64 @@ def evaluate(model, config, args, best_epoch, logger,
         json.dump(results, f, indent=4)
     logger.info(f"Evaluation results saved to {results_path}")
 
-    # --- Sort and Save Best/Worst Reruns and Visualizations ---
+    # --- Sort and Save Best Reruns and Visualizations by Different Metrics ---
     if all_samples_metrics:
-        # Sort samples by L1 loss (ascending for best, descending for worst)
-        all_samples_metrics.sort(key=lambda x: x['l1'])
-        
         num_to_save = args.num_top_worst_to_save
-        logger.info(f"Saving top/worst {num_to_save} Rerun recordings and visualizations...")
-        logger.info(f"Samples sorted by L1 loss (lower is better)")
-
-        # Save best samples
-        logger.info(f"--- Saving {min(num_to_save, len(all_samples_metrics))} best samples (lowest L1 loss) ---")
-        for i in range(min(num_to_save, len(all_samples_metrics))):
-            sample_data = all_samples_metrics[i]
-            logger.info(f"Best sample {i+1}/{num_to_save} (L1: {sample_data['l1']:.4f}): {sample_data['sample_name']}")
-            if sample_data['vis_path'] and os.path.exists(sample_data['vis_path']):
-                try:
-                    shutil.copy(sample_data['vis_path'], best_vis_dir)
-                    logger.info(f"  Copied visualization to {best_vis_dir}")
-                except Exception as e:
-                    logger.error(f"  Error copying visualization {sample_data['vis_path']}: {e}")
-            if sample_data['rerun_path'] and os.path.exists(sample_data['rerun_path']):
-                try:
-                    shutil.copy(sample_data['rerun_path'], best_rerun_dir)
-                    logger.info(f"  Copied Rerun recording to {best_rerun_dir}")
-                except Exception as e:
-                    logger.error(f"  Error copying Rerun recording {sample_data['rerun_path']}: {e}")
-
-        # Save worst samples (from the end of the sorted list)
-        logger.info(f"--- Saving {min(num_to_save, len(all_samples_metrics))} worst samples (highest L1 loss) ---")
-        for i in range(min(num_to_save, len(all_samples_metrics))):
-            sample_data = all_samples_metrics[-(i+1)] # Get from the end
-            logger.info(f"Worst sample {i+1}/{num_to_save} (L1: {sample_data['l1']:.4f}): {sample_data['sample_name']}")
-            if sample_data['vis_path'] and os.path.exists(sample_data['vis_path']):
-                try:
-                    shutil.copy(sample_data['vis_path'], worst_vis_dir)
-                    logger.info(f"  Copied visualization to {worst_vis_dir}")
-                except Exception as e:
-                    logger.error(f"  Error copying visualization {sample_data['vis_path']}: {e}")
-            if sample_data['rerun_path'] and os.path.exists(sample_data['rerun_path']):
-                try:
-                    shutil.copy(sample_data['rerun_path'], worst_rerun_dir)
-                    logger.info(f"  Copied Rerun recording to {worst_rerun_dir}")
-                except Exception as e:
-                    logger.error(f"  Error copying Rerun recording {sample_data['rerun_path']}: {e}")
-    # ------------------------------------------------------------
+        logger.info(f"Saving top {num_to_save} Rerun recordings and visualizations for each metric...")
+        
+        # Create separate directories for different metrics
+        l1_best_rerun_dir = os.path.join(args.output_dir, "l1_best_rerun")
+        l1_best_vis_dir = os.path.join(args.output_dir, "l1_best_visualization")
+        frechet_best_rerun_dir = os.path.join(args.output_dir, "frechet_best_rerun")
+        frechet_best_vis_dir = os.path.join(args.output_dir, "frechet_best_visualization")
+        angular_best_rerun_dir = os.path.join(args.output_dir, "angular_cosine_best_rerun")
+        angular_best_vis_dir = os.path.join(args.output_dir, "angular_cosine_best_visualization")
+        
+        os.makedirs(l1_best_rerun_dir, exist_ok=True)
+        os.makedirs(l1_best_vis_dir, exist_ok=True)
+        os.makedirs(frechet_best_rerun_dir, exist_ok=True)
+        os.makedirs(frechet_best_vis_dir, exist_ok=True)
+        os.makedirs(angular_best_rerun_dir, exist_ok=True)
+        os.makedirs(angular_best_vis_dir, exist_ok=True)
+        
+        # Define metrics and their directories
+        metrics_to_evaluate = [
+            {'name': 'L1', 'key': 'l1', 'ascending': True, 'rerun_dir': l1_best_rerun_dir, 'vis_dir': l1_best_vis_dir},
+            {'name': 'Fréchet', 'key': 'frechet', 'ascending': True, 'rerun_dir': frechet_best_rerun_dir, 'vis_dir': frechet_best_vis_dir},
+            {'name': 'Angular_Cosine', 'key': 'angular_cosine', 'ascending': False, 'rerun_dir': angular_best_rerun_dir, 'vis_dir': angular_best_vis_dir}  # Higher cosine similarity is better
+        ]
+        
+        for metric_info in metrics_to_evaluate:
+            metric_name = metric_info['name']
+            metric_key = metric_info['key']
+            ascending = metric_info['ascending']
+            rerun_dir = metric_info['rerun_dir']
+            vis_dir = metric_info['vis_dir']
+            
+            # Sort samples by the current metric
+            sorted_samples = sorted(all_samples_metrics, key=lambda x: x[metric_key], reverse=not ascending)
+            
+            logger.info(f"--- Saving {min(num_to_save, len(sorted_samples))} best samples by {metric_name} ---")
+            
+            for i in range(min(num_to_save, len(sorted_samples))):
+                sample_data = sorted_samples[i]
+                logger.info(f"Best {metric_name} sample {i+1}/{num_to_save} ({metric_name}: {sample_data[metric_key]:.4f}): {sample_data['sample_name']}")
+                
+                # Copy visualization
+                if sample_data['vis_path'] and os.path.exists(sample_data['vis_path']):
+                    try:
+                        shutil.copy(sample_data['vis_path'], vis_dir)
+                        logger.info(f"  Copied visualization to {vis_dir}")
+                    except Exception as e:
+                        logger.error(f"  Error copying visualization {sample_data['vis_path']}: {e}")
+                
+                # Copy Rerun recording
+                if sample_data['rerun_path'] and os.path.exists(sample_data['rerun_path']):
+                    try:
+                        shutil.copy(sample_data['rerun_path'], rerun_dir)
+                        logger.info(f"  Copied Rerun recording to {rerun_dir}")
+                    except Exception as e:
+                        logger.error(f"  Error copying Rerun recording {sample_data['rerun_path']}: {e}")
 
     return results
 
@@ -1080,16 +1167,17 @@ def main():
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
-    # --- Create subdirectories for best/worst visualizations and Reruns ---
-    best_rerun_dir = os.path.join(output_dir, "best_rerun")
-    best_vis_dir = os.path.join(output_dir, "best_visualization")
-    worst_rerun_dir = os.path.join(output_dir, "worst_rerun")
-    worst_vis_dir = os.path.join(output_dir, "worst_visualization")
+    # --- Create subdirectories for best visualizations and Reruns (worst dirs will be created per metric) ---
+    # NOTE: These directories are now created inside evaluate() function for each metric
+    # best_rerun_dir = os.path.join(output_dir, "best_rerun")
+    # best_vis_dir = os.path.join(output_dir, "best_visualization")
+    # worst_rerun_dir = os.path.join(output_dir, "worst_rerun")
+    # worst_vis_dir = os.path.join(output_dir, "worst_visualization")
     
-    os.makedirs(best_rerun_dir, exist_ok=True)
-    os.makedirs(best_vis_dir, exist_ok=True)
-    os.makedirs(worst_rerun_dir, exist_ok=True)
-    os.makedirs(worst_vis_dir, exist_ok=True)
+    # os.makedirs(best_rerun_dir, exist_ok=True)
+    # os.makedirs(best_vis_dir, exist_ok=True)
+    # os.makedirs(worst_rerun_dir, exist_ok=True)
+    # os.makedirs(worst_vis_dir, exist_ok=True)
     # -----------------------------------------------------------------------
     
     # Setup logger
@@ -1111,6 +1199,7 @@ def main():
     logger.info(f"Number of samples to visualize: {args.num_vis_samples}")
     logger.info(f"Show orientation arrows: {'Enabled' if args.show_ori_arrows else 'Disabled'}")
     logger.info(f"Visualize bounding boxes: {'Enabled' if args.visualize_bbox else 'Disabled'}")
+    logger.info(f"Point cloud choice: {'Full scene' if args.use_full_scene_pointcloud else 'Trajectory-specific'}")
     
     # Log Rerun visualization settings
     logger.info("\n=== RERUN VISUALIZATION SETTINGS ===")
@@ -1119,6 +1208,7 @@ def main():
             logger.info("Rerun visualization for saving recordings: Enabled (viewer will not spawn)")
             logger.info(f"Rerun output directory: {os.path.join(output_dir, 'rerun_visualization')}")
             logger.info(f"Point cloud downsample factor: {args.pointcloud_downsample_factor}")
+            logger.info(f"Point cloud choice: {'Full scene' if args.use_full_scene_pointcloud else 'Trajectory-specific'}")
             logger.info(f"Line width: {args.rerun_line_width}")
             logger.info(f"Point size: {args.rerun_point_size}")
             logger.info(f"Show orientation arrows: {'Enabled' if args.rerun_show_arrows else 'Disabled'}")
@@ -1319,40 +1409,45 @@ def main():
 
     # Run evaluation
     evaluate(model, config, args, best_epoch, logger, 
-             best_rerun_dir, best_vis_dir, worst_rerun_dir, worst_vis_dir)
+             None, None, None, None)
     logger.info("Evaluation completed.")
 
 if __name__ == "__main__":
     main()
 
 # Example usage:
-# 1. Basic evaluation with visualization
+# 1. Basic evaluation with visualization (using full scene point cloud by default)
 # python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --visualize --num_vis_samples 5
 #
-# 2. Evaluating a model trained with use_first_frame_only enabled
-# python evaluate_gimo_adt.py --model_path ./checkpoints/first_frame_only_model.pth --visualize --num_vis_samples 10 --output_dir eval_first_frame_only
+# 2. Evaluating with trajectory-specific point clouds
+# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --visualize --num_vis_samples 5 --no-use_full_scene_pointcloud
 #
-# 3. Evaluating on a specific test set (overriding the one in the checkpoint's config)
+# 3. Evaluating a model trained with use_first_frame_only enabled (with full scene point cloud)
+# python evaluate_gimo_adt.py --model_path ./checkpoints/first_frame_only_model.pth --visualize --num_vis_samples 10 --output_dir eval_first_frame_only --use_full_scene_pointcloud
+#
+# 4. Evaluating on a specific test set (overriding the one in the checkpoint's config)
 # python evaluate_gimo_adt.py --model_path ./checkpoints/gimo_model.pth --adt_dataroot /path/to/test_data --batch_size 8 
 #
-# 4. Example for latest GIMO model with text categories
-# python evaluate_gimo_adt.py --model_path ./checkpoints/gimo_adt_with_categories.pth --visualize --num_vis_samples 20 --output_dir eval_with_categories
+# 5. Example for latest GIMO model with text categories and full scene visualization
+# python evaluate_gimo_adt.py --model_path ./checkpoints/gimo_adt_with_categories.pth --visualize --num_vis_samples 20 --output_dir eval_with_categories --use_full_scene_pointcloud
 #
-# 5. Evaluating 6D pose model with orientation visualization enabled
+# 6. Evaluating 6D pose model with orientation visualization enabled
 # python evaluate_gimo_adt.py --model_path ./checkpoints/full_6d_model.pth --visualize --num_vis_samples 30 --output_dir eval_with_orientation 
 #
-# 6. Using the new command line arguments to override config
+# 7. Using the new command line arguments to override config
 # python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --visualize --show_ori_arrows --use_first_frame_only 
 #
-# 7. Evaluation with Rerun visualization including arrows and semantic bounding boxes with categories
-# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --use_rerun --rerun_show_arrows --rerun_show_semantic_bboxes --num_vis_samples 10
+# 8. Evaluation with Rerun visualization including arrows and semantic bounding boxes with full scene point cloud
+# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --use_rerun --rerun_show_arrows --rerun_show_semantic_bboxes --num_vis_samples 10 --use_full_scene_pointcloud
 #
-# 8. Customized Rerun visualization settings with semantic object categories
-# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --use_rerun --rerun_arrow_length 0.3 --rerun_line_width 0.03 --pointcloud_downsample_factor 5
+# 9. Customized Rerun visualization settings with semantic object categories and trajectory-specific point cloud
+# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --use_rerun --rerun_arrow_length 0.3 --rerun_line_width 0.03 --pointcloud_downsample_factor 5 --no-use_full_scene_pointcloud
 #
-# 9. Evaluation with both Matplotlib and Rerun visualization showing semantic objects
-# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --visualize --visualize_bbox --use_rerun --rerun_show_arrows --rerun_show_semantic_bboxes 
+# 10. Evaluation with both Matplotlib and Rerun visualization showing semantic objects with full scene point cloud
+# python evaluate_gimo_adt.py --model_path ./checkpoints/best_model.pth --visualize --visualize_bbox --use_rerun --rerun_show_arrows --rerun_show_semantic_bboxes --use_full_scene_pointcloud
 #
-# Note: Each semantic bounding box will now appear as an individual object in Rerun,
+# Note: --use_full_scene_pointcloud is the default behavior for better trajectory context visualization
+#       Use --no-use_full_scene_pointcloud to switch back to trajectory-specific point clouds
+#       Each semantic bounding box will appear as an individual object in Rerun,
 #       named by its category (e.g., "food_object_0", "dining_table_1", "cutting_board_2") with category-specific colors
-#       Category names are cleaned for Rerun paths (spaces become underscores, special characters removed) 
+#       Category names are cleaned for Rerun paths (spaces become underscores, special characters removed)

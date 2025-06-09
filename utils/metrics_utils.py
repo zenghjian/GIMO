@@ -12,6 +12,7 @@ import seaborn as sns
 from collections import defaultdict
 import os
 from tqdm import tqdm
+from scipy.spatial.distance import cdist
 
 # Import geometry utilities for rotation conversion
 try:
@@ -764,9 +765,134 @@ def plot_gradient_magnitudes(gradient_logs, component_names=None, output_path=No
     return stats
 
 
+def compute_frechet_distance(pred_traj, gt_traj, mask=None):
+    """
+    Compute the Fréchet distance between two trajectories.
+    
+    Args:
+        pred_traj (torch.Tensor): Predicted trajectory [T, 3]
+        gt_traj (torch.Tensor): Ground truth trajectory [T, 3]
+        mask (torch.Tensor): Mask for valid points [T], optional
+        
+    Returns:
+        torch.Tensor: Fréchet distance (scalar)
+    """
+    # Convert to numpy for computation
+    if isinstance(pred_traj, torch.Tensor):
+        pred_traj = pred_traj.detach().cpu().numpy()
+    if isinstance(gt_traj, torch.Tensor):
+        gt_traj = gt_traj.detach().cpu().numpy()
+    if mask is not None and isinstance(mask, torch.Tensor):
+        mask = mask.detach().cpu().numpy()
+    
+    # Apply mask if provided
+    if mask is not None:
+        valid_indices = np.where(mask > 0)[0]
+        if len(valid_indices) < 2:
+            return torch.tensor(0.0)
+        pred_traj = pred_traj[valid_indices]
+        gt_traj = gt_traj[valid_indices]
+    
+    # Handle case with insufficient points
+    if len(pred_traj) < 2 or len(gt_traj) < 2:
+        return torch.tensor(0.0)
+    
+    # Compute distance matrix between all points
+    # pred_traj: [n, 3], gt_traj: [m, 3]
+    n, m = len(pred_traj), len(gt_traj)
+    
+    # Create distance matrix
+    distance_matrix = cdist(pred_traj, gt_traj, metric='euclidean')
+    
+    # Dynamic programming to compute Fréchet distance
+    # Initialize DP table
+    dp = np.full((n, m), np.inf)
+    dp[0, 0] = distance_matrix[0, 0]
+    
+    # Fill first row
+    for j in range(1, m):
+        dp[0, j] = max(dp[0, j-1], distance_matrix[0, j])
+    
+    # Fill first column
+    for i in range(1, n):
+        dp[i, 0] = max(dp[i-1, 0], distance_matrix[i, 0])
+    
+    # Fill the rest of the table
+    for i in range(1, n):
+        for j in range(1, m):
+            dp[i, j] = max(
+                min(dp[i-1, j], dp[i-1, j-1], dp[i, j-1]),
+                distance_matrix[i, j]
+            )
+    
+    frechet_dist = dp[n-1, m-1]
+    return torch.tensor(frechet_dist, dtype=torch.float32)
+
+
+def compute_angular_cosine_similarity(pred_traj, gt_traj, mask=None):
+    """
+    Compute the Angular Cosine Similarity between movement directions of two trajectories.
+    
+    Args:
+        pred_traj (torch.Tensor): Predicted trajectory [T, 3]
+        gt_traj (torch.Tensor): Ground truth trajectory [T, 3]
+        mask (torch.Tensor): Mask for valid points [T], optional
+        
+    Returns:
+        torch.Tensor: Angular cosine similarity (scalar, 1=perfect, 0=orthogonal, -1=opposite)
+    """
+    device = pred_traj.device
+    
+    # Apply mask if provided
+    if mask is not None:
+        valid_indices = torch.where(mask > 0)[0]
+        if len(valid_indices) < 2:
+            return torch.tensor(0.0, device=device)
+        pred_traj = pred_traj[valid_indices]
+        gt_traj = gt_traj[valid_indices]
+    
+    # Handle case with insufficient points
+    if pred_traj.shape[0] < 2 or gt_traj.shape[0] < 2:
+        return torch.tensor(0.0, device=device)
+    
+    # Compute movement vectors (direction between consecutive points)
+    pred_directions = pred_traj[1:] - pred_traj[:-1]  # [T-1, 3]
+    gt_directions = gt_traj[1:] - gt_traj[:-1]        # [T-1, 3]
+    
+    # Remove zero-length vectors
+    pred_norms = torch.norm(pred_directions, dim=-1)  # [T-1]
+    gt_norms = torch.norm(gt_directions, dim=-1)      # [T-1]
+    
+    # Find non-zero movement vectors
+    valid_pred = pred_norms > 1e-6
+    valid_gt = gt_norms > 1e-6
+    valid_both = valid_pred & valid_gt
+    
+    if torch.sum(valid_both) == 0:
+        return torch.tensor(0.0, device=device)
+    
+    # Filter to valid movements
+    pred_dirs_valid = pred_directions[valid_both]    # [N_valid, 3]
+    gt_dirs_valid = gt_directions[valid_both]        # [N_valid, 3]
+    pred_norms_valid = pred_norms[valid_both]        # [N_valid]
+    gt_norms_valid = gt_norms[valid_both]            # [N_valid]
+    
+    # Normalize direction vectors
+    pred_dirs_normalized = pred_dirs_valid / pred_norms_valid.unsqueeze(-1)  # [N_valid, 3]
+    gt_dirs_normalized = gt_dirs_valid / gt_norms_valid.unsqueeze(-1)        # [N_valid, 3]
+    
+    # Compute cosine similarity for each pair of direction vectors
+    cosine_similarities = torch.sum(pred_dirs_normalized * gt_dirs_normalized, dim=-1)  # [N_valid]
+    
+    # Average cosine similarity across all valid direction pairs
+    mean_cosine_similarity = torch.mean(cosine_similarities)
+    
+    return mean_cosine_similarity
+
+
 def compute_metrics_for_sample(pred_future, gt_future, future_mask):
     """
-    Compute L1 Mean, L2 Mean (for RMSE), and FDE for a single trajectory sample.
+    Compute L1 Mean, L2 Mean (for RMSE), FDE, Fréchet Distance, and Angular Cosine Similarity for a single trajectory sample.
 
     Args:
         pred_future (torch.Tensor): Predicted future trajectory [Fut_Len, 3] (position only)
@@ -777,6 +903,8 @@ def compute_metrics_for_sample(pred_future, gt_future, future_mask):
         l1_mean (torch.Tensor): Mean L1 distance (scalar)
         rmse_ade (torch.Tensor): Mean L2 distance (RMSE analog for ADE) (scalar)
         fde (torch.Tensor): Final Displacement Error (scalar)
+        frechet_distance (torch.Tensor): Fréchet distance between trajectories (scalar)
+        angular_cosine_similarity (torch.Tensor): Angular cosine similarity (scalar)
     """
     # Ensure tensors are on the same device
     device = pred_future.device
@@ -795,7 +923,11 @@ def compute_metrics_for_sample(pred_future, gt_future, future_mask):
     num_valid_points = future_mask.sum()
     if num_valid_points == 0:
         # Return zeros if no valid points to avoid division by zero
-        return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+        return (torch.tensor(0.0, device=device), 
+                torch.tensor(0.0, device=device), 
+                torch.tensor(0.0, device=device),
+                torch.tensor(0.0, device=device),
+                torch.tensor(0.0, device=device))
         
     num_valid_coords = num_valid_points * 3  # Total number of valid coordinate values
 
@@ -827,7 +959,13 @@ def compute_metrics_for_sample(pred_future, gt_future, future_mask):
     # Calculate FDE as the L2 distance between these final points
     fde = torch.norm(final_pred_point - final_gt_point, dim=-1)
 
-    return l1_mean, rmse_ade, fde
+    # --- Fréchet Distance Calculation ---
+    frechet_distance = compute_frechet_distance(pred_future, gt_future, future_mask)
+
+    # --- Angular Cosine Similarity Calculation ---
+    angular_cosine_similarity = compute_angular_cosine_similarity(pred_future, gt_future, future_mask)
+
+    return l1_mean, rmse_ade, fde, frechet_distance, angular_cosine_similarity
 
 
 def gimo_collate_fn(batch, dataset, num_sample_points):
