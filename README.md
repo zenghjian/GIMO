@@ -25,9 +25,15 @@ Key Parameters (`config/adt_config.py`):
 
 *   `--sample_points`: Default: `50000`. Target number of points per point cloud sample in a batch. If a source point cloud has fewer points, points are sampled *with replacement* to reach this number. If more, points are randomly sampled *without replacement*.
 
-*   `--no_text_embedding`: Default: `False`. If `True`, disable the use of object category text embeddings as conditioning.
+*   `--no_text_embedding`: Default: `False`. If `True`, disable the use of object category text embeddings as conditioning. Default embedding dim is `256`.
 
-*  `--no_bbox`: Default: `False`. If `True`, disable the use of bounding boxes as conditioning.
+*  `--no_bbox`: Default: `False`. If `True`, disable the use of bounding boxes as conditioning. Default embedding dim is `256`.
+
+*   `--no_semantic_text`: Default: `False`. If `True`, disable the use of semantic text as conditioning.
+
+*   `--no_semantic_bbox`: Default: `False`. If `True`, disable the use of semantic bbox as conditioning.
+
+*   `--no_end_pose`: Default: `False`. If `True`, disable the use of end pose as conditioning.
 
 *   `--lambda_trans`: Default: `1.0`. Weight for the translation (position) component of the loss.
 

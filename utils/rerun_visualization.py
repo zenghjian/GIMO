@@ -523,6 +523,21 @@ def visualize_trajectory_rerun(
     future_positions_pred_valid = future_positions_pred
     future_orientations_pred_valid = future_orientations_pred
     
+    # --- Determine endpose (last valid point of GT trajectory) ---
+    endpose_position = None
+    endpose_orientation = None
+    
+    if future_positions_gt_valid is not None and future_positions_gt_valid.shape[0] > 0:
+        # Use the last point of GT future trajectory as endpose
+        endpose_position = future_positions_gt_valid[-1]  # [3]
+        if future_orientations_gt_valid is not None and future_orientations_gt_valid.shape[0] > 0:
+            endpose_orientation = future_orientations_gt_valid[-1]  # [6]
+    elif past_positions_valid.shape[0] > 0:
+        # If no future GT, use the last point of past trajectory as endpose
+        endpose_position = past_positions_valid[-1]  # [3]
+        if past_orientations_valid is not None and past_orientations_valid.shape[0] > 0:
+            endpose_orientation = past_orientations_valid[-1]  # [6]
+    
     try:
         current_animation_step = 0 # Initialize animation_step counter first
 
@@ -594,6 +609,38 @@ def visualize_trajectory_rerun(
                                    colors=[bbox_color] * len(single_bbox_edges),
                                    radii=line_width * 0.8
                                ))
+        
+        # Log static endpose visualization (appears immediately and stays visible)
+        if endpose_position is not None:
+            rr.set_time_sequence("animation_step", current_animation_step)
+            
+            # Log endpose as a large, bright sphere
+            rr.log(f"{vis_path}/endpose/target_point",
+                   rr.Points3D(
+                       positions=[endpose_position],
+                       colors=[[1.0, 0.8, 0.0, 1.0]],  # Bright gold/yellow color
+                       radii=point_size * 3.0  # 3x larger than normal points
+                   ))
+            
+            # Add a text label for the endpose
+            rr.log(f"{vis_path}/endpose/label",
+                   rr.TextDocument(
+                       "ENDPOSE",
+                       media_type=rr.MediaType.MARKDOWN
+                   ),
+                   rr.Transform3D(translation=endpose_position + np.array([0.1, 0.1, 0.1])))
+            
+            # Add endpose orientation arrow if available
+            if show_arrows and endpose_orientation is not None:
+                endpose_direction = convert_6d_rotation_to_direction(endpose_orientation, arrow_length * 1.5)
+                rr.log(f"{vis_path}/endpose/orientation_arrow",
+                       rr.Arrows3D(
+                           origins=[endpose_position],
+                           vectors=[endpose_direction],
+                           colors=[[1.0, 0.8, 0.0, 1.0]]  # Bright gold/yellow arrow
+                       ))
+            
+            print(f"Highlighted endpose at position: {endpose_position}")
         
         # current_animation_step is still 0 here. 
         # Trajectory animations will start their loops using this current_animation_step = 0,

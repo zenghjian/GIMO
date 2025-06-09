@@ -147,11 +147,29 @@ def validate(model, dataloader, device, config, epoch):
                 else:
                     semantic_text_categories = None
 
+                # Extract end pose (last valid position) for conditioning
+                end_pose_batch = None
+                if not getattr(config, 'no_end_pose', False):
+                    end_pose_batch = []
+                    for i in range(full_trajectory_batch.shape[0]):
+                        # Get the actual length of this trajectory
+                        trajectory_mask = current_attention_mask_batch[i]
+                        actual_length = torch.sum(trajectory_mask).int().item()
+                        if actual_length > 0:
+                            # Get the last valid pose
+                            last_valid_idx = actual_length - 1
+                            end_pose = full_trajectory_batch[i, last_valid_idx:last_valid_idx+1, :]  # [1, 9]
+                            end_pose_batch.append(end_pose)
+                        else:
+                            # Handle empty trajectory case
+                            end_pose_batch.append(torch.zeros(1, full_trajectory_batch.shape[2], device=device))
+                    end_pose_batch = torch.cat(end_pose_batch, dim=0)  # [B, 9]
+
             except KeyError as e: logger(f"Error: Missing key {e} in batch {batch_idx}. Skipping."); continue
             except Exception as e: logger(f"Error processing batch {batch_idx}: {e}. Skipping."); continue
 
             # 1. Forward pass with input trajectory, point cloud, bbox corners, and category strings
-            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask, semantic_text_categories)
+            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask, semantic_text_categories, end_pose_batch)
 
             # 2. Compute loss
             total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
@@ -1110,8 +1128,26 @@ def main():
             except KeyError as e: logger(f"Error: Missing key {e} in batch {batch_idx}. Skipping."); continue
             except Exception as e: logger(f"Error processing batch {batch_idx}: {e}. Skipping."); continue
 
+            # Extract end pose (last valid position) for conditioning
+            end_pose_batch = None
+            if not getattr(config, 'no_end_pose', False):
+                end_pose_batch = []
+                for i in range(full_trajectory_batch.shape[0]):
+                    # Get the actual length of this trajectory
+                    trajectory_mask = current_attention_mask_batch[i]
+                    actual_length = torch.sum(trajectory_mask).int().item()
+                    if actual_length > 0:
+                        # Get the last valid pose
+                        last_valid_idx = actual_length - 1
+                        end_pose = full_trajectory_batch[i, last_valid_idx:last_valid_idx+1, :]  # [1, 9]
+                        end_pose_batch.append(end_pose)
+                    else:
+                        # Handle empty trajectory case
+                        end_pose_batch.append(torch.zeros(1, full_trajectory_batch.shape[2], device=device))
+                end_pose_batch = torch.cat(end_pose_batch, dim=0)  # [B, 9]
+
             # 1. Forward pass with input trajectory, point cloud, bbox corners, and category strings
-            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask, semantic_text_categories)
+            predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask, semantic_text_categories, end_pose_batch)
 
             # 2. Compute loss
             total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)

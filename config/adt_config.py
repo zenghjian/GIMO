@@ -50,6 +50,7 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.scene_configs.add_argument('--no_semantic_text', action='store_true', default=False, help='Disable semantic text embedding for scene conditioning')
         self.scene_configs.add_argument('--max_bboxes', default=400, type=int, help='Maximum number of bounding boxes for scene conditioning')
         self.scene_configs.add_argument('--semantic_bbox_embed_dim', default=256, type=int, help='Output dimension of semantic bbox embedder')
+        self.scene_configs.add_argument('--semantic_text_embed_dim', default=256, type=int, help='Output dimension of semantic text embedder')
         self.scene_configs.add_argument('--semantic_bbox_hidden_dim', default=128, type=int, help='Hidden dimension in semantic bbox embedder')
         self.scene_configs.add_argument('--semantic_bbox_num_heads', default=4, type=int, help='Number of attention heads in semantic bbox embedder')
         self.scene_configs.add_argument('--semantic_bbox_use_attention', action='store_true', default=True, help='Use attention in semantic bbox embedder')
@@ -78,6 +79,11 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.text_configs.add_argument('--num_object_categories', default=50, type=int, help='Number of object categories (for legacy torch.embedding)')
         self.text_configs.add_argument('--clip_model_name', default="ViT-B/32", type=str, choices=["ViT-B/32", "ViT-B/16", "ViT-L/14"], help='CLIP model to use for category embedding')
         self.text_configs.add_argument('--use_legacy_category_embedding', action='store_true', default=False, help='Use legacy torch.embedding instead of CLIP for category embedding')
+
+        # === End Pose Configuration ===
+        self.end_pose_configs = self.add_argument_group('End Pose Conditioning')
+        self.end_pose_configs.add_argument('--no_end_pose', action='store_true', default=False, help='Disable end pose embedding and conditioning')
+        self.end_pose_configs.add_argument('--end_pose_embed_dim', default=256, type=int, help='Dimension of end pose embedding')
 
         # === Training Configuration ===
         self.train_configs = self.add_argument_group('Training')

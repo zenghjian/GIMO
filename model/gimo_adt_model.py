@@ -312,6 +312,46 @@ class SemanticTextEmbedder(nn.Module):
         # Final projection
         return self.final_proj(embeddings)
 
+
+class EndPoseEmbedder(nn.Module):
+    """Embeds the end pose into a representation of the same dimension as other embeddings."""
+    
+    def __init__(self, input_dim=9, output_dim=256):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(input_dim, output_dim // 4),
+            nn.GELU(),
+            nn.Linear(output_dim // 4, output_dim // 2),
+            nn.GELU(),
+            nn.Linear(output_dim // 2, output_dim),
+        )
+    
+    def forward(self, x):
+        """
+        Process the end pose.
+        
+        Args:
+            x: End pose tensor of shape [batch_size, 1, 9] or [batch_size, 9]
+            
+        Returns:
+            Embedding tensor of shape [batch_size, output_dim]
+        """
+        if x is None:
+            return None
+            
+        # Handle shape [batch_size, 1, 9]
+        if len(x.shape) == 3:
+            batch_size, num_points, input_dim = x.shape
+            assert num_points == 1, f"Expected 1 end pose point, got {num_points}"
+            # Squeeze the middle dimension to get [batch_size, 9]
+            x = x.squeeze(1)
+        
+        # Now x should be [batch_size, 9]
+        assert len(x.shape) == 2, f"Expected 2D tensor [batch_size, input_dim], got shape {x.shape}"
+        
+        # Process through the projection layers
+        return self.proj(x)
+
 class GIMO_ADT_Model(nn.Module):
     """
     GIMO model for ADT Object Motion Prediction.
@@ -376,8 +416,16 @@ class GIMO_ADT_Model(nn.Module):
         # 4. Semantic Text Embedder (for scene-level text category conditioning)
         if self.use_semantic_text:
             self.semantic_text_embedder = SemanticTextEmbedder(
-                output_dim=getattr(config, 'semantic_text_embed_dim', 640),
+                output_dim=getattr(config, 'semantic_text_embed_dim', 256),
                 clip_model=shared_clip_model
+            )
+
+        # 5. End Pose Embedder (for end pose conditioning)
+        self.use_end_pose = not getattr(config, 'no_end_pose', False)
+        if self.use_end_pose:
+            self.end_pose_embedder = EndPoseEmbedder(
+                input_dim=config.object_motion_dim,  # Same as input motion dim (9)
+                output_dim=getattr(config, 'end_pose_embed_dim', 256)
             )
 
         # Bounding Box related layers (as per diagram)
@@ -422,15 +470,24 @@ class GIMO_ADT_Model(nn.Module):
         # Prepare input dims for embedding layer
         # This layer will now potentially receive category embeddings as well
         embed_dim = config.motion_latent_dim
+        print(f"INFO: embed_dim: {embed_dim}")
         if self.use_scene:
             embed_dim += config.scene_feats_dim
+            print(f"INFO: embed_dim after adding scene feats: {config.scene_feats_dim} is {embed_dim}") 
         if not config.no_text_embedding:
             embed_dim += config.category_embed_dim
+            print(f"INFO: embed_dim after adding category embed: {config.category_embed_dim} is {embed_dim}")
         if self.use_semantic_bbox:
             embed_dim += config.semantic_bbox_embed_dim
+            print(f"INFO: embed_dim after adding semantic bbox embed: {config.semantic_bbox_embed_dim} is {embed_dim}")
         if self.use_semantic_text:
-            embed_dim += getattr(config, 'semantic_text_embed_dim', 640)
+            embed_dim += getattr(config, 'semantic_text_embed_dim', 256)
+            print(f"INFO: embed_dim after adding semantic text embed: {getattr(config, 'semantic_text_embed_dim', 256)} is {embed_dim}")
+        if self.use_end_pose:
+            embed_dim += getattr(config, 'end_pose_embed_dim', 256)
+            print(f"INFO: embed_dim after adding end pose embed: {getattr(config, 'end_pose_embed_dim', 256)} is {embed_dim}")
         
+        print(f"INFO: final embed_dim: {embed_dim}")
         self.embedding_layer = PositionwiseFeedForward(
             d_in=embed_dim, 
             d_hid=embed_dim, 
@@ -452,7 +509,7 @@ class GIMO_ADT_Model(nn.Module):
         self.outputlayer = nn.Linear(config.output_latent_dim, config.object_motion_dim)
     
     def forward(self, input_trajectory, point_cloud, bounding_box_corners=None, object_category_ids=None, 
-                semantic_bbox_info=None, semantic_bbox_mask=None, semantic_text_categories=None):
+                semantic_bbox_info=None, semantic_bbox_mask=None, semantic_text_categories=None, end_pose=None):
         """
         Forward pass of the GIMO ADT model with 3D bounding box integration.
         
@@ -464,6 +521,7 @@ class GIMO_ADT_Model(nn.Module):
             semantic_bbox_info: [batch_size, max_bboxes, 12] - semantic bbox information for scene conditioning (optional if no_semantic_bbox=True)
             semantic_bbox_mask: [batch_size, max_bboxes] - mask for semantic bbox (1 for real, 0 for padding) (optional if no_semantic_bbox=True)
             semantic_text_categories: List of category strings for semantic text conditioning (optional if no_semantic_text=True)
+            end_pose: [batch_size, 9] - end pose for conditioning
             
         Returns:
             torch.Tensor: Predicted future trajectory [batch_size, trajectory_length, 9]
@@ -504,6 +562,11 @@ class GIMO_ADT_Model(nn.Module):
         semantic_text_embeddings = None
         if self.use_semantic_text and semantic_text_categories is not None:
             semantic_text_embeddings = self.semantic_text_embedder(semantic_text_categories, semantic_bbox_mask)  # [B, semantic_text_embed_dim]
+        
+        # Process End Pose (if enabled)
+        end_pose_embeddings = None
+        if self.use_end_pose and end_pose is not None:
+            end_pose_embeddings = self.end_pose_embedder(end_pose)  # [B, end_pose_embed_dim]
         
         # Process Bounding Box (if enabled)
         if self.use_bbox and bounding_box_corners is not None:
@@ -580,9 +643,14 @@ class GIMO_ADT_Model(nn.Module):
             semantic_text_embeddings_expanded = semantic_text_embeddings.unsqueeze(1).repeat(1, self.sequence_length, 1)  # [B, sequence_length, semantic_text_embed_dim]
             features_to_fuse.append(semantic_text_embeddings_expanded)
         
+        if end_pose_embeddings is not None:
+            # Expand end pose embeddings to sequence length
+            end_pose_embeddings_expanded = end_pose_embeddings.unsqueeze(1).repeat(1, self.sequence_length, 1)  # [B, sequence_length, end_pose_embed_dim]
+            features_to_fuse.append(end_pose_embeddings_expanded)
+        
         # Concatenate all features along the last dimension
         final_fused_input = torch.cat(features_to_fuse, dim=2)
-    
+        
         cross_modal_embedding = self.embedding_layer(final_fused_input) # Output: [B, sequence_length, embed_input_dim]
 
         

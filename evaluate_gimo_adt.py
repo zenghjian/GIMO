@@ -510,6 +510,24 @@ def evaluate(model, config, args, best_epoch, logger,
                 if not getattr(config, 'no_semantic_text', False):
                     semantic_text_categories = batch.get('scene_bbox_categories', None)
 
+                # Extract end pose (last valid position) for conditioning
+                end_pose_batch = None
+                if hasattr(config, 'use_end_pose') and not getattr(config, 'no_end_pose', False):
+                    end_pose_batch = []
+                    for i in range(full_trajectory_batch.shape[0]):
+                        # Get the actual length of this trajectory
+                        trajectory_mask = full_attention_mask[i]
+                        actual_length = torch.sum(trajectory_mask).int().item()
+                        if actual_length > 0:
+                            # Get the last valid pose
+                            last_valid_idx = actual_length - 1
+                            end_pose = full_trajectory_batch[i, last_valid_idx:last_valid_idx+1, :]  # [1, 9]
+                            end_pose_batch.append(end_pose)
+                        else:
+                            # Handle empty trajectory case
+                            end_pose_batch.append(torch.zeros(1, full_trajectory_batch.shape[2], device=device))
+                    end_pose_batch = torch.cat(end_pose_batch, dim=0)  # [B, 9]
+
                 # --- Dynamically determine input history length for the batch (evaluation) ---
                 actual_lengths_batch = full_attention_mask.sum(dim=1).int() # Shape [B]
 
@@ -545,9 +563,9 @@ def evaluate(model, config, args, best_epoch, logger,
                 # Update forward call to match training script signature with positional arguments
                 # Handle different signatures between regular and autoregressive models
                 if config.timestep == 1:  # Autoregressive model
-                    predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask, semantic_text_categories)
+                    predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask, semantic_text_categories, end_pose_batch)
                 else:  # Regular model
-                    predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask, semantic_text_categories)
+                    predicted_full_trajectory = model(input_trajectory_batch, point_cloud_batch, bbox_corners_input_batch, object_category_ids, semantic_bbox_info, semantic_bbox_mask, semantic_text_categories, end_pose_batch)
                 total_loss, loss_dict = model.compute_loss(predicted_full_trajectory, batch)
                 logger.info(f"Loss: {total_loss:.4f}")
 
