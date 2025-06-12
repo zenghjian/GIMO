@@ -59,6 +59,7 @@ def rotation_6d_to_matrix(r6d):
 def rotation_6d_to_matrix_torch(r6d):
     """
     PyTorch version: Convert 6D representation to rotation matrix.
+    Numerically stable version with epsilon to prevent division by zero.
     
     Args:
         r6d: 6D rotation representation tensor [..., 6]
@@ -66,22 +67,61 @@ def rotation_6d_to_matrix_torch(r6d):
     Returns:
         torch.Tensor: rotation matrix tensor [..., 3, 3]
     """
+    eps = 1e-8  # Small epsilon to prevent division by zero
+    
     # Extract two columns
     x = r6d[..., :3]  # First column
     y = r6d[..., 3:]  # Second column
     
-    # Normalize first column
-    x = x / torch.norm(x, dim=-1, keepdim=True)
+    # Normalize first column with epsilon for numerical stability
+    x_norm = torch.norm(x, dim=-1, keepdim=True)
+    x = x / torch.clamp(x_norm, min=eps)
     
     # Make second column orthogonal to first using Gram-Schmidt
     t = y - torch.sum(x * y, dim=-1, keepdim=True) * x
-    y = t / torch.norm(t, dim=-1, keepdim=True)
+    t_norm = torch.norm(t, dim=-1, keepdim=True)
+    
+    # Handle degenerate case where t becomes very small (vectors nearly parallel)
+    # In this case, create a random orthogonal vector to x
+    mask = t_norm.squeeze(-1) < eps * 10  # More conservative threshold
+    if mask.any():
+        # Create orthogonal vector by swapping and negating components
+        orthogonal = torch.zeros_like(x)
+        orthogonal[..., 0] = -x[..., 1]  
+        orthogonal[..., 1] = x[..., 0]
+        orthogonal[..., 2] = 0
+        # If x is close to z-axis, use different approach
+        z_axis_mask = torch.norm(x[..., :2], dim=-1) < eps
+        orthogonal[z_axis_mask, 0] = 1
+        orthogonal[z_axis_mask, 1] = 0
+        orthogonal[z_axis_mask, 2] = 0
+        
+        # Normalize the orthogonal vector
+        orthogonal = orthogonal / torch.clamp(torch.norm(orthogonal, dim=-1, keepdim=True), min=eps)
+        
+        # Replace degenerate t with orthogonal vector
+        t[mask] = orthogonal[mask]
+        t_norm = torch.norm(t, dim=-1, keepdim=True)
+    
+    y = t / torch.clamp(t_norm, min=eps)
     
     # Third column is cross product
     z = torch.cross(x, y, dim=-1)
     
+    # Ensure z is also normalized (should be automatically, but for safety)
+    z = z / torch.clamp(torch.norm(z, dim=-1, keepdim=True), min=eps)
+    
     # Stack to create rotation matrix
-    return torch.stack([x, y, z], dim=-1)
+    rotation_matrix = torch.stack([x, y, z], dim=-1)
+    
+    # Final check: replace any remaining NaN with identity matrix
+    nan_mask = torch.isnan(rotation_matrix).any(dim=(-2, -1))
+    if nan_mask.any():
+        identity = torch.eye(3, device=rotation_matrix.device, dtype=rotation_matrix.dtype)
+        identity = identity.expand_as(rotation_matrix)
+        rotation_matrix[nan_mask] = identity[nan_mask]
+    
+    return rotation_matrix
 
 
 def rotation_matrix_to_6d_torch(rotation_matrix):

@@ -650,7 +650,6 @@ class GIMO_ADT_Model(nn.Module):
         
         # Concatenate all features along the last dimension
         final_fused_input = torch.cat(features_to_fuse, dim=2)
-        
         cross_modal_embedding = self.embedding_layer(final_fused_input) # Output: [B, sequence_length, embed_input_dim]
 
         

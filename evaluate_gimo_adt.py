@@ -40,6 +40,47 @@ from utils.metrics_utils import (
     gimo_collate_fn
 )
 
+def extract_pointcloud_along_trajectory(scene_pc: torch.Tensor, trajectory: torch.Tensor, radius: float) -> Optional[torch.Tensor]:
+    """
+    Extracts a point cloud from the scene that is within a certain radius of any point on the trajectory.
+    This is intended for visualization purposes during evaluation.
+
+    Args:
+        scene_pc (torch.Tensor): The full scene point cloud, shape [N, 3].
+        trajectory (torch.Tensor): The object trajectory, shape [T, 3].
+        radius (float): The radius around the trajectory to include points.
+
+    Returns:
+        Optional[torch.Tensor]: The extracted point cloud, shape [M, 3], or None if inputs are invalid.
+    """
+    if scene_pc is None or trajectory is None or scene_pc.numel() == 0 or trajectory.numel() == 0:
+        return None
+    
+    # Ensure tensors are on the same device
+    device = trajectory.device
+    scene_pc = scene_pc.to(device)
+    
+    # Calculate squared distances for efficiency
+    radius_sq = radius ** 2
+    
+    # Expand dims for broadcasting: [T, 1, 3] and [1, N, 3]
+    trajectory_expanded = trajectory.unsqueeze(1)
+    scene_pc_expanded = scene_pc.unsqueeze(0)
+    
+    # Calculate squared distances between each trajectory point and each scene point
+    # dist_sq shape: [T, N]
+    dist_sq = torch.sum((trajectory_expanded - scene_pc_expanded) ** 2, dim=2)
+    
+    # Find the minimum distance from each scene point to any point on the trajectory
+    # min_dist_sq shape: [N]
+    min_dist_sq, _ = torch.min(dist_sq, dim=0)
+    
+    # Create a mask for points within the radius
+    mask = min_dist_sq <= radius_sq
+    
+    # Return the filtered point cloud
+    return scene_pc[mask]
+
 def setup_logger(output_dir):
     """Set up logger to both write to console and to file."""
     # Create a logger
@@ -121,6 +162,7 @@ def parse_args():
     parser.add_argument(
         "--visualize",
         action="store_true",
+        default=True,
         help="Enable visualization of trajectories"
     )
     parser.add_argument(
@@ -132,6 +174,7 @@ def parse_args():
     parser.add_argument(
         "--visualize_bbox",
         action="store_true",
+        default=True,
         help="Enable visualization of bounding boxes"
     )
     
@@ -139,6 +182,7 @@ def parse_args():
     parser.add_argument(
         "--use_rerun",
         action="store_true",
+        default=True,
         help="Enable Rerun visualization"
     )
     parser.add_argument(
@@ -201,6 +245,13 @@ def parse_args():
         "--use_full_scene_pointcloud",
         action="store_true",
         help="Use complete scene pointcloud for visualization instead of trajectory-specific pointcloud"
+    )
+    parser.add_argument(
+        '--use_trajectory_pointcloud',
+        type=float,
+        default=1.0,
+        metavar='RADIUS',
+        help='Extract and use a trajectory-specific point cloud for visualization with the specified radius.'
     )
     
     # --- Model Configuration Overrides ---
@@ -512,7 +563,7 @@ def evaluate(model, config, args, best_epoch, logger,
 
                 # Extract end pose (last valid position) for conditioning
                 end_pose_batch = None
-                if hasattr(config, 'use_end_pose') and not getattr(config, 'no_end_pose', False):
+                if not getattr(config, 'no_end_pose', False):
                     end_pose_batch = []
                     for i in range(full_trajectory_batch.shape[0]):
                         # Get the actual length of this trajectory
@@ -826,21 +877,38 @@ def evaluate(model, config, args, best_epoch, logger,
                                  
                                  # Apply transformation for visualization
                                  gt_full_denorm_vis = transform_coords_for_visualization(gt_full_denorm.cpu())
-                                 
                                  # Choose point cloud for visualization based on user preference
-                                 if args.use_full_scene_pointcloud and 'scene_pointcloud' in batch and i < len(batch['scene_pointcloud']):
-                                     # Use complete scene point cloud if available and requested
-                                     scene_pc_data = batch['scene_pointcloud'][i]
-                                     if scene_pc_data is not None and isinstance(scene_pc_data, torch.Tensor) and scene_pc_data.numel() > 0:
-                                         sample_point_cloud_vis = transform_coords_for_visualization(scene_pc_data.cpu())
-                                         logger.info(f"Using full scene pointcloud for visualization ({scene_pc_data.shape[0]} points)")
-                                     else:
-                                         # Fallback to default point cloud if scene pointcloud is not available
-                                         sample_point_cloud_vis = transform_coords_for_visualization(point_cloud_batch[i].cpu())
-                                         logger.info(f"Scene pointcloud not available, using default point cloud for visualization")
-                                 else:
-                                     # Use default point cloud (trajectory-specific or sampled)
+                                 sample_point_cloud_vis = None # Initialize
+                                 
+                                 if args.use_trajectory_pointcloud is not None:
+                                     # Priority 1: Extract point cloud along the trajectory from the scene_pointcloud
+                                     if 'scene_pointcloud' in batch and i < len(batch['scene_pointcloud']):
+                                         scene_pc_data = batch['scene_pointcloud'][i]
+                                         if scene_pc_data is not None and isinstance(scene_pc_data, torch.Tensor) and scene_pc_data.numel() > 0:
+                                             extracted_pc = extract_pointcloud_along_trajectory(
+                                                 scene_pc=scene_pc_data.cpu(),
+                                                 trajectory=gt_full_denorm.cpu(),
+                                                 radius=args.use_trajectory_pointcloud
+                                             )
+                                             if extracted_pc is not None:
+                                                 sample_point_cloud_vis = transform_coords_for_visualization(extracted_pc)
+                                                 logger.info(f"Using trajectory-specific pointcloud (radius={args.use_trajectory_pointcloud}) with {extracted_pc.shape[0]} points.")
+                                         else:
+                                             logger.warning("`--use_trajectory_pointcloud` was specified but scene_pointcloud is not available for this sample.")
+                                 
+                                 elif args.use_full_scene_pointcloud:
+                                     # Priority 2: Use complete scene point cloud if available and requested
+                                     if 'scene_pointcloud' in batch and i < len(batch['scene_pointcloud']):
+                                         scene_pc_data = batch['scene_pointcloud'][i]
+                                         if scene_pc_data is not None and isinstance(scene_pc_data, torch.Tensor) and scene_pc_data.numel() > 0:
+                                             sample_point_cloud_vis = transform_coords_for_visualization(scene_pc_data.cpu())
+                                             logger.info(f"Using full scene pointcloud for visualization ({scene_pc_data.shape[0]} points)")
+                                 
+                                 if sample_point_cloud_vis is None:
+                                     # Fallback to the default point cloud from the batch (e.g., from dataset's trajectory_specific_pointcloud)
                                      sample_point_cloud_vis = transform_coords_for_visualization(point_cloud_batch[i].cpu())
+                                     logger.info(f"Using default pointcloud from dataset for visualization.")
+
                                  
                                  sample_bbox_corners_vis = transform_coords_for_visualization(sample_bbox_corners_cpu)
 
@@ -872,42 +940,36 @@ def evaluate(model, config, args, best_epoch, logger,
                                      if sample_rerun_initialized:
                                          # --- Prepare point cloud for Rerun (moved here, was missing) ---
                                          traj_point_cloud = None # Initialize to None
-                                         if point_cloud_batch is not None and point_cloud_batch.shape[0] > i:
-                                             sample_pc_for_rerun = point_cloud_batch[i].cpu()
-                                             if args.pointcloud_downsample_factor > 1:
-                                                 sample_pc_for_rerun = downsample_point_cloud(
-                                                     sample_pc_for_rerun, 
-                                                     args.pointcloud_downsample_factor
-                                                 )
-                                             traj_point_cloud = sample_pc_for_rerun
                                          
-                                         # Check for trajectory-specific point cloud from the batch (if applicable)
-                                         if 'trajectory_specific_pointcloud' in batch and i < len(batch['trajectory_specific_pointcloud']):
-                                             traj_specific_pc_data = batch['trajectory_specific_pointcloud'][i]
-                                             if traj_specific_pc_data is not None and isinstance(traj_specific_pc_data, torch.Tensor) and traj_specific_pc_data.numel() > 0:
-                                                 processed_traj_specific_pc = traj_specific_pc_data.cpu()
-                                                 if args.pointcloud_downsample_factor > 1:
-                                                     processed_traj_specific_pc = downsample_point_cloud(
-                                                         processed_traj_specific_pc, 
-                                                         args.pointcloud_downsample_factor
+                                         if args.use_trajectory_pointcloud is not None:
+                                             # Priority 1 for Rerun: Extract from scene_pointcloud
+                                             if 'scene_pointcloud' in batch and i < len(batch['scene_pointcloud']):
+                                                 scene_pc_data = batch['scene_pointcloud'][i]
+                                                 if scene_pc_data is not None and isinstance(scene_pc_data, torch.Tensor) and scene_pc_data.numel() > 0:
+                                                     traj_point_cloud = extract_pointcloud_along_trajectory(
+                                                         scene_pc=scene_pc_data.cpu(),
+                                                         trajectory=gt_full_denorm.cpu(),
+                                                         radius=args.use_trajectory_pointcloud
                                                      )
-                                                 traj_point_cloud = processed_traj_specific_pc # Override with more specific PC if available
                                          
-                                         # Check for complete scene point cloud if requested
-                                         if args.use_full_scene_pointcloud and 'scene_pointcloud' in batch and i < len(batch['scene_pointcloud']):
-                                             # Use complete scene point cloud if available and requested
-                                             scene_pc_data = batch['scene_pointcloud'][i]
-                                             if scene_pc_data is not None and isinstance(scene_pc_data, torch.Tensor) and scene_pc_data.numel() > 0:
-                                                 processed_scene_pc = scene_pc_data.cpu()
-                                                 if args.pointcloud_downsample_factor > 1:
-                                                     processed_scene_pc = downsample_point_cloud(
-                                                         processed_scene_pc, 
-                                                         args.pointcloud_downsample_factor
-                                                     )
-                                                 traj_point_cloud = processed_scene_pc # Override with full scene PC if available
-                                                 logger.info(f"Using full scene pointcloud for Rerun visualization ({scene_pc_data.shape[0]} points)")
-                                             else:
-                                                 logger.info(f"Scene pointcloud not available for Rerun, using default")
+                                         elif args.use_full_scene_pointcloud:
+                                             # Priority 2 for Rerun: Use full scene pointcloud
+                                             if 'scene_pointcloud' in batch and i < len(batch['scene_pointcloud']):
+                                                 scene_pc_data = batch['scene_pointcloud'][i]
+                                                 if scene_pc_data is not None and isinstance(scene_pc_data, torch.Tensor) and scene_pc_data.numel() > 0:
+                                                     traj_point_cloud = scene_pc_data.cpu()
+                                         
+                                         if traj_point_cloud is None:
+                                             # Fallback for Rerun: Use default point cloud (from dataset)
+                                             if point_cloud_batch is not None and point_cloud_batch.shape[0] > i:
+                                                 traj_point_cloud = point_cloud_batch[i].cpu()
+
+                                         # Downsample the selected point cloud
+                                         if traj_point_cloud is not None and args.pointcloud_downsample_factor > 1:
+                                             traj_point_cloud = downsample_point_cloud(
+                                                 traj_point_cloud, 
+                                                 args.pointcloud_downsample_factor
+                                             )
                                          
                                          # --- End of point cloud preparation ---
 

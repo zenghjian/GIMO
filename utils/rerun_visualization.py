@@ -622,13 +622,13 @@ def visualize_trajectory_rerun(
                        radii=point_size * 3.0  # 3x larger than normal points
                    ))
             
-            # Add a text label for the endpose
-            rr.log(f"{vis_path}/endpose/label",
-                   rr.TextDocument(
-                       "ENDPOSE",
-                       media_type=rr.MediaType.MARKDOWN
-                   ),
-                   rr.Transform3D(translation=endpose_position + np.array([0.1, 0.1, 0.1])))
+            # # Add a text label for the endpose
+            # rr.log(f"{vis_path}/endpose/label",
+            #        rr.TextDocument(
+            #            "ENDPOSE",
+            #            media_type=rr.MediaType.MARKDOWN
+            #        ),
+            #        rr.Transform3D(translation=endpose_position + np.array([0.1, 0.1, 0.1])))
             
             # Add endpose orientation arrow if available
             if show_arrows and endpose_orientation is not None:
