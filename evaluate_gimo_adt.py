@@ -1040,7 +1040,9 @@ def evaluate(model, config, args, best_epoch, logger,
                                              line_width=args.rerun_line_width,
                                              point_size=args.rerun_point_size,
                                              show_arrows=args.rerun_show_arrows,
-                                             show_semantic_bboxes=args.rerun_show_semantic_bboxes
+                                             show_semantic_bboxes=args.rerun_show_semantic_bboxes,
+                                             method_name='our',
+                                             pred_color='red'
                                          )
 
                                          # Explicitly save if init fell back

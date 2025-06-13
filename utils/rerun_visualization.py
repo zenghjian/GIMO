@@ -428,6 +428,8 @@ def visualize_trajectory_rerun(
     object_name="object",
     sequence_name="sequence",
     segment_idx=None,
+    method_name="baseline",
+    pred_color=None,
     arrow_length=0.3,
     line_width=0.02,
     point_size=0.03,
@@ -455,6 +457,10 @@ def visualize_trajectory_rerun(
         object_name: Name/ID of the object, used to create a unique path in Rerun.
         sequence_name: Name of the sequence, used in the Rerun path.
         segment_idx: Optional segment index, used in the Rerun path.
+        method_name: Name of the method (e.g., "baseline", "our"), used in the Rerun path for distinction.
+        pred_color: Color for predicted trajectory. Can be a predefined color name string or RGBA list.
+                   Available predefined colors: 'red', 'orange', 'purple', 'cyan', 'magenta', 'yellow'.
+                   If None, defaults to 'red'.
         arrow_length: Length of orientation arrows.
         line_width: Width of trajectory lines.
         point_size: Size of trajectory points.
@@ -464,10 +470,65 @@ def visualize_trajectory_rerun(
     if not HAS_RERUN:
         return False
     
+    # Predefined colors for predicted trajectories
+    PREDEFINED_COLORS = {
+        'red': {
+            'path_color': [1.0, 0.6, 0.6, 0.7],    # Lighter Red for path
+            'point_color': [1.0, 0.3, 0.3, 0.5],   # Solid Red for points
+            'arrow_color': [1.0, 0.3, 0.3, 0.8]    # Red for arrows
+        },
+        'orange': {
+            'path_color': [1.0, 0.8, 0.4, 0.7],    # Lighter Orange for path
+            'point_color': [1.0, 0.6, 0.2, 0.5],   # Solid Orange for points
+            'arrow_color': [1.0, 0.6, 0.2, 0.8]    # Orange for arrows
+        },
+        'purple': {
+            'path_color': [0.8, 0.6, 1.0, 0.7],    # Lighter Purple for path
+            'point_color': [0.6, 0.3, 1.0, 0.5],   # Solid Purple for points
+            'arrow_color': [0.6, 0.3, 1.0, 0.8]    # Purple for arrows
+        },
+        'cyan': {
+            'path_color': [0.4, 0.9, 1.0, 0.7],    # Lighter Cyan for path
+            'point_color': [0.2, 0.8, 1.0, 0.5],   # Solid Cyan for points
+            'arrow_color': [0.2, 0.8, 1.0, 0.8]    # Cyan for arrows
+        },
+        'magenta': {
+            'path_color': [1.0, 0.6, 0.8, 0.7],    # Lighter Magenta for path
+            'point_color': [1.0, 0.3, 0.6, 0.5],   # Solid Magenta for points
+            'arrow_color': [1.0, 0.3, 0.6, 0.8]    # Magenta for arrows
+        },
+        'yellow': {
+            'path_color': [1.0, 1.0, 0.6, 0.7],    # Lighter Yellow for path
+            'point_color': [1.0, 0.9, 0.3, 0.5],   # Solid Yellow for points
+            'arrow_color': [1.0, 0.9, 0.3, 0.8]    # Yellow for arrows
+        }
+    }
+    
+    # Determine prediction colors
+    if pred_color is None:
+        # Default to red
+        pred_colors = PREDEFINED_COLORS['red']
+    elif isinstance(pred_color, str) and pred_color.lower() in PREDEFINED_COLORS:
+        # Use predefined color
+        pred_colors = PREDEFINED_COLORS[pred_color.lower()]
+    elif isinstance(pred_color, (list, tuple)) and len(pred_color) >= 3:
+        # Custom RGBA color provided
+        if len(pred_color) == 3:
+            pred_color = list(pred_color) + [0.7]  # Add alpha if not provided
+        pred_colors = {
+            'path_color': [pred_color[0], pred_color[1], pred_color[2], pred_color[3] * 0.9],  # Slightly more transparent for path
+            'point_color': [pred_color[0] * 0.8, pred_color[1] * 0.8, pred_color[2] * 0.8, pred_color[3] * 0.7],  # Darker for points
+            'arrow_color': [pred_color[0] * 0.8, pred_color[1] * 0.8, pred_color[2] * 0.8, pred_color[3]]  # Darker for arrows
+        }
+    else:
+        # Fallback to red if invalid color provided
+        print(f"Warning: Invalid pred_color '{pred_color}', falling back to red")
+        pred_colors = PREDEFINED_COLORS['red']
+    
     vis_path = f"trajectories/{sequence_name}"
     if segment_idx is not None:
         vis_path += f"/segment_{segment_idx}"
-    vis_path += f"/{object_name}"
+    vis_path += f"/{method_name}/{object_name}"
     
     # Convert all inputs to numpy arrays
     if isinstance(past_positions, torch.Tensor):
@@ -810,7 +871,7 @@ def visualize_trajectory_rerun(
                     rr.log(f"{vis_path}/trajectory/pred_path",
                            rr.LineStrips3D(
                                [points_to_log_pred],
-                               colors=[[1, 0.6, 0.6, 0.7]], # Lighter Red
+                               colors=[pred_colors['path_color']], # Use configurable prediction color
                                radii=line_width
                            ))
                 
@@ -819,7 +880,7 @@ def visualize_trajectory_rerun(
                     rr.log(f"{vis_path}/trajectory/pred_points",
                            rr.Points3D(
                                positions=future_positions_pred_valid[0:t+1],
-                               colors=[1, 0.3, 0.3, 0.5], # Solid Red
+                               colors=pred_colors['point_color'], # Use configurable prediction color
                                radii=point_size
                            ))
                 
@@ -833,7 +894,7 @@ def visualize_trajectory_rerun(
                            rr.Arrows3D(
                                origins=[current_position],
                                vectors=[direction_vector],
-                               colors=[1, 0.3, 0.3, 0.8]  # Red arrows
+                               colors=pred_colors['arrow_color']  # Use configurable prediction color
                            ))
                 
                 current_animation_step += 1
