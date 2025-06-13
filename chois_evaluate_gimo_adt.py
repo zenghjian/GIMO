@@ -98,10 +98,12 @@ def parse_args():
     parser.add_argument('--use_trajectory_pointcloud', type=float, default=1.0, metavar='RADIUS', help='Extract and use a trajectory-specific point cloud for visualization with the specified radius.')
     parser.add_argument("--show_ori_arrows", action="store_true", help="Show orientation arrows in visualizations")
     parser.add_argument("--num_top_worst_to_save", type=int, default=10, help="Number of best and worst Rerun recordings and visualizations to save.")
+    parser.add_argument("--method_name", type=str, default='baseline', help="Method name for visualization (e.g., 'baseline', 'our'). Overrides checkpoint config if provided.")
+    parser.add_argument("--pred_color", type=str, default='orange', help="Prediction color for visualization (e.g., 'red', 'orange', 'purple', 'cyan', 'magenta', 'yellow'). Overrides checkpoint config if provided.")
 
     return parser.parse_args()
 
-def load_model_and_config(checkpoint_path, device, logger):
+def load_model_and_config(checkpoint_path, device, logger, args=None):
     """
     Load SimpleTrajectoryTransformer and its config from a checkpoint.
     """
@@ -120,6 +122,25 @@ def load_model_and_config(checkpoint_path, device, logger):
         
     config_dict = checkpoint['config']
     config = argparse.Namespace(**config_dict)
+    
+    # Add missing visualization parameters with defaults if they don't exist
+    if not hasattr(config, 'method_name'):
+        config.method_name = 'baseline'
+        logger.info("Added missing method_name parameter with default value: baseline")
+    
+    if not hasattr(config, 'pred_color'):
+        config.pred_color = 'red'
+        logger.info("Added missing pred_color parameter with default value: red")
+    
+    # Override with command line arguments if provided
+    if args:
+        if args.method_name is not None:
+            config.method_name = args.method_name
+            logger.info(f"Overriding method_name with command line value: {args.method_name}")
+        
+        if args.pred_color is not None:
+            config.pred_color = args.pred_color
+            logger.info(f"Overriding pred_color with command line value: {args.pred_color}")
     
     logger.info("Configuration loaded from checkpoint:")
     logger.info(str(config))
@@ -332,7 +353,15 @@ def evaluate(model, config, args, best_epoch, logger):
                                 logger.info(f"Creating Rerun visualization for: {sample_recording_name}")
                                 
                                 # Initialize rerun recording
-                                rr.init(f"adt_trajectory_{sample_recording_name}", spawn=False)
+                                sample_recording_name = filename_base # e.g., "obj_seq_seg_batch"
+                                logger.info(f"Attempting Rerun visualization for sample: {sample_recording_name}")
+
+                                # Initialize Rerun for THIS SPECIFIC SAMPLE.
+                                sample_rerun_initialized, returned_sample_rrd_path = initialize_rerun(
+                                    recording_name=sample_recording_name, 
+                                    spawn=False, # No viewer per sample
+                                    output_dir=per_sample_rrd_basedir 
+                                )
                                 
                                 # Set a base time to ensure data is logged
                                 rr.set_time_sequence("animation_step", 0)
@@ -458,7 +487,7 @@ def main():
         logger.info(f"  {arg}: {value}")
     
     try:
-        model, config, best_epoch = load_model_and_config(args.model_path, device, logger)
+        model, config, best_epoch = load_model_and_config(args.model_path, device, logger, args)
         evaluate(model, config, args, best_epoch, logger)
     except Exception as e:
         logger.error(f"An error occurred during evaluation: {e}")
