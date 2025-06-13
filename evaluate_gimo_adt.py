@@ -272,6 +272,9 @@ def parse_args():
         help="Number of best and worst Rerun recordings and visualizations to save."
     )
 
+    parser.add_argument("--method_name", type=str, default='our', help="Method name for visualization (e.g., 'baseline', 'our'). Overrides checkpoint config if provided.")
+    parser.add_argument("--pred_color", type=str, default='red', help="Prediction color for visualization (e.g., 'red', 'orange', 'purple', 'cyan', 'magenta', 'yellow'). Overrides checkpoint config if provided.")
+
     return parser.parse_args()
 
 def load_model_and_config(checkpoint_path, device, logger):
@@ -1041,8 +1044,8 @@ def evaluate(model, config, args, best_epoch, logger,
                                              point_size=args.rerun_point_size,
                                              show_arrows=args.rerun_show_arrows,
                                              show_semantic_bboxes=args.rerun_show_semantic_bboxes,
-                                             method_name=config.method_name,
-                                             pred_color=config.pred_color
+                                             method_name=args.method_name,
+                                             pred_color=args.pred_color
                                          )
 
                                          # Explicitly save if init fell back
