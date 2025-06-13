@@ -55,11 +55,11 @@ def initialize_rerun(recording_name="gimo_adt_evaluation", spawn=True, output_di
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
             out_path = os.path.join(output_dir, f"{recording_name}.rrd")
-            rr.init(recording_name, spawn=spawn)
+            rr.init(recording_name, spawn=spawn, recording_id=recording_name)
             print(f"Initialized Rerun (older version or fallback) with recording name: {recording_name}. Saving to {out_path} may need explicit 'rr.save()' if not handled by init.")
             return True, out_path 
         else:
-            rr.init(recording_name, spawn=spawn)
+            rr.init(recording_name, spawn=spawn, recording_id=recording_name)
             return True, None
         
     except Exception as e:
