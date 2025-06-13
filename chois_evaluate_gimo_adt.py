@@ -365,7 +365,9 @@ def evaluate(model, config, args, best_epoch, logger):
                                     arrow_length=args.rerun_arrow_length,
                                     line_width=args.rerun_line_width,
                                     point_size=args.rerun_point_size,
-                                    show_arrows=args.rerun_show_arrows
+                                    show_arrows=args.rerun_show_arrows,
+                                    method_name=config.method_name,
+                                    pred_color=config.pred_color
                                 )
                                 
                                 if success:
