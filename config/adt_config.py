@@ -131,8 +131,6 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.viz_configs.add_argument('--viz_ori_scale', type=float, default=0.2, help='Scale factor for orientation arrows in visualization')
         self.viz_configs.add_argument('--show_ori_arrows', action='store_true', default=False, help='Show orientation arrows in visualization')
         self.viz_configs.add_argument('--visualize_train_trajectories_on_start', action='store_true', default=False, help='Generate and save visualizations for a subset of the training data at the beginning of training.')
-        self.viz_configs.add_argument('--method_name', type=str, default='our', help='Method name for visualization, e.g. our, baseline, etc.')
-        self.viz_configs.add_argument('--pred_color', type=str, default='red', help='Prediction color for visualization, e.g. red, orange, purple, cyan, magenta, yellow')
 
         # === DiT Configuration ===
         self.dit_configs = self.add_argument_group('Diffusion Transformer (DiT)')
