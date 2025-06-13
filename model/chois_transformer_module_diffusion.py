@@ -132,88 +132,68 @@ class DecoderLayer(nn.Module):
         decoder_out, dec_self_attn = self.self_attn(decoder_input, decoder_input, decoder_input, \
                                 mask=self_attn_time_mask)
         # BS X T X D, BS X T X T
-        
-        # The original implementation uses this, but for a standard transformer decoder, 
-        # the padding mask should be applied in the attention mechanism. Let's adjust this.
-        if self_attn_padding_mask is not None:
-             decoder_out *= self_attn_padding_mask.unsqueeze(-1).float()
+        decoder_out *= self_attn_padding_mask.unsqueeze(-1).float()
+        # BS X T X D
 
         decoder_out = self.pos_ffn(decoder_out) # BS X T X D
-        
-        if self_attn_padding_mask is not None:
-            decoder_out *= self_attn_padding_mask.unsqueeze(-1).float()
+        decoder_out *= self_attn_padding_mask.unsqueeze(-1).float()
 
         return decoder_out, dec_self_attn
         # BS X T X D, BS X T X T
 
 
-class TrajectoryTransformer(nn.Module):
+class Decoder(nn.Module):
     def __init__(
             self,
             d_feats, d_model,
-            n_layers, n_head, d_k, d_v, max_timesteps):
-        super(TrajectoryTransformer, self).__init__()
+            n_layers, n_head, d_k, d_v, max_timesteps, use_full_attention=False):
+        super(Decoder, self).__init__()
 
-        self.start_conv = nn.Conv1d(d_feats, d_model, 1) # Project input features to model dimension
+        self.start_conv = nn.Conv1d(d_feats, d_model, 1) # (input: 17*3)
         self.position_vec = nn.Embedding.from_pretrained(
-            get_sinusoid_encoding_table(max_timesteps + 1, d_model, padding_idx=0),
+            get_sinusoid_encoding_table(max_timesteps+1, d_model, padding_idx=0),
             freeze=True)
         self.layer_stack = nn.ModuleList([DecoderLayer(d_model, n_head, d_k, d_v)
             for _ in range(n_layers)])
 
-    def forward(self, src, src_key_padding_mask=None, cond_embedding=None):
-        # src: BS X T X D_feats (input trajectory)
-        # src_key_padding_mask: BS X T (mask for padding, 1 for valid, 0 for padding)
-        # cond_embedding: BS X 1 X d_model (conditioning token, e.g., from text)
-        
-        bs, seq_len, _ = src.shape
+        self.use_full_attention = use_full_attention 
+
+    def forward(self, decoder_input, padding_mask, decoder_pos_vec, obj_embedding=None):
+        # decoder_input: BS X D X T 
+        # padding_mask: BS X 1 X T
+        # decoder_pos_vec: BS X 1 X T
+        # obj_embedding: BS X 1 X D
+
         dec_self_attn_list = []
 
-        # --- Prepare input ---
-        # Project input features to model dimension
-        input_embedding = self.start_conv(src.transpose(1, 2)).transpose(1, 2) # BS X T X d_model
+        padding_mask = padding_mask.squeeze(1) # BS X T
+        decoder_pos_vec = decoder_pos_vec.squeeze(1) # BS X T
 
-        # Prepend conditioning embedding if it exists
-        if cond_embedding is not None:
-            input_embedding = torch.cat((cond_embedding, input_embedding), dim=1)
-            
-            # Update padding mask for the new token (it's always valid)
-            if src_key_padding_mask is not None:
-                cond_padding_mask = torch.ones(bs, 1, device=src.device, dtype=src_key_padding_mask.dtype)
-                src_key_padding_mask = torch.cat((cond_padding_mask, src_key_padding_mask), dim=1)
-
-        current_seq_len = input_embedding.shape[1]
-
-        # --- Create masks ---
-        # Causal mask to prevent attending to future positions
-        causal_mask = get_subsequent_mask(input_embedding[:,:,0]) # BS X current_seq_len X current_seq_len
-
-        # Combine with padding mask if provided
-        if src_key_padding_mask is not None:
-            padding_attn_mask = src_key_padding_mask.ne(1).unsqueeze(1).expand(-1, current_seq_len, -1)
-            combined_mask = causal_mask | padding_attn_mask
+        input_embedding = self.start_conv(decoder_input)  # BS X D X T
+        input_embedding = input_embedding.transpose(1, 2) # BS X T X D
+        if obj_embedding is not None:
+            new_input_embedding = torch.cat((obj_embedding, input_embedding), dim=1) # BS X (T+1) X D 
         else:
-            combined_mask = causal_mask
-            
-        # --- Positional Encoding ---
-        # Create position vector for the whole sequence
-        pos_vec = torch.arange(1, current_seq_len + 1, device=src.device).unsqueeze(0).repeat(bs, 1)
-        
-        if src_key_padding_mask is not None:
-            pos_vec = pos_vec * src_key_padding_mask.long()
+            new_input_embedding = input_embedding
 
-        pos_embedding = self.position_vec(pos_vec)
+        # self.position_vec = self.position_vec.cuda()
+        pos_embedding = self.position_vec(decoder_pos_vec) # BS X T X D
         
-        dec_output = input_embedding + pos_embedding # BS X current_seq_len X d_model
-
-        # --- Forward through layers ---
+        # Time mask is same for all blocks, while padding mask differ according to the position of block
+        if self.use_full_attention:
+            time_mask = None
+        else:
+            time_mask = get_subsequent_mask(decoder_pos_vec) 
+        # BS X T X T (Prev steps are 0, later 1)
+       
+        dec_output = new_input_embedding + pos_embedding # BS X T X D
         for dec_layer in self.layer_stack:
             dec_output, dec_self_attn = dec_layer(
-                dec_output,
-                self_attn_time_mask=combined_mask,
-                self_attn_padding_mask=src_key_padding_mask)
+                dec_output, # BS X T X D
+                self_attn_time_mask=time_mask, # BS X T X T
+                self_attn_padding_mask=padding_mask) # BS X T
 
             dec_self_attn_list += [dec_self_attn]
 
         return dec_output, dec_self_attn_list
-        # BS X current_seq_len X d_model, list of attention weights
+        # BS X T X D, list

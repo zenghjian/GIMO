@@ -155,6 +155,19 @@ class ADTObjectMotionConfig(ArgumentParser):
         self.diffusion_configs.add_argument('--diffusion_loss_type', type=str, default='l2', choices=['l1', 'l2'], help='Loss function for diffusion training')
         self.diffusion_configs.add_argument('--diffusion_sampling_steps', type=int, default=100, help='Number of sampling steps during inference (can be less than training timesteps)')
 
+        # === BPS Encoder Configuration ===
+        self.bps_configs = self.add_argument_group('BPS Encoder')
+        self.bps_configs.add_argument('--use_bps', action='store_true', default=False, help='Enable BPS encoder for object shape conditioning')
+        self.bps_configs.add_argument('--bps_input_dim', default=1024*3, type=int, help='Input dimension for BPS encoder (1024 points * 3 coordinates)')
+        self.bps_configs.add_argument('--bps_hidden_dim', default=512, type=int, help='Hidden dimension in BPS encoder')
+        self.bps_configs.add_argument('--bps_output_dim', default=256, type=int, help='Output dimension of BPS encoder')
+        self.bps_configs.add_argument('--bps_num_points', default=1024, type=int, help='Number of BPS points to sample from bbox')
+        self.bps_configs.add_argument('--lambda_obj_geo', type=float, default=1.0, help='Weight for object geometry loss')
+
+        # === CHOIS Sparse Conditioning Configuration ===
+        self.sparse_cond_configs = self.add_argument_group('Sparse Conditioning')
+        self.sparse_cond_configs.add_argument('--conditioning_strategy', type=str, default='history_fraction', choices=['full_trajectory', 'history_fraction', 'chois_original'], help='Strategy for creating trajectory conditions')
+        self.sparse_cond_configs.add_argument('--waypoint_interval', default=10, type=int, help='Frame interval for waypoints in sparse conditioning (for chois_original strategy)')
     def get_configs(self):
         # Basic validation
         args = self.parse_args()

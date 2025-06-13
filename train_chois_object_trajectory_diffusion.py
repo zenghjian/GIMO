@@ -197,6 +197,7 @@ def validate_object_diffusion(model, dataloader, device, config, epoch, logger, 
                         
                         if use_single_step_prediction:
                             # Single-step prediction: directly predict clean trajectory
+                            # TODO: not reasonable, we should use diffusion sampling for validation
                             logger(f"Using single-step prediction for validation...")
                             generated_trajectories_12d = val_model_out
                         else:

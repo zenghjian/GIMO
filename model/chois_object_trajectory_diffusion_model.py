@@ -18,7 +18,7 @@ from utils.geometry_utils import (
 )
 
 # Import CHOIS Transformer Decoder
-from model.chois_transformer_module import Decoder
+from model.chois_transformer_module_diffusion import Decoder
 
 def exists(x):
     return x is not None
@@ -148,12 +148,9 @@ class TransformerDiffusionModel(nn.Module):
         # condition: BS X T X D_cond (bbox features + pose conditions)
         # noise_t: BS (timestep)
 
-        # DEBUG: Check input dimensions
-        print(f"DEBUG TransformerDiffusionModel: src.shape={src.shape}, condition.shape={condition.shape}")
-        print("src mean/std after concat:", src.mean().item(), src.std().item())
         # Concatenate trajectory with conditions
         src = torch.cat((src, condition), dim=-1)
-        print(f"DEBUG TransformerDiffusionModel: after concat src.shape={src.shape}")
+
        
         # Get timestep embedding
         noise_t_embed = self.time_mlp(noise_t)  # BS X d_model 
@@ -535,7 +532,6 @@ class ObjectTrajectoryDiffusion(nn.Module):
 
     def forward(self, batch_data, history_fraction=0.3, conditioning_strategy='history_fraction', waypoint_interval=30):
         """
-        前向传播，按照原始 CHOIS 的简化逻辑
         
         Args:
             batch_data: dict, 
