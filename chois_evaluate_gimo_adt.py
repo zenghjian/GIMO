@@ -219,6 +219,34 @@ def evaluate(model, config, args, best_epoch, logger):
         per_sample_rrd_basedir = os.path.join(args.output_dir, "rerun_visualizations_per_sample")
         os.makedirs(per_sample_rrd_basedir, exist_ok=True)
         logger.info(f"Rerun per-sample .rrd files will be saved to: {per_sample_rrd_basedir}")
+        
+        # Test basic rerun functionality
+        test_rrd_path = os.path.join(per_sample_rrd_basedir, "test_rerun.rrd")
+        try:
+            logger.info("Testing basic Rerun functionality...")
+            rr.init("test_recording", spawn=False)
+            rr.set_time_sequence("frame", 0)
+            
+            # Log a simple test point
+            test_point = np.array([[0.0, 0.0, 0.0]])
+            rr.log("test/point", rr.Points3D(positions=test_point, colors=[1, 0, 0, 1], radii=0.1))
+            
+            # Save test file
+            rr.save(test_rrd_path)
+            
+            # Check if test file was created
+            if os.path.exists(test_rrd_path):
+                test_file_size = os.path.getsize(test_rrd_path)
+                logger.info(f"Rerun test successful - created file of size {test_file_size} bytes")
+                # Clean up test file
+                os.remove(test_rrd_path)
+            else:
+                logger.error("Rerun test failed - no file created")
+                
+        except Exception as e:
+            logger.error(f"Rerun test failed with error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     with torch.no_grad():
         progress_bar = tqdm(eval_loader, desc="Evaluating")
@@ -297,32 +325,69 @@ def evaluate(model, config, args, best_epoch, logger):
                              
                         # Rerun visualization
                         if args.use_rerun and HAS_RERUN and per_sample_rrd_basedir:
-                            sample_recording_name = filename_base
-                            rr.init(f"adt_trajectory_{sample_recording_name}", spawn=False)
-                            rr.save(os.path.join(per_sample_rrd_basedir, f"{sample_recording_name}.rrd"))
-                            
-                            point_cloud = batch['point_cloud'][i].cpu()
-                            if args.pointcloud_downsample_factor > 1:
-                                point_cloud = downsample_point_cloud(point_cloud, args.pointcloud_downsample_factor)
-                            
-                                visualize_trajectory_rerun(
-                                past_positions=transform_coords_for_visualization(gt_hist_pos.cpu()),
-                                future_positions_gt=transform_coords_for_visualization(gt_future_pos.cpu()),
-                                future_positions_pred=transform_coords_for_visualization(pred_future_pos.cpu()),
-                                             past_mask=hist_mask,
-                                             future_mask_gt=future_mask,
-                                point_cloud=transform_coords_for_visualization(point_cloud) if point_cloud is not None else None,
-                                past_orientations=gt_hist_rot.cpu(),
-                                future_orientations_gt=gt_future_rot.cpu(),
-                                future_orientations_pred=pred_future_rot.cpu(),
-                                             object_name=obj_name, 
-                                             sequence_name=sequence_name_extracted, 
-                                             segment_idx=seg_idx, 
-                                             arrow_length=args.rerun_arrow_length,
-                                             line_width=args.rerun_line_width,
-                                             point_size=args.rerun_point_size,
-                                show_arrows=args.rerun_show_arrows
-                            )
+                            try:
+                                sample_recording_name = filename_base
+                                rrd_file_path = os.path.join(per_sample_rrd_basedir, f"{sample_recording_name}.rrd")
+                                
+                                logger.info(f"Creating Rerun visualization for: {sample_recording_name}")
+                                
+                                # Initialize rerun recording
+                                rr.init(f"adt_trajectory_{sample_recording_name}", spawn=False)
+                                
+                                # Set a base time to ensure data is logged
+                                rr.set_time_sequence("animation_step", 0)
+                                
+                                # Process point cloud
+                                point_cloud = batch['point_cloud'][i].cpu()
+                                if args.pointcloud_downsample_factor > 1:
+                                    point_cloud = downsample_point_cloud(point_cloud, args.pointcloud_downsample_factor)
+                                
+                                # Log some debug info
+                                logger.info(f"  - Past trajectory: {gt_hist_pos.shape[0]} points")
+                                logger.info(f"  - Future GT: {gt_future_pos.shape[0]} points") 
+                                logger.info(f"  - Future Pred: {pred_future_pos.shape[0]} points")
+                                logger.info(f"  - Point cloud: {point_cloud.shape[0] if point_cloud is not None else 0} points")
+                                
+                                # Visualize trajectory in rerun (this actually records the data)
+                                success = visualize_trajectory_rerun(
+                                    past_positions=transform_coords_for_visualization(gt_hist_pos.cpu()),
+                                    future_positions_gt=transform_coords_for_visualization(gt_future_pos.cpu()),
+                                    future_positions_pred=transform_coords_for_visualization(pred_future_pos.cpu()),
+                                    past_mask=hist_mask,
+                                    future_mask_gt=future_mask,
+                                    point_cloud=transform_coords_for_visualization(point_cloud) if point_cloud is not None else None,
+                                    past_orientations=gt_hist_rot.cpu(),
+                                    future_orientations_gt=gt_future_rot.cpu(),
+                                    future_orientations_pred=pred_future_rot.cpu(),
+                                    object_name=obj_name, 
+                                    sequence_name=sequence_name_extracted, 
+                                    segment_idx=seg_idx, 
+                                    arrow_length=args.rerun_arrow_length,
+                                    line_width=args.rerun_line_width,
+                                    point_size=args.rerun_point_size,
+                                    show_arrows=args.rerun_show_arrows
+                                )
+                                
+                                if success:
+                                    logger.info(f"  - Visualization successful, saving to: {rrd_file_path}")
+                                    # Save the recording after data has been logged
+                                    rr.save(rrd_file_path)
+                                    
+                                    # Verify file was created and has content
+                                    if os.path.exists(rrd_file_path):
+                                        file_size = os.path.getsize(rrd_file_path)
+                                        logger.info(f"  - File saved successfully, size: {file_size} bytes")
+                                        if file_size < 1000:  # Less than 1KB suggests empty file
+                                            logger.warning(f"  - Warning: File size is very small ({file_size} bytes), may be empty")
+                                    else:
+                                        logger.error(f"  - Error: File was not created at {rrd_file_path}")
+                                else:
+                                    logger.error(f"  - Visualization failed for {sample_recording_name}")
+                                    
+                            except Exception as e:
+                                logger.error(f"Error creating Rerun visualization for {sample_recording_name}: {e}")
+                                import traceback
+                                logger.error(traceback.format_exc())
 
             except Exception as e:
                  logger.error(f"Error processing batch {batch_idx}: {e}")
