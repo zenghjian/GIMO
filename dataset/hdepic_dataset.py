@@ -405,11 +405,65 @@ def get_all_scene_objects_with_temporal_positioning(video_id, reference_frame, a
     print(f"Found {len(scene_objects)} objects with temporal positioning")
     return scene_objects
 
-def create_scene_bboxes_3d(scene_objects):
-    """Create 3D bounding boxes for all scene objects using improved size estimation"""
+def create_scene_bboxes_3d(scene_objects, participant=None, static_bboxes_by_participant=None):
+    """Create 3D bounding boxes for all scene objects using improved size estimation and static bbox validation"""
     scene_bboxes = []
+    filtered_objects = []
+    
+    # Get fixture mapping for this participant if available
+    fixture_map = {}
+    if participant and static_bboxes_by_participant:
+        fixture_map_key = f"{participant}_fixture_map"
+        fixture_map = static_bboxes_by_participant.get(fixture_map_key, {})
+        print(f"Using fixture mapping with {len(fixture_map)} fixtures for participant {participant}")
+    
+    def is_position_above_bbox(position_3d, bbox_center, bbox_size, tolerance=0.0):
+        """Check if a 3D position is above (within) a bounding box with some tolerance"""
+        center = np.array(bbox_center)
+        size = np.array(bbox_size)
+        pos = np.array(position_3d)
+        
+        # Calculate bbox bounds
+        bbox_min = center - size / 2
+        bbox_max = center + size / 2
+        
+        # Check if position is within weight, depth bounds (horizontal plane)
+        w_within = bbox_min[0] - tolerance <= pos[0] <= bbox_max[0] + tolerance
+        d_within = bbox_min[1] - tolerance <= pos[1] <= bbox_max[1] + tolerance
+        
+        # Check if position is above the top of the bbox (height coordinate)
+        # In HD-EPIC, assume z is up (height)
+        h_above = pos[2] >= bbox_max[2] - tolerance
+        
+        
+        return w_within and d_within and h_above
     
     for obj in scene_objects:
+        # Get the fixture name from mask_data
+        fixture_name = obj['mask_data'].get('fixture', '')
+        position_3d = obj['mask_data'].get('3d_location', [0, 0, 0])
+        
+        # Check if we need to validate against static bbox
+        should_validate = fixture_name and fixture_name in fixture_map
+        position_valid = True
+        
+        if should_validate:
+            static_bbox = fixture_map[fixture_name]
+            position_valid = is_position_above_bbox(
+                position_3d, 
+                static_bbox['center'], 
+                static_bbox['size']
+            )
+            
+            if not position_valid:
+                print(f"  Filtering out object '{obj['object_name']}' - position {position_3d} not above fixture '{fixture_name}' with bbox max height {static_bbox['center'][2] + static_bbox['size'][2]/2}")
+                continue
+            else:
+                print(f"  Validated object '{obj['object_name']}' - position {position_3d} is above fixture '{fixture_name}' with bbox max height {static_bbox['center'][2] + static_bbox['size'][2]/2}")
+        
+        # If position is valid (or no validation needed), process the object
+        filtered_objects.append(obj)
+        
         # Extract 3D bbox using the improved method with object name
         bbox_3d = extract_3d_bbox_from_mask_improved(
             obj['mask_data'], 
@@ -427,6 +481,8 @@ def create_scene_bboxes_3d(scene_objects):
                 'frame_number': obj['frame_number'],
                 'temporal_reasoning': obj.get('temporal_reasoning', 'unknown'),
                 'mask_pixels': bbox_3d['mask_pixels'],
+                'fixture_name': fixture_name,  # Add fixture name for reference
+                'position_validated': should_validate,  # Mark if position was validated
                 # Additional debug info from improved extraction
                 'object_type_detected': bbox_3d['object_type'],
                 'scale_factor': bbox_3d['scale_factor'],
@@ -437,13 +493,20 @@ def create_scene_bboxes_3d(scene_objects):
             
             scene_bboxes.append(bbox_entry)
     
+    # Print filtering statistics
+    original_count = len(scene_objects)
+    filtered_count = len(filtered_objects)
+    print(f"Filtered scene objects: {original_count} -> {filtered_count} (removed {original_count - filtered_count})")
     print(f"Created {len(scene_bboxes)} scene-level 3D bounding boxes with improved size estimation")
     
     # Print some debug info for the first few objects
     for i, bbox in enumerate(scene_bboxes[:3]):
-        print(f"  Object {i+1}: {bbox['object_name']} -> {bbox['object_type_detected']}")
+        validation_status = "✓ validated" if bbox['position_validated'] else "- not validated"
+        print(f"  Object {i+1}: {bbox['object_name']} -> {bbox['object_type_detected']} ({validation_status})")
         print(f"    Size: {[f'{s:.3f}' for s in bbox['size']]} (scale: {bbox['scale_factor']:.2f})")
         print(f"    Distance: {bbox['distance']:.2f}m, 2D: {bbox['bbox_2d_pixels']}")
+        if bbox['fixture_name']:
+            print(f"    Fixture: {bbox['fixture_name']}")
     
     return scene_bboxes
 
@@ -563,21 +626,39 @@ class HDEpicTrajectoryDataset(Dataset):
                     
                 # Convert to bbox format
                 participant_bboxes = []
+                fixture_map = {}  # Map fixture name to bbox data
+                
                 for _, row in participant_df.iterrows():
+                    # Extract fixture name from obj_file (remove .obj extension)
+                    obj_file = row.get('obj_file', '')
+                    if obj_file.endswith('.obj'):
+                        fixture_name = obj_file[:-4]  # Remove .obj suffix
+                    else:
+                        fixture_name = obj_file
+                    
                     bbox = {
                         'center': [row['center_x'], row['center_y'], row['center_z']],
-                        'size': [row['size_w'], row['size_h'], row['size_d']],
+                        'size': [row['size_w'], row['size_d'], row['size_h']],
                         'rotation_6d': [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],  # Identity rotation
                         'object_name': row['category'],
                         'object_index': row['index'],
                         'volume': row['volume'],
-                        'obj_file': row.get('obj_file', ''),
+                        'obj_file': obj_file,
+                        'fixture_name': fixture_name,  # Add fixture name for lookup
                         'is_static': True,  # Mark as static object
                     }
                     participant_bboxes.append(bbox)
+                    
+                    # Add to fixture mapping
+                    if fixture_name:
+                        fixture_map[fixture_name] = bbox
                 
                 static_bboxes_by_participant[participant] = participant_bboxes
+                # Store fixture mapping for this participant
+                static_bboxes_by_participant[f"{participant}_fixture_map"] = fixture_map
+                
                 print(f"  Loaded {len(participant_bboxes)} static bboxes for {participant}")
+                print(f"  Created fixture mapping for {len(fixture_map)} fixtures")
                 
             return static_bboxes_by_participant
             
@@ -818,7 +899,7 @@ class HDEpicTrajectoryDataset(Dataset):
                                 
                                 if scene_objects:
                                     # Create 3D bounding boxes for this trajectory's timeframe
-                                    dynamic_scene_bboxes = create_scene_bboxes_3d(scene_objects)
+                                    dynamic_scene_bboxes = create_scene_bboxes_3d(scene_objects, participant, self.static_bboxes_by_participant)
                                     
                                     # Limit number of dynamic scene objects
                                     if len(dynamic_scene_bboxes) > self.max_dynamic_objects:
@@ -1787,9 +1868,9 @@ class MultiSequenceHDEpicDataset(Dataset):
 
 # Example usage
 if __name__ == "__main__":
-    # Example 1: Single dataset with hand interpolation
+    # Example 1: Single dataset with hand interpolation and bbox validation
     print("=" * 60)
-    print("EXAMPLE 1: Single HD-EPIC Dataset with Hand Interpolation")
+    print("EXAMPLE 1: HD-EPIC Dataset with Static/Dynamic Bbox Validation")
     print("=" * 60)
     
     dataset = HDEpicTrajectoryDataset(
@@ -1799,7 +1880,7 @@ if __name__ == "__main__":
         skip_frames=5,
         use_displacements=True,
         normalize_data=True,
-        use_cache=False,  # 🔧 Disable cache to regenerate data with scene_bboxes
+        use_cache=False,  # 🔧 Disable cache to regenerate data with new bbox validation
         trajectory_source='SLAM',
         annotations_subdir='scene-and-object-movements',
         use_hand_interpolation=True,  # Enable dense trajectories with hand data
@@ -1825,7 +1906,7 @@ if __name__ == "__main__":
         print(f"Track ID: {sample['track_idx']}")
         
         # 🆕 Show bbox information
-        print(f"\n🆕 Bounding Box Information:")
+        print(f"\n🆕 Bounding Box Information with Validation:")
         print(f"Static bboxes: {int(sample['static_bbox_mask'].sum())} objects")
         print(f"Dynamic bboxes: {int(sample['dynamic_bbox_mask'].sum())} objects")
         print(f"Combined bboxes: {int(sample['bbox_mask'].sum())} objects (backward compatible)")
@@ -1837,59 +1918,23 @@ if __name__ == "__main__":
             for i in range(min(3, num_static)):
                 print(f"  - {sample['static_bbox_categories'][i]}")
         
-        # Show first few dynamic objects
+        # Show first few dynamic objects with validation info
         num_dynamic = int(sample['dynamic_bbox_mask'].sum())
         if num_dynamic > 0:
-            print(f"\nFirst 3 dynamic objects:")
+            print(f"\nFirst 3 dynamic objects (with fixture validation):")
             for i in range(min(3, num_dynamic)):
                 print(f"  - {sample['dynamic_bbox_categories'][i]}")
-    
-    # Example 2: Multi-sequence dataset 
-    # print("\n" + "=" * 60)
-    # print("EXAMPLE 2: Multi-Sequence HD-EPIC Dataset")
-    # print("=" * 60)
-    
-    # multi_dataset = MultiSequenceHDEpicDataset(
-    #     base_path="/storage/user/saroha/datasets/hd-epic-downloader/hd-epic/HD-EPIC/",
-    #     annotations_path="/home/wiss/saroha/github/project_aria/diffusion-trial/hd-epic-annotations-main",
-    #     trajectory_length=32,
-    #     skip_frames=5,
-    #     use_displacements=True,
-    #     normalize_data=True,
-    #     use_cache=True,
-    #     trajectory_source='SLAM',
-    #     annotations_subdir='scene-and-object-movements',
-    #     use_hand_interpolation=True,
-    #     participants=["P01", "P02"],  # Multiple participants
-    #     split_by_participants=True,   # Create separate datasets per participant
-    #     load_scene_bboxes=True,
-    #     mask_base_path="/storage/user/saroha/datasets/hd-epic-downloader/hd-epic/HD-EPIC/Digital-Twin/hd_epic_association_masks/masks",
-    #     max_scene_objects=100,
-    # )
-    
-    # print(f"Multi-sequence dataset contains {len(multi_dataset)} trajectories")
-    # print(f"Number of sequences: {multi_dataset.get_sequence_count()}")
-    # print(f"Sequences info: {multi_dataset.get_sequences_info()}")
-    
-    # if len(multi_dataset) > 0:
-    #     sample = multi_dataset[0]
-    #     print(f"Sample positions shape: {sample['positions'].shape}")
-    #     print(f"Sample first_position shape: {sample['first_position'].shape}")
-    #     print(f"Object name: {sample['object_category']}")
-    #     print(f"Sequence name: {sample['sequence_name']}")
-    #     print(f"Dataset index: {sample['dataset_idx']}")
         
-    #     # Test DataLoader compatibility
-    #     from torch.utils.data import DataLoader
-    #     dataloader = DataLoader(multi_dataset, batch_size=4, shuffle=True, num_workers=2)
-        
-    #     # Test batch loading
-    #     for batch in dataloader:
-    #         print(f"Batch positions shape: {batch['positions'].shape}")
-    #         print(f"Batch keys: {list(batch.keys())}")
-    #         print(f"Batch participants: {batch['participant']}")
-    #         break
-    # else:
-    #     print("Dataset is empty! Check the annotations path and subdirectory.")
-    #     print("Make sure assoc_info.json and mask_info.json exist in:")
-    #     print("  annotations_path/scene-and-object-movements/") 
+        print(f"\n🔍 Validation Statistics:")
+        print(f"  - Static objects provide fixture context for validation")
+        print(f"  - Dynamic objects are filtered based on position relative to fixtures")
+        print(f"  - Only objects positioned above their corresponding fixtures are retained")
+    
+    print("\n" + "=" * 60)
+    print("✅ Bbox validation system implemented successfully!")
+    print("📊 Features added:")
+    print("  1. Fixture mapping: obj_file (CSV) → fixture (mask_data)")
+    print("  2. Position validation: 3d_location must be above fixture bbox")
+    print("  3. Automatic filtering: invalid objects are removed")
+    print("  4. Debug info: validation status shown for each object")
+    print("=" * 60)

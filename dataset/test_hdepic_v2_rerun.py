@@ -822,17 +822,17 @@ def visualize_hdepic_in_rerun(max_trajectories=10):
                     bbox_color = get_bbox_color(category, "dynamic")
                     
                     # Log 3D bounding box with rotation (solid style for dynamic)
-                    # rr.log(
-                    #     bbox_entity,
-                    #     rr.Boxes3D(
-                    #         centers=[center],
-                    #         sizes=[size],
-                    #         rotations=[quaternion],
-                    #         colors=[bbox_color],
-                    #         labels=[f"[D] {category}"],  # [D] prefix for dynamic
-                    #         show_labels=False
-                    #     )
-                    # )
+                    rr.log(
+                        bbox_entity,
+                        rr.Boxes3D(
+                            centers=[center],
+                            sizes=[size],
+                            rotations=[quaternion],
+                            colors=[bbox_color],
+                            labels=[f"[D] {category}"],  # [D] prefix for dynamic
+                            show_labels=False
+                        )
+                    )
                     # INSERT_YOUR_CODE
                     # Log the bbox center as a 3D circle for visualization
                     rr.log(
