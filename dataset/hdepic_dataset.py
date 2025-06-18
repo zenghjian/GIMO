@@ -489,134 +489,16 @@ def create_scene_bboxes_3d(scene_objects, participant=None, static_bboxes_by_par
     print(f"Filtered scene objects: {original_count} -> {filtered_count} (removed {original_count - filtered_count})")
     print(f"Created {len(scene_bboxes)} scene-level 3D bounding boxes with improved size estimation")
     
-    # Collision detection and size adjustment
-    if len(scene_bboxes) > 1:
-        print(f"Checking for bbox collisions and adjusting sizes...")
-        scene_bboxes = resolve_bbox_collisions(scene_bboxes)
-        print(f"Collision resolution completed")
-    
     # Print some debug info for the first few objects
     for i, bbox in enumerate(scene_bboxes[:3]):
         validation_status = "✓ validated" if bbox['position_validated'] else "- not validated"
-        collision_status = "🔧 size adjusted" if bbox.get('collision_adjusted', False) else "- original size"
-        print(f"  Object {i+1}: {bbox['object_name']} -> {bbox['object_type_detected']} ({validation_status}) ({collision_status})")
+        print(f"  Object {i+1}: {bbox['object_name']} -> {bbox['object_type_detected']} ({validation_status})")
         print(f"    Size: {[f'{s:.3f}' for s in bbox['size']]} (scale: {bbox['scale_factor']:.2f})")
         print(f"    Distance: {bbox['distance']:.2f}m, 2D: {bbox['bbox_2d_pixels']}")
         if bbox['fixture_name']:
             print(f"    Fixture: {bbox['fixture_name']}")
     
     return scene_bboxes
-
-def resolve_bbox_collisions(scene_bboxes):
-    """
-    Resolve collisions between bounding boxes by dynamically adjusting their sizes.
-    Prioritizes larger objects and objects detected earlier.
-    """
-    if len(scene_bboxes) <= 1:
-        return scene_bboxes
-    
-    def boxes_overlap(bbox1, bbox2):
-        """Check if two 3D bounding boxes overlap"""
-        center1 = np.array(bbox1['center'])
-        size1 = np.array(bbox1['size'])
-        center2 = np.array(bbox2['center'])
-        size2 = np.array(bbox2['size'])
-        
-        # Calculate bounds for each box
-        min1 = center1 - size1 / 2
-        max1 = center1 + size1 / 2
-        min2 = center2 - size2 / 2
-        max2 = center2 + size2 / 2
-        
-        # Check overlap in all three dimensions
-        overlap_x = max1[0] > min2[0] and max2[0] > min1[0]
-        overlap_y = max1[1] > min2[1] and max2[1] > min1[1]  
-        overlap_z = max1[2] > min2[2] and max2[2] > min1[2]
-        
-        return overlap_x and overlap_y and overlap_z
-    
-    def calculate_overlap_volume(bbox1, bbox2):
-        """Calculate the overlap volume between two boxes"""
-        center1 = np.array(bbox1['center'])
-        size1 = np.array(bbox1['size'])
-        center2 = np.array(bbox2['center'])
-        size2 = np.array(bbox2['size'])
-        
-        min1 = center1 - size1 / 2
-        max1 = center1 + size1 / 2
-        min2 = center2 - size2 / 2
-        max2 = center2 + size2 / 2
-        
-        # Calculate overlap in each dimension
-        overlap_min = np.maximum(min1, min2)
-        overlap_max = np.minimum(max1, max2)
-        overlap_size = np.maximum(0, overlap_max - overlap_min)
-        
-        return np.prod(overlap_size)
-    
-    def adjust_bbox_size(bbox, other_bbox, reduction_factor=0.8):
-        """Reduce bbox size to minimize collision"""
-        original_size = np.array(bbox['size'])
-        new_size = original_size * reduction_factor
-        
-        # Ensure minimum size (1cm in each dimension)
-        min_size = 0.01
-        new_size = np.maximum(new_size, min_size)
-        
-        bbox['size'] = new_size.tolist()
-        bbox['collision_adjusted'] = True
-        
-        return bbox
-    
-    # Sort bboxes by volume (largest first for iteration order, but we'll prioritize protecting smaller ones)
-    scene_bboxes_sorted = sorted(scene_bboxes, key=lambda x: np.prod(x['size']), reverse=True)
-    
-    collision_count = 0
-    max_iterations = 20  # Prevent infinite loops
-    
-    for iteration in range(max_iterations):
-        current_collisions = 0
-        
-        # Check all pairs for collisions
-        for i in range(len(scene_bboxes_sorted)):
-            for j in range(i + 1, len(scene_bboxes_sorted)):
-                bbox1 = scene_bboxes_sorted[i]
-                bbox2 = scene_bboxes_sorted[j]
-                
-                if boxes_overlap(bbox1, bbox2):
-                    overlap_volume = calculate_overlap_volume(bbox1, bbox2)
-                    
-                    if overlap_volume > 0:
-                        current_collisions += 1
-                        
-                        # Decide which bbox to adjust (prioritize reducing larger one)
-                        vol1 = np.prod(bbox1['size'])
-                        vol2 = np.prod(bbox2['size'])
-                        
-                        if vol1 > vol2:
-                            # Adjust the larger bbox (bbox1)
-                            adjust_bbox_size(bbox1, bbox2)
-                            print(f"    Collision: Reduced size of larger object '{bbox1['object_name']}' (vol={vol1:.6f}) due to overlap with smaller '{bbox2['object_name']}' (vol={vol2:.6f})")
-                        else:
-                            # Adjust the larger bbox (bbox2) 
-                            adjust_bbox_size(bbox2, bbox1)
-                            print(f"    Collision: Reduced size of larger object '{bbox2['object_name']}' (vol={vol2:.6f}) due to overlap with smaller '{bbox1['object_name']}' (vol={vol1:.6f})")
-        
-        collision_count += current_collisions
-        
-        if current_collisions == 0:
-            break  # No more collisions
-        
-        print(f"    Iteration {iteration + 1}: Resolved {current_collisions} collisions")
-    
-    if collision_count > 0:
-        print(f"  Total collisions resolved: {collision_count}")
-        # Mark adjusted bboxes
-        for bbox in scene_bboxes_sorted:
-            if 'collision_adjusted' not in bbox:
-                bbox['collision_adjusted'] = False
-    
-    return scene_bboxes_sorted
 
 class HDEpicTrajectoryDataset(Dataset):
     """Dataset for loading and processing HD-EPIC trajectory data for DiT models"""
@@ -2037,15 +1919,12 @@ if __name__ == "__main__":
         print(f"  - Static objects provide fixture context for validation")
         print(f"  - Dynamic objects are filtered based on position relative to fixtures")
         print(f"  - Only objects positioned above their corresponding fixtures are retained")
-        print(f"  - Bbox collision detection prevents overlapping objects")
     
     print("\n" + "=" * 60)
-    print("✅ Enhanced Bbox System implemented successfully!")
+    print("✅ Bbox validation system implemented successfully!")
     print("📊 Features added:")
     print("  1. Fixture mapping: obj_file (CSV) → fixture (mask_data)")
     print("  2. Position validation: 3d_location must be above fixture bbox")
     print("  3. Automatic filtering: invalid objects are removed")
-    print("  4. Geometric size estimation: based on fixture height and 2D aspect ratio")
-    print("  5. Collision detection: prevents bbox overlapping with dynamic size adjustment")
-    print("  6. Debug info: validation and collision status shown for each object")
+    print("  4. Debug info: validation status shown for each object")
     print("=" * 60)
