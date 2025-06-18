@@ -180,8 +180,8 @@ def load_participant_pointcloud(participant: str, base_path: str, video_id: str,
     return None
 
 # Scene-level bounding box functions from test_mask.py
-def extract_3d_bbox_from_mask_improved(mask_data, mask_array, object_name=None):
-    """Extract 3D bounding box from mask data using object-specific priors"""
+def extract_3d_bbox_from_mask_improved(mask_data, mask_array, object_name=None, static_bbox=None):
+    """Extract 3D bounding box using geometric relationships between 3D position, 2D bbox, and fixture"""
     if mask_array is None:
         return None
         
@@ -192,88 +192,69 @@ def extract_3d_bbox_from_mask_improved(mask_data, mask_array, object_name=None):
         
     center_3d = np.array(center_3d, dtype=np.float32)
     
-    # Get 2D bbox from mask_data
+    # Get 2D bbox from mask_data: [xmin, ymin, xmax, ymax]
     bbox_2d = mask_data.get('bbox', [0, 0, 1, 1])
     if len(bbox_2d) != 4:
         bbox_2d = [0, 0, 1, 1]
     
     # Calculate 2D bbox dimensions
-    width_2d = abs(bbox_2d[2] - bbox_2d[0])   # pixels
-    height_2d = abs(bbox_2d[3] - bbox_2d[1])  # pixels
-    aspect_ratio = width_2d / max(height_2d, 1e-6)  # w/h ratio
+    width_2d_pixels = abs(bbox_2d[2] - bbox_2d[0])   # xmax - xmin
+    height_2d_pixels = abs(bbox_2d[3] - bbox_2d[1])  # ymax - ymin
+    print(f"width_2d_pixels: {width_2d_pixels}, height_2d_pixels: {height_2d_pixels}")
     
-    # Object-specific size priors (typical real-world sizes in meters)
-    size_priors = {
-        'mug': [0.08, 0.10, 0.08],           # 8cm x 10cm x 8cm
-        'cup': [0.08, 0.09, 0.08],           # 8cm x 9cm x 8cm  
-        'glass': [0.07, 0.12, 0.07],         # 7cm x 12cm x 7cm
-        'bottle': [0.07, 0.25, 0.07],        # 7cm x 25cm x 7cm
-        'milk_bottle': [0.09, 0.28, 0.09],   # 9cm x 28cm x 9cm
-        'milk bottle': [0.09, 0.28, 0.09],   # Alternative spelling
-        'coffee_capsule': [0.04, 0.02, 0.04], # 4cm x 2cm x 4cm
-        'coffee capsule': [0.04, 0.02, 0.04], # Alternative spelling
-        'capsule': [0.04, 0.02, 0.04],       # Short form
-        'scissors': [0.20, 0.08, 0.02],      # 20cm x 8cm x 2cm
-        'knife': [0.25, 0.02, 0.02],         # 25cm x 2cm x 2cm
-        'spoon': [0.15, 0.03, 0.01],         # 15cm x 3cm x 1cm
-        'fork': [0.18, 0.02, 0.01],          # 18cm x 2cm x 1cm
-        'plate': [0.25, 0.02, 0.25],         # 25cm x 2cm x 25cm
-        'bowl': [0.15, 0.08, 0.15],          # 15cm x 8cm x 15cm
-        'orange': [0.08, 0.08, 0.08],        # 8cm x 8cm x 8cm
-        'apple': [0.07, 0.07, 0.07],         # 7cm x 7cm x 7cm
-        'banana': [0.15, 0.03, 0.03],        # 15cm x 3cm x 3cm
-        'chopping_board': [0.30, 0.02, 0.20], # 30cm x 2cm x 20cm
-        'chopping board': [0.30, 0.02, 0.20], # Alternative spelling
-        'food_processor': [0.25, 0.30, 0.25], # 25cm x 30cm x 25cm
-        'food processor': [0.25, 0.30, 0.25], # Alternative spelling
-        'unknown': [0.10, 0.10, 0.10],       # Default 10cm cube
-    }
-    
-    # Use provided object name or try to detect from mask_data
-    if object_name:
-        obj_name_lower = object_name.lower()
+    # Estimate 3D size using geometric relationships
+    if static_bbox is not None:
+        # Method 1: Use fixture information for better size estimation
+        fixture_center = np.array(static_bbox['center'])
+        fixture_size = np.array(static_bbox['size'])  # [width, depth, height]
+        
+        # Calculate object height: object center is geometric center
+        # So we need distance from object center to fixture top, then double it
+        fixture_top_z = fixture_center[2] + fixture_size[2] / 2
+        center_to_top_distance = center_3d[2] - fixture_top_z
+        
+        # Object height is twice the distance from center to bottom
+        # Since center_to_top = height/2, so height = 2 * center_to_top
+        object_height = 2 * center_to_top_distance
+        
+        # Ensure minimum height
+        object_height = max(object_height, 0.01)  # At least 1cm
+        
+        # Calculate width and depth using 2D bbox proportions
+        # We know the real 3D height, so we can calculate width based on 2D aspect ratio
+        aspect_ratio = width_2d_pixels / max(height_2d_pixels, 1)  # width/height ratio in 2D
+        print(f"aspect_ratio: {aspect_ratio}")
+        object_width = object_height * aspect_ratio
+        object_depth = object_width  # Assume roughly square base for most objects
+        
+        size_3d = [object_width, object_depth, object_height]
+        
+        print(f"    Using fixture-based estimation: height={object_height:.3f}m (center_to_top={center_to_top_distance:.3f}m)")
+        print(f"    2D aspect ratio: {aspect_ratio:.2f}, calculated width: {object_width:.3f}m")
+        
     else:
-        obj_name_lower = 'unknown'
-    
-    # Try to find a matching size prior
-    prior_size = None
-    matched_key = 'unknown'
-    
-    for key, size in size_priors.items():
-        if key.lower() in obj_name_lower or obj_name_lower in key.lower():
-            prior_size = size
-            matched_key = key
-            break
-    
-    if prior_size is None:
-        prior_size = size_priors['unknown']
-    
-    # Estimate scale based on distance and 2D bbox size
-    # Assume typical camera parameters for HD-EPIC (rough estimates)
-    focal_length_pixels = 1000  # Rough estimate for HD cameras
-    distance_to_object = np.linalg.norm(center_3d)  # Distance from camera origin
-    
-    # Calculate expected 2D size if object was at this distance
-    expected_width_2d = (prior_size[0] * focal_length_pixels) / max(distance_to_object, 0.1)
-    expected_height_2d = (prior_size[1] * focal_length_pixels) / max(distance_to_object, 0.1)
-    
-    # Scale the prior based on actual vs expected 2D size
-    scale_x = width_2d / max(expected_width_2d, 1e-6)
-    scale_y = height_2d / max(expected_height_2d, 1e-6)
-    scale_avg = (scale_x + scale_y) / 2.0
-    
-    # Apply scaling to prior size (but constrain to reasonable bounds)
-    scale_factor = np.clip(scale_avg, 0.3, 3.0)  # Don't scale more than 3x or less than 0.3x
-    
-    estimated_size = [
-        prior_size[0] * scale_factor,  # width
-        prior_size[1] * scale_factor,  # height  
-        prior_size[2] * scale_factor   # depth
-    ]
-    
-    # Ensure minimum size (2cm minimum)
-    min_size = 0.02
-    size_3d = [max(s, min_size) for s in estimated_size]
+        # Method 2: Fallback estimation without fixture (less accurate)
+        # Use simple heuristics based on typical object scales
+        
+        # Estimate distance to camera (rough approximation)
+        distance_to_camera = np.linalg.norm(center_3d)
+        
+        # Rough focal length estimation for HD cameras
+        focal_length_pixels = 1000
+        
+        # Estimate real-world size from 2D bbox
+        estimated_width = (width_2d_pixels * distance_to_camera) / focal_length_pixels
+        estimated_height = (height_2d_pixels * distance_to_camera) / focal_length_pixels
+        estimated_depth = estimated_width  # Assume square base
+        
+        # Apply reasonable bounds
+        estimated_width = np.clip(estimated_width, 0.02, 1.0)   # 2cm to 1m
+        estimated_height = np.clip(estimated_height, 0.02, 1.0) # 2cm to 1m  
+        estimated_depth = np.clip(estimated_depth, 0.02, 1.0)   # 2cm to 1m
+        
+        size_3d = [estimated_width, estimated_depth, estimated_height]
+        
+        print(f"    Using fallback estimation: distance={distance_to_camera:.2f}m")
     
     # Count mask pixels
     mask_pixels = np.sum(mask_array > 0) if mask_array is not None else 0
@@ -282,12 +263,13 @@ def extract_3d_bbox_from_mask_improved(mask_data, mask_array, object_name=None):
         'center': center_3d,
         'size': size_3d,
         'mask_pixels': mask_pixels,
-        'object_type': matched_key,
+        'object_type': object_name or 'unknown',
         'original_object_name': object_name or 'unknown',
-        'scale_factor': scale_factor,
-        'distance': distance_to_object,
-        'bbox_2d_pixels': [width_2d, height_2d],
-        'prior_size': prior_size
+        'scale_factor': 1.0,  # Not applicable with geometric method
+        'distance': np.linalg.norm(center_3d),
+        'bbox_2d_pixels': [width_2d_pixels, height_2d_pixels],
+        'prior_size': size_3d,  # The calculated size becomes our "prior"
+        'estimation_method': 'fixture_geometric' if static_bbox is not None else 'fallback_geometric'
     }
 
 # Keep the old function name for backward compatibility  
@@ -417,7 +399,7 @@ def create_scene_bboxes_3d(scene_objects, participant=None, static_bboxes_by_par
         fixture_map = static_bboxes_by_participant.get(fixture_map_key, {})
         print(f"Using fixture mapping with {len(fixture_map)} fixtures for participant {participant}")
     
-    def is_position_above_bbox(position_3d, bbox_center, bbox_size, tolerance=0.0):
+    def is_position_above_bbox(position_3d, bbox_center, bbox_size):
         """Check if a 3D position is above (within) a bounding box with some tolerance"""
         center = np.array(bbox_center)
         size = np.array(bbox_size)
@@ -428,12 +410,12 @@ def create_scene_bboxes_3d(scene_objects, participant=None, static_bboxes_by_par
         bbox_max = center + size / 2
         
         # Check if position is within weight, depth bounds (horizontal plane)
-        w_within = bbox_min[0] - tolerance <= pos[0] <= bbox_max[0] + tolerance
-        d_within = bbox_min[1] - tolerance <= pos[1] <= bbox_max[1] + tolerance
+        w_within =  bbox_min[0] <= pos[0] <= bbox_max[0]
+        d_within =  bbox_min[1] <= pos[1] <= bbox_max[1]
         
         # Check if position is above the top of the bbox (height coordinate)
         # In HD-EPIC, assume z is up (height)
-        h_above = pos[2] >= bbox_max[2] - tolerance
+        h_above = pos[2] >= bbox_max[2]
         
         
         return w_within and d_within and h_above
@@ -443,32 +425,40 @@ def create_scene_bboxes_3d(scene_objects, participant=None, static_bboxes_by_par
         fixture_name = obj['mask_data'].get('fixture', '')
         position_3d = obj['mask_data'].get('3d_location', [0, 0, 0])
         
-        # Check if we need to validate against static bbox
-        should_validate = fixture_name and fixture_name in fixture_map
-        position_valid = True
+        # Handle different cases for fixture validation
+        if not fixture_name:
+            # No fixture name provided - skip this object as we can't validate it
+            print(f"  Skipping object '{obj['object_name']}' - no fixture name provided")
+            continue
+        elif fixture_name not in fixture_map:
+            # Fixture name provided but not found in our mapping - skip this object
+            print(f"  Skipping object '{obj['object_name']}' - fixture '{fixture_name}' not found in static bbox mapping")
+            continue
         
-        if should_validate:
-            static_bbox = fixture_map[fixture_name]
-            position_valid = is_position_above_bbox(
-                position_3d, 
-                static_bbox['center'], 
-                static_bbox['size']
-            )
-            
-            if not position_valid:
-                print(f"  Filtering out object '{obj['object_name']}' - position {position_3d} not above fixture '{fixture_name}' with bbox max height {static_bbox['center'][2] + static_bbox['size'][2]/2}")
-                continue
-            else:
-                print(f"  Validated object '{obj['object_name']}' - position {position_3d} is above fixture '{fixture_name}' with bbox max height {static_bbox['center'][2] + static_bbox['size'][2]/2}")
+        # At this point, we have a valid fixture_name that exists in fixture_map
+        static_bbox = fixture_map[fixture_name]
+        position_valid = is_position_above_bbox(
+            position_3d, 
+            static_bbox['center'], 
+            static_bbox['size']
+        )
         
-        # If position is valid (or no validation needed), process the object
+        if not position_valid:
+            print(f"  Filtering out object '{obj['object_name']}' - position {position_3d} not above fixture '{fixture_name}' with bbox max height {static_bbox['center'][2] + static_bbox['size'][2]/2}")
+            continue
+        else:
+            print(f"  Validated object '{obj['object_name']}' - position {position_3d} is above fixture '{fixture_name}' with bbox max height {static_bbox['center'][2] + static_bbox['size'][2]/2}")
+        
+        # If we reach here, the object passed all validations
         filtered_objects.append(obj)
         
-        # Extract 3D bbox using the improved method with object name
+        # Extract 3D bbox using the improved method with fixture information
+        # We know static_bbox exists because we validated it above
         bbox_3d = extract_3d_bbox_from_mask_improved(
             obj['mask_data'], 
             obj['mask_array'], 
-            object_name=obj.get('object_name', 'unknown')
+            object_name=obj.get('object_name', 'unknown'),
+            static_bbox=static_bbox  # Use the static_bbox we already retrieved
         )
         
         if bbox_3d:
@@ -482,7 +472,7 @@ def create_scene_bboxes_3d(scene_objects, participant=None, static_bboxes_by_par
                 'temporal_reasoning': obj.get('temporal_reasoning', 'unknown'),
                 'mask_pixels': bbox_3d['mask_pixels'],
                 'fixture_name': fixture_name,  # Add fixture name for reference
-                'position_validated': should_validate,  # Mark if position was validated
+                'position_validated': position_valid,  # Mark if position was validated
                 # Additional debug info from improved extraction
                 'object_type_detected': bbox_3d['object_type'],
                 'scale_factor': bbox_3d['scale_factor'],
@@ -499,16 +489,134 @@ def create_scene_bboxes_3d(scene_objects, participant=None, static_bboxes_by_par
     print(f"Filtered scene objects: {original_count} -> {filtered_count} (removed {original_count - filtered_count})")
     print(f"Created {len(scene_bboxes)} scene-level 3D bounding boxes with improved size estimation")
     
+    # Collision detection and size adjustment
+    if len(scene_bboxes) > 1:
+        print(f"Checking for bbox collisions and adjusting sizes...")
+        scene_bboxes = resolve_bbox_collisions(scene_bboxes)
+        print(f"Collision resolution completed")
+    
     # Print some debug info for the first few objects
     for i, bbox in enumerate(scene_bboxes[:3]):
         validation_status = "✓ validated" if bbox['position_validated'] else "- not validated"
-        print(f"  Object {i+1}: {bbox['object_name']} -> {bbox['object_type_detected']} ({validation_status})")
+        collision_status = "🔧 size adjusted" if bbox.get('collision_adjusted', False) else "- original size"
+        print(f"  Object {i+1}: {bbox['object_name']} -> {bbox['object_type_detected']} ({validation_status}) ({collision_status})")
         print(f"    Size: {[f'{s:.3f}' for s in bbox['size']]} (scale: {bbox['scale_factor']:.2f})")
         print(f"    Distance: {bbox['distance']:.2f}m, 2D: {bbox['bbox_2d_pixels']}")
         if bbox['fixture_name']:
             print(f"    Fixture: {bbox['fixture_name']}")
     
     return scene_bboxes
+
+def resolve_bbox_collisions(scene_bboxes):
+    """
+    Resolve collisions between bounding boxes by dynamically adjusting their sizes.
+    Prioritizes larger objects and objects detected earlier.
+    """
+    if len(scene_bboxes) <= 1:
+        return scene_bboxes
+    
+    def boxes_overlap(bbox1, bbox2):
+        """Check if two 3D bounding boxes overlap"""
+        center1 = np.array(bbox1['center'])
+        size1 = np.array(bbox1['size'])
+        center2 = np.array(bbox2['center'])
+        size2 = np.array(bbox2['size'])
+        
+        # Calculate bounds for each box
+        min1 = center1 - size1 / 2
+        max1 = center1 + size1 / 2
+        min2 = center2 - size2 / 2
+        max2 = center2 + size2 / 2
+        
+        # Check overlap in all three dimensions
+        overlap_x = max1[0] > min2[0] and max2[0] > min1[0]
+        overlap_y = max1[1] > min2[1] and max2[1] > min1[1]  
+        overlap_z = max1[2] > min2[2] and max2[2] > min1[2]
+        
+        return overlap_x and overlap_y and overlap_z
+    
+    def calculate_overlap_volume(bbox1, bbox2):
+        """Calculate the overlap volume between two boxes"""
+        center1 = np.array(bbox1['center'])
+        size1 = np.array(bbox1['size'])
+        center2 = np.array(bbox2['center'])
+        size2 = np.array(bbox2['size'])
+        
+        min1 = center1 - size1 / 2
+        max1 = center1 + size1 / 2
+        min2 = center2 - size2 / 2
+        max2 = center2 + size2 / 2
+        
+        # Calculate overlap in each dimension
+        overlap_min = np.maximum(min1, min2)
+        overlap_max = np.minimum(max1, max2)
+        overlap_size = np.maximum(0, overlap_max - overlap_min)
+        
+        return np.prod(overlap_size)
+    
+    def adjust_bbox_size(bbox, other_bbox, reduction_factor=0.8):
+        """Reduce bbox size to minimize collision"""
+        original_size = np.array(bbox['size'])
+        new_size = original_size * reduction_factor
+        
+        # Ensure minimum size (1cm in each dimension)
+        min_size = 0.01
+        new_size = np.maximum(new_size, min_size)
+        
+        bbox['size'] = new_size.tolist()
+        bbox['collision_adjusted'] = True
+        
+        return bbox
+    
+    # Sort bboxes by volume (largest first for iteration order, but we'll prioritize protecting smaller ones)
+    scene_bboxes_sorted = sorted(scene_bboxes, key=lambda x: np.prod(x['size']), reverse=True)
+    
+    collision_count = 0
+    max_iterations = 20  # Prevent infinite loops
+    
+    for iteration in range(max_iterations):
+        current_collisions = 0
+        
+        # Check all pairs for collisions
+        for i in range(len(scene_bboxes_sorted)):
+            for j in range(i + 1, len(scene_bboxes_sorted)):
+                bbox1 = scene_bboxes_sorted[i]
+                bbox2 = scene_bboxes_sorted[j]
+                
+                if boxes_overlap(bbox1, bbox2):
+                    overlap_volume = calculate_overlap_volume(bbox1, bbox2)
+                    
+                    if overlap_volume > 0:
+                        current_collisions += 1
+                        
+                        # Decide which bbox to adjust (prioritize reducing larger one)
+                        vol1 = np.prod(bbox1['size'])
+                        vol2 = np.prod(bbox2['size'])
+                        
+                        if vol1 > vol2:
+                            # Adjust the larger bbox (bbox1)
+                            adjust_bbox_size(bbox1, bbox2)
+                            print(f"    Collision: Reduced size of larger object '{bbox1['object_name']}' (vol={vol1:.6f}) due to overlap with smaller '{bbox2['object_name']}' (vol={vol2:.6f})")
+                        else:
+                            # Adjust the larger bbox (bbox2) 
+                            adjust_bbox_size(bbox2, bbox1)
+                            print(f"    Collision: Reduced size of larger object '{bbox2['object_name']}' (vol={vol2:.6f}) due to overlap with smaller '{bbox1['object_name']}' (vol={vol1:.6f})")
+        
+        collision_count += current_collisions
+        
+        if current_collisions == 0:
+            break  # No more collisions
+        
+        print(f"    Iteration {iteration + 1}: Resolved {current_collisions} collisions")
+    
+    if collision_count > 0:
+        print(f"  Total collisions resolved: {collision_count}")
+        # Mark adjusted bboxes
+        for bbox in scene_bboxes_sorted:
+            if 'collision_adjusted' not in bbox:
+                bbox['collision_adjusted'] = False
+    
+    return scene_bboxes_sorted
 
 class HDEpicTrajectoryDataset(Dataset):
     """Dataset for loading and processing HD-EPIC trajectory data for DiT models"""
@@ -1929,12 +2037,15 @@ if __name__ == "__main__":
         print(f"  - Static objects provide fixture context for validation")
         print(f"  - Dynamic objects are filtered based on position relative to fixtures")
         print(f"  - Only objects positioned above their corresponding fixtures are retained")
+        print(f"  - Bbox collision detection prevents overlapping objects")
     
     print("\n" + "=" * 60)
-    print("✅ Bbox validation system implemented successfully!")
+    print("✅ Enhanced Bbox System implemented successfully!")
     print("📊 Features added:")
     print("  1. Fixture mapping: obj_file (CSV) → fixture (mask_data)")
     print("  2. Position validation: 3d_location must be above fixture bbox")
     print("  3. Automatic filtering: invalid objects are removed")
-    print("  4. Debug info: validation status shown for each object")
+    print("  4. Geometric size estimation: based on fixture height and 2D aspect ratio")
+    print("  5. Collision detection: prevents bbox overlapping with dynamic size adjustment")
+    print("  6. Debug info: validation and collision status shown for each object")
     print("=" * 60)
